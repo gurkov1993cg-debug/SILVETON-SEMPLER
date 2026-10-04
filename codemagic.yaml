@@ -34,9 +34,12 @@ workflows:
           test -f "$PROJECT_DIR/core/CMakeLists.txt"
 
           # Strict -Wconversion fix for Android Clang in metersArray().
-          python3 - <<'PYFIX'
+          python3 - "$PROJECT_DIR" <<'PYFIX'
           from pathlib import Path
-          p = Path("$PROJECT_DIR/android/app/src/main/cpp/SamplerAudioBridge.cpp")
+          import sys
+
+          project_dir = Path(sys.argv[1])
+          p = project_dir / "android/app/src/main/cpp/SamplerAudioBridge.cpp"
           s = p.read_text()
           old = """    for (int i=0;i<kUpperCount;++i) {\n        v[5 + i*2] = m.upperPeakLeft[static_cast<std::size_t>(i)];\n        v[6 + i*2] = m.upperPeakRight[static_cast<std::size_t>(i)];\n    }\n"""
           new = """    for (std::size_t i = 0; i < static_cast<std::size_t>(kUpperCount); ++i) {\n        const std::size_t base = 5U + i * 2U;\n        v[base] = m.upperPeakLeft[i];\n        v[base + 1U] = m.upperPeakRight[i];\n    }\n"""

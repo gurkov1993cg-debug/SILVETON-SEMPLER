@@ -4,7 +4,8 @@ import sys
 root = Path(sys.argv[1])
 cpp = root / 'android/app/src/main/cpp/SamplerAudioBridge.cpp'
 view = root / 'android/app/src/main/java/com/silveton/sampler/SilvetonSamplerView.kt'
-for p in (cpp, view):
+runtime = root / 'android/app/src/main/java/com/silveton/sampler/SamplerRuntime.kt'
+for p in (cpp, view, runtime):
     if not p.is_file():
         raise SystemExit(f'missing required source: {p}')
 
@@ -36,6 +37,29 @@ for needle in required_cpp:
         raise SystemExit(f'keyboard test contract missing in C++: {needle}')
 cpp.write_text(s, encoding='utf-8')
 
+# Do not let an AUDIO-node permission failure prevent the native open() call:
+# native open() starts raw MIDI first, then attempts PCM. This is essential for
+# diagnosis because MIDI RX must remain visible even when ALSA output is broken.
+r = runtime.read_text(encoding='utf-8')
+perm_block = '''        val audioPermissions = SilvetonRootRuntime.refreshAudioPermissions()\n        if (!audioPermissions.ok) {\n            statusChanged(audioPermissions.message)\n            return false\n        }\n'''
+perm_continue = '''        val audioPermissions = SilvetonRootRuntime.refreshAudioPermissions()\n        if (!audioPermissions.ok) statusChanged(audioPermissions.message)\n        val midiPermissions = SilvetonRootRuntime.refreshMidiPermissions()\n        if (!midiPermissions.ok) statusChanged(midiPermissions.message)\n'''
+count = r.count(perm_block)
+if count > 0:
+    # Expected in start() and resumeAudio(); recovery has a different block.
+    r = r.replace(perm_block, perm_continue)
+elif 'val midiPermissions = SilvetonRootRuntime.refreshMidiPermissions()' not in r:
+    raise SystemExit('runtime permission/start anchor changed')
+
+# We deliberately continue into nativeAudioOpen(): C++ open() launches Direct
+# MIDI before attempting the PCM device, so a dead PCM no longer hides MIDI.
+for needle in [
+    'val midiPermissions = SilvetonRootRuntime.refreshMidiPermissions()',
+    'if (!engine.nativeAudioOpen())',
+]:
+    if needle not in r:
+        raise SystemExit(f'keyboard/MIDI runtime contract missing: {needle}')
+runtime.write_text(r, encoding='utf-8')
+
 # Make it explicit on-screen that the keyboard is playing the built-in patch.
 v = view.read_text(encoding='utf-8')
 # The diagnostics patch already has TEST EP wording on current builds; if the
@@ -46,4 +70,4 @@ if 'TEST EP' not in v:
         v = v.replace(anchor, anchor + '        text(c, "TEST EP", left+95f*sx, nowBottom+8f*sy, 12f*ss, C_ACCENT, bold=true)\n', 1)
 view.write_text(v, encoding='utf-8')
 
-print('PASS: external keyboard TEST EP forced ON (raw MIDI -> native synth -> Direct ALSA)')
+print('PASS: external keyboard TEST EP forced ON; MIDI remains testable even with broken PCM')

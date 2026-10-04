@@ -70,4 +70,13 @@ if 'TEST EP' not in v:
         v = v.replace(anchor, anchor + '        text(c, "TEST EP", left+95f*sx, nowBottom+8f*sy, 12f*ss, C_ACCENT, bold=true)\n', 1)
 view.write_text(v, encoding='utf-8')
 
-print('PASS: external keyboard TEST EP forced ON; MIDI remains testable even with broken PCM')
+# Replace the old formatting-sensitive GUI audit after all GUI patches have run.
+audit_fix = Path(__file__).with_name('codemagic_gui_contract_fix.py')
+if not audit_fix.is_file():
+    raise SystemExit(f'missing GUI audit fix: {audit_fix}')
+exec(compile(audit_fix.read_text(encoding='utf-8'), str(audit_fix), 'exec'), {
+    '__name__': '__main__',
+    '__file__': str(audit_fix),
+})
+
+print('PASS: external keyboard TEST EP forced ON; MIDI remains testable even with broken PCM; GUI audit updated')

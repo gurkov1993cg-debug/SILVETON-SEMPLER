@@ -175,4 +175,12 @@ for p, needles in checks.items():
             raise SystemExit(f'final stability contract missing in {p.name}: {needle}')
 if 'Handler(Looper.getMainLooper())' in runtime.read_text(encoding='utf-8'):
     raise SystemExit('audio recovery still bound to UI looper')
-print('PASS: final runtime stability fix applied (off-UI ALSA/root lifecycle + audio-node refresh + bounded su timeout)')
+
+# 4) Final UI/hardware diagnostics. This runs after the LIVE MIDI visual skin,
+# so the skin cannot overwrite the real AUDIO/XRUN/MIDI indicators or TEST EP.
+diag = Path(__file__).with_name('codemagic_live_diagnostics_fix.py')
+if not diag.is_file():
+    raise SystemExit(f'missing diagnostics patch: {diag}')
+exec(compile(diag.read_text(encoding='utf-8'), str(diag), 'exec'), {'__name__':'__main__', '__file__':str(diag)})
+
+print('PASS: final runtime stability fix applied (off-UI ALSA/root lifecycle + audio-node refresh + bounded su timeout + live diagnostics)')

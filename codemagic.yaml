@@ -132,6 +132,9 @@ workflows:
 
           APK="$(find android/app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print -quit)"
           test -n "$APK"
+          test -f "$APK"
+          echo "Verifying APK: $APK"
+          ls -lh "$APK"
 
           AAPT="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION/aapt"
           APKSIGNER="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION/apksigner"
@@ -145,22 +148,57 @@ workflows:
           test -x "$ZIPALIGN"
           test -x "$READELF"
 
-          BADGING="$($AAPT dump badging "$APK")"
-          echo "$BADGING" | grep -q "package: name='com.silveton.sampler'"
-          echo "$BADGING" | grep -q "sdkVersion:'26'"
-          echo "$BADGING" | grep -q "targetSdkVersion:'35'"
-
-          APK_LIST="$(unzip -Z1 "$APK")"
-          ABIS="$(printf '%s\n' "$APK_LIST" | grep '^lib/' | grep '\.so$' | cut -d/ -f2 | sort -u)"
-          test "$ABIS" = "arm64-v8a"
-          printf '%s\n' "$APK_LIST" | grep -qx 'lib/arm64-v8a/libsilveton_jni.so'
+          BADGING="$("$AAPT" dump badging "$APK")"
+          case "$BADGING" in
+            *"package: name='com.silveton.sampler'"*) ;;
+            *) echo "Wrong package id" >&2; exit 1 ;;
+          esac
+          case "$BADGING" in
+            *"sdkVersion:'26'"*) ;;
+            *) echo "Wrong minSdk" >&2; exit 1 ;;
+          esac
+          case "$BADGING" in
+            *"targetSdkVersion:'35'"*) ;;
+            *) echo "Wrong targetSdk" >&2; exit 1 ;;
+          esac
 
           TMP_DIR="$(mktemp -d)"
-          unzip -qq "$APK" 'lib/arm64-v8a/libsilveton_jni.so' -d "$TMP_DIR"
-          "$READELF" -h "$TMP_DIR/lib/arm64-v8a/libsilveton_jni.so" | grep -Eq 'Machine:[[:space:]]+AArch64'
+          trap 'rm -rf "$TMP_DIR"' EXIT
+          python3 - "$APK" "$TMP_DIR" <<'PYAPK'
+          import shutil
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          apk = Path(sys.argv[1])
+          out = Path(sys.argv[2])
+          wanted = "lib/arm64-v8a/libsilveton_jni.so"
+          with zipfile.ZipFile(apk, "r") as zf:
+              bad = zf.testzip()
+              if bad is not None:
+                  raise SystemExit(f"APK ZIP CRC failure: {bad}")
+              names = zf.namelist()
+              libs = [n for n in names if n.startswith("lib/") and n.endswith(".so")]
+              abis = sorted({n.split("/", 2)[1] for n in libs if n.count("/") >= 2})
+              print("APK ABIs:", ", ".join(abis) if abis else "<none>")
+              if abis != ["arm64-v8a"]:
+                  raise SystemExit(f"Unexpected APK ABIs: {abis!r}")
+              if wanted not in names:
+                  raise SystemExit(f"Missing {wanted}")
+              dst = out / wanted
+              dst.parent.mkdir(parents=True, exist_ok=True)
+              with zf.open(wanted, "r") as src, dst.open("wb") as f:
+                  shutil.copyfileobj(src, f)
+          PYAPK
+
+          "$READELF" -h "$TMP_DIR/lib/arm64-v8a/libsilveton_jni.so" > "$TMP_DIR/elf-header.txt"
+          grep -Eq 'Machine:[[:space:]]+AArch64' "$TMP_DIR/elf-header.txt"
+
+          echo "Checking 16 KiB APK alignment"
           "$ZIPALIGN" -c -P 16 -v 4 "$APK"
+
+          echo "Checking APK signature"
           "$APKSIGNER" verify --verbose --print-certs "$APK"
-          rm -rf "$TMP_DIR"
 
           mkdir -p "$CM_BUILD_DIR/artifacts"
           cp "$APK" "$CM_BUILD_DIR/artifacts/SILVETON-SAMPLER-release.apk"

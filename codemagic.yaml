@@ -20,6 +20,7 @@ workflows:
           test -f "$CM_BUILD_DIR/$SILVETON_ZIP"
           test -f "$CM_BUILD_DIR/codemagic_runtime_fix.py"
           test -f "$CM_BUILD_DIR/codemagic_system_app_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_gui_sampler3.py"
           test -f "$CM_BUILD_DIR/codemagic_make_system_payload.py"
 
           rm -rf "$CM_BUILD_DIR/_silveton_src"
@@ -33,10 +34,12 @@ workflows:
 
           python3 "$CM_BUILD_DIR/codemagic_runtime_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_system_app_fix.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_gui_sampler3.py" "$PROJECT_DIR"
 
           BRIDGE="$PROJECT_DIR/android/app/src/main/cpp/SamplerAudioBridge.cpp"
           RUNTIME="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SamplerRuntime.kt"
           MODE="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SilvetonSystemMode.kt"
+          VIEW="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SilvetonSamplerView.kt"
           MANIFEST="$PROJECT_DIR/android/app/src/main/AndroidManifest.xml"
 
           grep -F 'constexpr unsigned kRate = 96000U;' "$BRIDGE"
@@ -45,6 +48,9 @@ workflows:
           grep -F 'pinCurrentThreadToCpu(6);' "$BRIDGE"
           grep -F 'sys.silveton.performance' "$MODE"
           grep -F 'SilvetonSystemMode.enter()' "$RUNTIME"
+          grep -F 'SILVETON-sampler-3.zip' "$VIEW"
+          grep -F 'DESIGN_W = 1340f' "$VIEW"
+          grep -F 'private fun drawBrand' "$VIEW"
           grep -F 'android:directBootAware="true"' "$MANIFEST"
           grep -F 'com.silveton.sampler.permission.DIRECT_ALSA' "$MANIFEST"
 

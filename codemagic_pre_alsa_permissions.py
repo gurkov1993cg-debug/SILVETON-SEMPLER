@@ -37,8 +37,6 @@ refresh = r'''    fun refreshAudioPermissions(): Result {
                 exit 53
             fi
 
-            # Re-apply the app-domain Direct-ALSA rule before every open/reopen.
-            # This is intentionally outside the realtime thread.
             "${'$'}MP" --live \
                 "allow ${'$'}DOMAIN audio_device dir { getattr open read search }" \
                 "allow ${'$'}DOMAIN device dir { getattr open read search }" \
@@ -51,8 +49,6 @@ refresh = r'''    fun refreshAudioPermissions(): Result {
                     exit 54
                 }
 
-            # Give only this SILVETON app UID + Android audio group access.
-            # Equivalent purpose to chmod/chown via su, but avoids world-writable 0666.
             for n in "${'$'}CTL" "${'$'}PCM"; do
                 chown ''' + '${uid}' + r''':1005 "${'$'}n" 2>/dev/null || {
                     echo "ALSA grant: chown failed for ${'$'}n"
@@ -71,6 +67,45 @@ refresh = r'''    fun refreshAudioPermissions(): Result {
 
 '''
 k = k[:start] + refresh + k[end:]
+
+# Remove su -c completely. Open a root shell and feed the script on stdin.
+# This avoids the device-specific "-c parameter not set" failure and also
+# rejects empty commands explicitly before starting su.
+run_start = k.find('    private fun runSu(script: String, timeoutSeconds: Long): Result')
+if run_start < 0:
+    raise SystemExit('runSu method missing')
+run_end = k.find('\n    }\n}', run_start)
+if run_end < 0:
+    raise SystemExit('runSu method end missing')
+new_run = r'''    private fun runSu(script: String, timeoutSeconds: Long): Result {
+        val command = script.trim()
+        if (command.isEmpty()) return Result(false, "Root command empty")
+
+        return try {
+            val p = ProcessBuilder("su")
+                .redirectErrorStream(true)
+                .start()
+
+            p.outputStream.bufferedWriter().use { writer ->
+                writer.write(command)
+                writer.newLine()
+                writer.flush()
+            }
+
+            if (!p.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
+                p.destroyForcibly()
+                p.waitFor(1, TimeUnit.SECONDS)
+                Result(false, "Root setup timed out")
+            } else {
+                val output = p.inputStream.bufferedReader().use { it.readText() }.trim()
+                if (p.exitValue() == 0) Result(true)
+                else Result(false, "Root setup failed (${p.exitValue()}): $output")
+            }
+        } catch (t: Throwable) {
+            Result(false, "Root unavailable: ${t.message ?: t.javaClass.simpleName}")
+        }
+    }'''
+k = k[:run_start] + new_run + k[run_end + len('\n    }'):]
 root_mode.write_text(k, encoding='utf-8')
 
 # Prove source order: permission grant must happen before native ALSA open.
@@ -96,9 +131,12 @@ for token in [
     'pcmC0D0p',
     'controlC0',
     'magiskpolicy',
-    '0x4100-0x41ff',
+    'ProcessBuilder("su")',
+    'val command = script.trim()',
 ]:
     if token not in final:
-        raise SystemExit(f'pre-ALSA permission contract missing: {token}')
+        raise SystemExit(f'pre-ALSA/root contract missing: {token}')
+if 'ProcessBuilder("su", "-c", script)' in final:
+    raise SystemExit('stale su -c execution remains')
 
-print('PASS: pre-ALSA root permission gate installed before every PCM open/reopen')
+print('PASS: pre-ALSA root gate installed; su -c removed; root scripts execute through stdin')

@@ -68,6 +68,16 @@ refresh = r'''    fun refreshAudioPermissions(): Result {
 '''
 k = k[:start] + refresh + k[end:]
 
+# Fix the shell nounset bug in the older root bootstrap. With `set -u`, the
+# text `$c_` is parsed by /system/bin/sh as a variable named `c_`, not `$c`
+# followed by an underscore. Emit `${c}_` instead in both save/restore loops.
+bad_idle_key = "key=\"idle_${'$'}c_${'$'}(basename"
+good_idle_key = "key=\"idle_${'$'}{c}_${'$'}(basename"
+if bad_idle_key in k:
+    k = k.replace(bad_idle_key, good_idle_key)
+elif good_idle_key not in k:
+    raise SystemExit('CPU idle key shell anchor missing')
+
 # Remove su -c without rewriting the whole Kotlin method. The previous version
 # searched for the method's closing braces and was brittle after other patches.
 # Keep the already-tested timeout/error handling intact and only change process
@@ -108,10 +118,13 @@ for token in [
     'magiskpolicy',
     'ProcessBuilder("su")',
     'writer.write(script)',
+    "key=\"idle_${'$'}{c}_${'$'}(basename",
 ]:
     if token not in final:
         raise SystemExit(f'pre-ALSA/root contract missing: {token}')
 if 'ProcessBuilder("su", "-c", script)' in final:
     raise SystemExit('stale su -c execution remains')
+if "key=\"idle_${'$'}c_${'$'}(basename" in final:
+    raise SystemExit('stale shell $c_ nounset bug remains')
 
-print('PASS: pre-ALSA root gate installed; su -c removed; root scripts execute through stdin')
+print('PASS: pre-ALSA root gate installed; su -c removed; shell CPU-idle variable expansion fixed')

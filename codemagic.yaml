@@ -25,6 +25,7 @@ workflows:
           test -f "$CM_BUILD_DIR/codemagic_test_instrument_fix.py"
           test -f "$CM_BUILD_DIR/codemagic_stability_fix.py"
           test -f "$CM_BUILD_DIR/codemagic_audio_driver_hardening.py"
+          test -f "$CM_BUILD_DIR/codemagic_final_stability_fix.py"
           test -f "$CM_BUILD_DIR/codemagic_gui_sampler3.py"
 
           rm -rf "$CM_BUILD_DIR/_silveton_src"
@@ -44,11 +45,13 @@ workflows:
           python3 "$CM_BUILD_DIR/codemagic_stability_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_audio_driver_hardening.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_gui_sampler3.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_final_stability_fix.py" "$PROJECT_DIR"
 
           BRIDGE="$PROJECT_DIR/android/app/src/main/cpp/SamplerAudioBridge.cpp"
           RUNTIME="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SamplerRuntime.kt"
           ROOTMODE="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SilvetonRootRuntime.kt"
           MIDICTRL="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SamplerMidiController.kt"
+          ACTIVITY="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/MainActivity.kt"
           ENGINE="$PROJECT_DIR/core/src/sampler/SamplerEngine.cpp"
           SINC="$PROJECT_DIR/core/include/silveton/sampler/SincInterpolator.h"
           VIEW="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SilvetonSamplerView.kt"
@@ -70,9 +73,13 @@ workflows:
           grep -F 'AUDIO DRIVER: PCM open/config failed' "$BRIDGE"
           grep -F 'SilvetonRootRuntime.enter()' "$RUNTIME"
           grep -F 'Audio reopen failed' "$RUNTIME"
+          grep -F 'SilvetonAudioRecovery' "$RUNTIME"
+          grep -F 'refreshAudioPermissions' "$RUNTIME"
+          grep -F 'refreshAudioPermissions' "$ROOTMODE"
           grep -F 'refreshMidiPermissions' "$ROOTMODE"
           grep -F 'return runSu(script, 5)' "$ROOTMODE"
           grep -F 'refreshMidiPermissions' "$MIDICTRL"
+          grep -F 'SilvetonAudioLifecycle' "$ACTIVITY"
           grep -F 'magiskpolicy' "$ROOTMODE"
           grep -F '0x4100-0x41ff' "$ROOTMODE"
           grep -F '0x5500-0x55ff' "$ROOTMODE"
@@ -93,6 +100,10 @@ workflows:
           fi
           if grep -Fq 'cmd activity kill-all' "$ROOTMODE"; then
             echo "ERROR: live mode must not kill cached apps" >&2
+            exit 1
+          fi
+          if grep -Fq 'Handler(Looper.getMainLooper())' "$RUNTIME"; then
+            echo "ERROR: audio recovery returned to UI looper" >&2
             exit 1
           fi
 

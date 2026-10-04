@@ -30,6 +30,7 @@ workflows:
           test -f "$CM_BUILD_DIR/codemagic_live_midi_visual_skin.py"
           test -f "$CM_BUILD_DIR/codemagic_force_keyboard_test_patch.py"
           test -f "$CM_BUILD_DIR/codemagic_gui_contract_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_48khz_fix.py"
 
           rm -rf "$CM_BUILD_DIR/_silveton_src"
           mkdir -p "$CM_BUILD_DIR/_silveton_src"
@@ -52,6 +53,7 @@ workflows:
           python3 "$CM_BUILD_DIR/codemagic_final_stability_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_force_keyboard_test_patch.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_gui_contract_fix.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_48khz_fix.py" "$PROJECT_DIR"
 
           BRIDGE="$PROJECT_DIR/android/app/src/main/cpp/SamplerAudioBridge.cpp"
           RUNTIME="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SamplerRuntime.kt"
@@ -62,8 +64,9 @@ workflows:
           SINC="$PROJECT_DIR/core/include/silveton/sampler/SincInterpolator.h"
           VIEW="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SilvetonSamplerView.kt"
 
-          grep -F 'constexpr unsigned kRate = 96000U;' "$BRIDGE"
+          grep -F 'constexpr unsigned kRate = 48000U;' "$BRIDGE"
           grep -F 'constexpr unsigned kPeriods = 2U;' "$BRIDGE"
+          grep -F 'kPreferredMinimumPeriodFrames = 96U;' "$BRIDGE"
           grep -F 'configureRealtimeThread("SilvAudioRT", 7, 7, 80);' "$BRIDGE"
           grep -F 'configureRealtimeThread("SilvMidiRT", 0, 5, 70);' "$BRIDGE"
           grep -F 'class BuiltinTestInstrument' "$BRIDGE"
@@ -101,6 +104,10 @@ workflows:
           grep -F 'DESIGN_W = 1340f' "$VIEW"
           grep -F 'TEST EP' "$VIEW"
 
+          if grep -Fq 'constexpr unsigned kRate = 96000U;' "$BRIDGE"; then
+            echo "ERROR: stale 96 kHz target remains" >&2
+            exit 1
+          fi
           if grep -Fq '#include <aaudio/AAudio.h>' "$BRIDGE"; then
             echo "ERROR: AAudio returned to Direct ALSA runtime" >&2
             exit 1

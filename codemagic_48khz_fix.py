@@ -52,4 +52,15 @@ exec(compile(perm.read_text(encoding='utf-8'), str(perm), 'exec'), {
     '__file__': str(perm),
 })
 
-print('PASS: SILVETON Direct ALSA target locked to 48 kHz / 96 frames x 2 periods + pre-open root grant')
+# Android /system/bin/sh + `set -u`: disambiguate `$c_` into `${c}_` in the
+# CPU idle-state key generation. Without braces the shell treats c_ as the
+# variable name and aborts with `c_: parameter not set`.
+shellfix = Path(__file__).with_name('codemagic_shell_nounset_fix.py')
+if not shellfix.is_file():
+    raise SystemExit(f'missing Android shell nounset patch: {shellfix}')
+exec(compile(shellfix.read_text(encoding='utf-8'), str(shellfix), 'exec'), {
+    '__name__': '__main__',
+    '__file__': str(shellfix),
+})
+
+print('PASS: SILVETON Direct ALSA target locked to 48 kHz / 96 frames x 2 periods + pre-open root grant + Android shell nounset fix')

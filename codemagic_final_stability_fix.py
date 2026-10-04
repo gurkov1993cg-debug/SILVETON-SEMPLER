@@ -10,6 +10,7 @@ for p in (runtime, root_mode, activity):
     if not p.is_file():
         raise SystemExit(f'missing required source: {p}')
 
+# 1) Recovery must never run on the UI looper.
 s = runtime.read_text(encoding='utf-8')
 s = s.replace('import android.os.Handler\nimport android.os.Looper\n',
               'import android.os.Handler\nimport android.os.HandlerThread\nimport android.os.Process\n')
@@ -17,14 +18,19 @@ s = s.replace(
 '''    private val handler = Handler(Looper.getMainLooper())\n    private var running = false\n''',
 '''    private val recoveryThread = HandlerThread(\n        "SilvetonAudioRecovery",\n        Process.THREAD_PRIORITY_BACKGROUND\n    ).apply { start() }\n    private val handler = Handler(recoveryThread.looper)\n    private var running = false\n''')
 
+# Refresh DAC ownership before every open/reopen/recovery. enter() deliberately
+# becomes a no-op after the first successful root setup, but /dev/snd nodes can
+# be recreated by Android/hot-plug and lose our per-app ownership.
 s = s.replace(
 '''        val root = SilvetonRootRuntime.enter()\n        if (!root.ok) {\n            statusChanged(root.message)\n            return false\n        }\n        if (!running) {\n''',
 '''        val root = SilvetonRootRuntime.enter()\n        if (!root.ok) {\n            statusChanged(root.message)\n            return false\n        }\n        val audioPermissions = SilvetonRootRuntime.refreshAudioPermissions()\n        if (!audioPermissions.ok) {\n            statusChanged(audioPermissions.message)\n            return false\n        }\n        if (!running) {\n''', 1)
 
+# Recovery path: refresh node ownership before touching PCM/control again.
 s = s.replace(
 '''                } else {\n                    val error = engine.nativeLastAudioError()\n                    if (!engine.nativeAudioRecover()) {\n''',
 '''                } else {\n                    val perms = SilvetonRootRuntime.refreshAudioPermissions()\n                    if (!perms.ok) {\n                        statusChanged(perms.message)\n                        handler.postDelayed(this, 250L)\n                        return\n                    }\n                    val error = engine.nativeLastAudioError()\n                    if (!engine.nativeAudioRecover()) {\n''', 1)
 
+# Resume path has a second enter() occurrence.
 resume_anchor = '''    fun resumeAudio(): Boolean {\n        if (closed) return false\n        val root = SilvetonRootRuntime.enter()\n        if (!root.ok) {\n            statusChanged(root.message)\n            return false\n        }\n'''
 resume_new = '''    fun resumeAudio(): Boolean {\n        if (closed) return false\n        val root = SilvetonRootRuntime.enter()\n        if (!root.ok) {\n            statusChanged(root.message)\n            return false\n        }\n        val audioPermissions = SilvetonRootRuntime.refreshAudioPermissions()\n        if (!audioPermissions.ok) {\n            statusChanged(audioPermissions.message)\n            return false\n        }\n'''
 if resume_anchor in s:
@@ -37,6 +43,7 @@ s = s.replace(
 '''        handler.removeCallbacks(recoveryPoll)\n        recoveryThread.quitSafely()\n        engine.nativePanic()\n''', 1)
 runtime.write_text(s, encoding='utf-8')
 
+# 2) Root helper: explicit audio-node refresh + real timeout semantics.
 k = root_mode.read_text(encoding='utf-8')
 insert_before = '    fun refreshMidiPermissions(): Result {\n'
 refresh_audio = r'''    fun refreshAudioPermissions(): Result {
@@ -44,7 +51,7 @@ refresh_audio = r'''    fun refreshAudioPermissions(): Result {
         val script = """
             for n in /dev/snd/controlC0 /dev/snd/pcmC0D0p; do
                 [ -e "${'$'}n" ] || { echo "Missing ${'$'}n"; exit 51; }
-                chown ${uid}:1005 "${'$'}n" 2>/dev/null || exit 52
+                chown ''' + '${uid}' + r''':1005 "${'$'}n" 2>/dev/null || exit 52
                 chmod 0660 "${'$'}n" 2>/dev/null || exit 53
             done
             exit 0
@@ -64,10 +71,14 @@ if start < 0:
 end = k.find('\n    }\n}', start)
 if end < 0:
     raise SystemExit('runSu block end missing')
+old = k[start:end+6]
 new = r'''    private fun runSu(script: String, timeoutSeconds: Long): Result = try {
         val p = ProcessBuilder("su", "-c", script)
             .redirectErrorStream(true)
             .start()
+
+        // Never call readText() before the process has exited: if su or a shell
+        // command hangs, readText blocks forever and makes the timeout useless.
         if (!p.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
             p.destroyForcibly()
             p.waitFor(1, TimeUnit.SECONDS)
@@ -84,30 +95,78 @@ new = r'''    private fun runSu(script: String, timeoutSeconds: Long): Result = 
 k = k[:start] + new + k[end+6:]
 root_mode.write_text(k, encoding='utf-8')
 
+# 3) All root/ALSA lifecycle work runs on one dedicated executor, never UI.
 a = activity.read_text(encoding='utf-8')
-if 'java.util.concurrent.Executors' not in a:
-    a = a.replace('import androidx.core.view.WindowInsetsControllerCompat\n',
-                  'import androidx.core.view.WindowInsetsControllerCompat\nimport java.util.concurrent.Executors\n')
-a = a.replace(
-'''    private lateinit var samplerView: SilvetonSamplerView\n    private var created = false\n''',
-'''    private lateinit var samplerView: SilvetonSamplerView\n    private val audioLifecycle = Executors.newSingleThreadExecutor { task ->\n        Thread(task, "SilvetonAudioLifecycle").apply { priority = Thread.NORM_PRIORITY }\n    }\n    private var created = false\n''')
-a = a.replace(
-'''    override fun onStart() {\n        super.onStart()\n        if (created && !sampler.start()) {\n            samplerView.setWarning(sampler.engine.nativeLastTextError().ifBlank { "Sampler start failed" })\n        }\n    }\n''',
-'''    override fun onStart() {\n        super.onStart()\n        if (created) audioLifecycle.execute { sampler.start() }\n    }\n''')
-a = a.replace('        if (created) sampler.resumeAudio()\n',
-              '        if (created) audioLifecycle.execute { sampler.resumeAudio() }\n', 1)
-a = a.replace(
-'''    override fun onPause() {\n        if (created) sampler.pauseAudio()\n        super.onPause()\n    }\n''',
-'''    override fun onPause() {\n        if (created) audioLifecycle.execute { sampler.pauseAudio() }\n        super.onPause()\n    }\n''')
-a = a.replace(
-'''    override fun onDestroy() {\n        if (created) sampler.close()\n        super.onDestroy()\n    }\n''',
-'''    override fun onDestroy() {\n        if (created) audioLifecycle.execute { sampler.close() }\n        audioLifecycle.shutdown()\n        super.onDestroy()\n    }\n''')
+if 'import java.util.concurrent.Executors' not in a:
+    import_anchor = 'import androidx.core.view.WindowInsetsControllerCompat\n'
+    if import_anchor in a:
+        a = a.replace(import_anchor, import_anchor + 'import java.util.concurrent.Executors\n', 1)
+    else:
+        bundle_anchor = 'import android.os.Bundle\n'
+        if bundle_anchor not in a:
+            raise SystemExit('MainActivity import anchor changed')
+        a = a.replace(bundle_anchor, bundle_anchor + 'import java.util.concurrent.Executors\n', 1)
+
+if 'private val audioLifecycle = Executors.newSingleThreadExecutor' not in a:
+    field_anchor = '    private lateinit var samplerView: SilvetonSamplerView\n'
+    if field_anchor not in a:
+        raise SystemExit('MainActivity samplerView field anchor changed')
+    executor = '''    private val audioLifecycle = Executors.newSingleThreadExecutor { task ->\n        Thread(task, "SilvetonAudioLifecycle").apply { priority = Thread.NORM_PRIORITY }\n    }\n'''
+    a = a.replace(field_anchor, field_anchor + executor, 1)
+
+def replace_activity_method(text: str, start_sig: str, next_sig: str, body: str) -> str:
+    begin = text.find(start_sig)
+    if begin < 0:
+        raise SystemExit(f'MainActivity method missing: {start_sig.strip()}')
+    finish = text.find(next_sig, begin)
+    if finish < 0:
+        raise SystemExit(f'MainActivity next method missing after: {start_sig.strip()}')
+    return text[:begin] + body.rstrip() + '\n\n' + text[finish:]
+
+a = replace_activity_method(
+    a,
+    '    override fun onStart() {',
+    '    override fun onResume() {',
+    '''    override fun onStart() {\n        super.onStart()\n        if (created) audioLifecycle.execute { sampler.start() }\n    }'''
+)
+a = replace_activity_method(
+    a,
+    '    override fun onResume() {',
+    '    override fun onPause() {',
+    '''    override fun onResume() {\n        super.onResume()\n        hideSystemUi()\n        if (created) audioLifecycle.execute { sampler.resumeAudio() }\n    }'''
+)
+a = replace_activity_method(
+    a,
+    '    override fun onPause() {',
+    '    override fun onDestroy() {',
+    '''    override fun onPause() {\n        if (created) audioLifecycle.execute { sampler.pauseAudio() }\n        super.onPause()\n    }'''
+)
+a = replace_activity_method(
+    a,
+    '    override fun onDestroy() {',
+    '    override fun onWindowFocusChanged(',
+    '''    override fun onDestroy() {\n        if (created) audioLifecycle.execute { sampler.close() }\n        audioLifecycle.shutdown()\n        super.onDestroy()\n    }'''
+)
 activity.write_text(a, encoding='utf-8')
 
+# Contracts.
 checks = {
-    runtime: ['"SilvetonAudioRecovery"', 'SilvetonRootRuntime.refreshAudioPermissions()', 'recoveryThread.quitSafely()'],
-    root_mode: ['fun refreshAudioPermissions(): Result', 'if (!p.waitFor(timeoutSeconds, TimeUnit.SECONDS))', 'val output = p.inputStream.bufferedReader().use { it.readText() }.trim()'],
-    activity: ['SilvetonAudioLifecycle', 'audioLifecycle.execute { sampler.start() }', 'audioLifecycle.execute { sampler.resumeAudio() }', 'audioLifecycle.execute { sampler.pauseAudio() }'],
+    runtime: [
+        '"SilvetonAudioRecovery"',
+        'SilvetonRootRuntime.refreshAudioPermissions()',
+        'recoveryThread.quitSafely()',
+    ],
+    root_mode: [
+        'fun refreshAudioPermissions(): Result',
+        'if (!p.waitFor(timeoutSeconds, TimeUnit.SECONDS))',
+        'val output = p.inputStream.bufferedReader().use { it.readText() }.trim()',
+    ],
+    activity: [
+        'SilvetonAudioLifecycle',
+        'audioLifecycle.execute { sampler.start() }',
+        'audioLifecycle.execute { sampler.resumeAudio() }',
+        'audioLifecycle.execute { sampler.pauseAudio() }',
+    ],
 }
 for p, needles in checks.items():
     text = p.read_text(encoding='utf-8')

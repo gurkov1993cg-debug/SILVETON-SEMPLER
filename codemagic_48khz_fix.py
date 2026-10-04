@@ -18,13 +18,10 @@ elif 'constexpr unsigned kRate = 48000U;' not in s:
     raise SystemExit('Direct ALSA sample-rate constant not found')
 
 s = s.replace('96 kHz / 96 x 2', '48 kHz / 96 x 2')
-s = s.replace('96 frames x 2 at 96 kHz', '96 frames x 2 at 48 kHz')
+s = s.replace('96 frames x 2 at 96 kHz', '48 kHz / 96 x 2')
 s = s.replace('96 kHz / 96x2', '48 kHz / 96x2')
-
 cpp.write_text(s, encoding='utf-8')
 
-# Keep the source audit aligned with the actual runtime target. The audit must
-# validate the real requested rate, not a stale 96 kHz literal.
 if audit.is_file():
     a = audit.read_text(encoding='utf-8')
     a = a.replace('96000U', '48000U')
@@ -42,8 +39,9 @@ if 'kPreferredMinimumPeriodFrames = 96U;' not in final:
 if 'constexpr unsigned kPeriods = 2U;' not in final:
     raise SystemExit('2-period low-latency contract missing')
 
-# Apply the explicit root chmod/chown + SELinux grant immediately before the
-# native ALSA open/reopen path. This stays out of the realtime audio thread.
+# Build the rooted pre-open gate. It resolves the live APK SELinux domain and the
+# live PCM/control node labels, grants open/read/write/ioctl/lock/map, and grants
+# the complete ALSA PCM/control/raw-MIDI ioctl families before nativeAudioOpen().
 perm = Path(__file__).with_name('codemagic_pre_alsa_permissions.py')
 if not perm.is_file():
     raise SystemExit(f'missing pre-ALSA permission patch: {perm}')
@@ -52,9 +50,43 @@ exec(compile(perm.read_text(encoding='utf-8'), str(perm), 'exec'), {
     '__file__': str(perm),
 })
 
-# Android /system/bin/sh + `set -u`: disambiguate `$c_` into `${c}_` in the
-# CPU idle-state key generation. Without braces the shell treats c_ as the
-# variable name and aborts with `c_: parameter not set`.
+# During hardware validation remove Unix DAC as a possible source of EACCES.
+# SELinux stays enforcing; access is still limited by the live-domain rules above.
+root_mode = root / 'android/app/src/main/java/com/silveton/sampler/SilvetonRootRuntime.kt'
+if not root_mode.is_file():
+    raise SystemExit(f'missing root runtime: {root_mode}')
+k = root_mode.read_text(encoding='utf-8')
+a0 = k.find('    fun refreshAudioPermissions(): Result {')
+a1 = k.find('    fun refreshMidiPermissions(): Result {', a0)
+if a0 < 0 or a1 < 0:
+    raise SystemExit('refreshAudioPermissions block missing')
+block = k[a0:a1]
+block = block.replace('chmod 0660 "${\'$\'}n"', 'chmod 0666 "${\'$\'}n"')
+k = k[:a0] + block + k[a1:]
+root_mode.write_text(k, encoding='utf-8')
+
+# Refuse to build if any of the known PCM permission boundaries are still absent.
+final_root = root_mode.read_text(encoding='utf-8')
+b0 = final_root.find('    fun refreshAudioPermissions(): Result {')
+b1 = final_root.find('    fun refreshMidiPermissions(): Result {', b0)
+audio_block = final_root[b0:b1]
+for token in [
+    'chmod 0666',
+    'chown ${uid}:1005',
+    'APPCTX=',
+    'PCMTYPE=',
+    'magiskpolicy',
+    'allow ${\'$\'}DOMAIN ${\'$\'}T chr_file { getattr open read write append ioctl lock map }',
+    '0x4100-0x41ff',
+    '0x5500-0x55ff',
+    '0x5700-0x57ff',
+]:
+    if token not in audio_block:
+        raise SystemExit(f'PCM permission contract missing: {token}')
+if 'chmod 0660' in audio_block:
+    raise SystemExit('restrictive PCM DAC mode remains in refreshAudioPermissions')
+
+# Android /system/bin/sh + `set -u`: disambiguate `$c_` into `${c}_`.
 shellfix = Path(__file__).with_name('codemagic_shell_nounset_fix.py')
 if not shellfix.is_file():
     raise SystemExit(f'missing Android shell nounset patch: {shellfix}')
@@ -63,4 +95,4 @@ exec(compile(shellfix.read_text(encoding='utf-8'), str(shellfix), 'exec'), {
     '__file__': str(shellfix),
 })
 
-print('PASS: SILVETON Direct ALSA target locked to 48 kHz / 96 frames x 2 periods + pre-open root grant + Android shell nounset fix')
+print('PASS: SILVETON Direct ALSA 48 kHz / 96x2 + PCM DAC open + live-domain SELinux ALSA grants')

@@ -27,6 +27,7 @@ workflows:
           test -f "$CM_BUILD_DIR/codemagic_audio_driver_hardening.py"
           test -f "$CM_BUILD_DIR/codemagic_final_stability_fix.py"
           test -f "$CM_BUILD_DIR/codemagic_gui_sampler3.py"
+          test -f "$CM_BUILD_DIR/codemagic_live_midi_visual_skin.py"
 
           rm -rf "$CM_BUILD_DIR/_silveton_src"
           mkdir -p "$CM_BUILD_DIR/_silveton_src"
@@ -45,6 +46,7 @@ workflows:
           python3 "$CM_BUILD_DIR/codemagic_stability_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_audio_driver_hardening.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_gui_sampler3.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_live_midi_visual_skin.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_final_stability_fix.py" "$PROJECT_DIR"
 
           BRIDGE="$PROJECT_DIR/android/app/src/main/cpp/SamplerAudioBridge.cpp"
@@ -87,7 +89,9 @@ workflows:
           grep -F 'LiveCubic4 = 4' "$SINC"
           grep -F 'InterpolationQuality::LiveCubic4' "$ENGINE"
           grep -F 'upperRouteMask' "$ENGINE"
-          grep -F 'SILVETON-sampler-3.zip' "$VIEW"
+          grep -F 'SILVETON LIVE MIDI native Canvas renderer' "$VIEW"
+          grep -F 'RadialGradient(' "$VIEW"
+          grep -F 'Color.rgb(252,253,255)' "$VIEW"
           grep -F 'DESIGN_W = 1340f' "$VIEW"
 
           if grep -Fq '#include <aaudio/AAudio.h>' "$BRIDGE"; then

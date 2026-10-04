@@ -1,6 +1,0 @@
-id=silveton_audio
-name=SILVETON Direct ALSA Audio
-version=1.0
-versionCode=1
-author=Silveton
- description=Dedicated SM-X130 Direct-ALSA access and low-latency audio policy for SILVETON SAMPLER

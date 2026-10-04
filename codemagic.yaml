@@ -30,7 +30,9 @@ workflows:
           test -f "$CM_BUILD_DIR/codemagic_live_midi_visual_skin.py"
           test -f "$CM_BUILD_DIR/codemagic_force_keyboard_test_patch.py"
           test -f "$CM_BUILD_DIR/codemagic_gui_contract_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_kotlin_compile_fix.py"
           test -f "$CM_BUILD_DIR/codemagic_48khz_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_live_performance_indicators.py"
 
           rm -rf "$CM_BUILD_DIR/_silveton_src"
           mkdir -p "$CM_BUILD_DIR/_silveton_src"
@@ -53,7 +55,9 @@ workflows:
           python3 "$CM_BUILD_DIR/codemagic_final_stability_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_force_keyboard_test_patch.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_gui_contract_fix.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_kotlin_compile_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_48khz_fix.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_live_performance_indicators.py" "$PROJECT_DIR"
 
           BRIDGE="$PROJECT_DIR/android/app/src/main/cpp/SamplerAudioBridge.cpp"
           RUNTIME="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SamplerRuntime.kt"
@@ -63,6 +67,7 @@ workflows:
           ENGINE="$PROJECT_DIR/core/src/sampler/SamplerEngine.cpp"
           SINC="$PROJECT_DIR/core/include/silveton/sampler/SincInterpolator.h"
           VIEW="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SilvetonSamplerView.kt"
+          CONTROLLER="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SamplerAppController.kt"
 
           grep -F 'constexpr unsigned kRate = 48000U;' "$BRIDGE"
           grep -F 'constexpr unsigned kPeriods = 2U;' "$BRIDGE"
@@ -102,7 +107,13 @@ workflows:
           grep -F 'RadialGradient(' "$VIEW"
           grep -F 'Color.rgb(252,253,255)' "$VIEW"
           grep -F 'DESIGN_W = 1340f' "$VIEW"
-          grep -F 'TEST EP' "$VIEW"
+          grep -F 'STAGE PIANO' "$VIEW"
+          grep -F 'BUILT-IN  •  RAW MIDI' "$VIEW"
+          grep -F 'val keyFlash = midiRx' "$VIEW"
+          grep -F 'val audioSignal = a.activeVoices > 0' "$VIEW"
+          grep -F '"48k 96x2"' "$VIEW"
+          grep -F 'data class MidiStatus(' "$CONTROLLER"
+          grep -F 'private val statusChanged: (String?) -> Unit = {},' "$CONTROLLER"
 
           if grep -Fq 'constexpr unsigned kRate = 96000U;' "$BRIDGE"; then
             echo "ERROR: stale 96 kHz target remains" >&2

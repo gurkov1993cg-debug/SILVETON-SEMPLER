@@ -21,6 +21,7 @@ workflows:
           test -f "$CM_BUILD_DIR/codemagic_runtime_fix.py"
           test -f "$CM_BUILD_DIR/codemagic_root_apk_fix.py"
           test -f "$CM_BUILD_DIR/codemagic_live_dsp_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_test_instrument_fix.py"
           test -f "$CM_BUILD_DIR/codemagic_gui_sampler3.py"
 
           rm -rf "$CM_BUILD_DIR/_silveton_src"
@@ -35,6 +36,7 @@ workflows:
           python3 "$CM_BUILD_DIR/codemagic_runtime_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_root_apk_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_live_dsp_fix.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_test_instrument_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_gui_sampler3.py" "$PROJECT_DIR"
 
           BRIDGE="$PROJECT_DIR/android/app/src/main/cpp/SamplerAudioBridge.cpp"
@@ -48,6 +50,8 @@ workflows:
           grep -F 'constexpr unsigned kPeriods = 2U;' "$BRIDGE"
           grep -F 'configureRealtimeThread("SilvAudioRT", 7, 7, 80);' "$BRIDGE"
           grep -F 'configureRealtimeThread("SilvMidiRT", 0, 5, 70);' "$BRIDGE"
+          grep -F 'class BuiltinTestInstrument' "$BRIDGE"
+          grep -F 'testInstrument_.render(renderBuffer_.data(), frames, sampleRate());' "$BRIDGE"
           grep -F 'SilvetonRootRuntime.enter()' "$RUNTIME"
           grep -F 'magiskpolicy' "$ROOTMODE"
           grep -F '0x4100-0x41ff' "$ROOTMODE"

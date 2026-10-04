@@ -6,84 +6,191 @@ cpp = root/'android/app/src/main/cpp/SamplerAudioBridge.cpp'
 native = root/'android/app/src/main/java/com/silveton/sampler/NativeSamplerEngine.kt'
 controller = root/'android/app/src/main/java/com/silveton/sampler/SamplerAppController.kt'
 view = root/'android/app/src/main/java/com/silveton/sampler/SilvetonSamplerView.kt'
-for p in (cpp,native,controller,view):
-    if not p.is_file(): raise SystemExit(f'missing {p}')
+for p in (cpp, native, controller, view):
+    if not p.is_file():
+        raise SystemExit(f'missing {p}')
 
+# ---------- Native C++ diagnostics ----------
 s = cpp.read_text(encoding='utf-8')
-needle = '''        const std::uint8_t kind = static_cast<std::uint8_t>(status & 0xF0U);\n        const std::uint8_t ch = static_cast<std::uint8_t>(status & 0x0FU);\n        midiActivitySerial_.fetch_add(1U, std::memory_order_relaxed);\n'''
-repl = '''        const std::uint8_t kind = static_cast<std::uint8_t>(status & 0xF0U);\n        const std::uint8_t ch = static_cast<std::uint8_t>(status & 0x0FU);\n        midiLastStatus_.store(static_cast<int>(status), std::memory_order_relaxed);\n        midiLastData1_.store(static_cast<int>(data1), std::memory_order_relaxed);\n        midiLastData2_.store(static_cast<int>(data2), std::memory_order_relaxed);\n        midiActivitySerial_.fetch_add(1U, std::memory_order_release);\n'''
-if needle in s:
-    s=s.replace(needle,repl,1)
-elif 'midiLastStatus_.store' not in s:
-    raise SystemExit('midi activity anchor changed')
 
-getter_anchor = '''    int midiDeviceCount() const noexcept { return midiDeviceCount_.load(std::memory_order_relaxed); }\n    int midiLastError() const noexcept { return midiLastError_.load(std::memory_order_relaxed); }\n'''
-getter_new = '''    int midiDeviceCount() const noexcept { return midiDeviceCount_.load(std::memory_order_relaxed); }\n    int midiLastError() const noexcept { return midiLastError_.load(std::memory_order_relaxed); }\n    std::uint64_t midiActivitySerial() const noexcept { return midiActivitySerial_.load(std::memory_order_acquire); }\n    int midiLastStatus() const noexcept { return midiLastStatus_.load(std::memory_order_relaxed); }\n    int midiLastData1() const noexcept { return midiLastData1_.load(std::memory_order_relaxed); }\n    int midiLastData2() const noexcept { return midiLastData2_.load(std::memory_order_relaxed); }\n    bool testInstrumentEnabled() const noexcept { return testInstrument_.enabled(); }\n    bool testNoteOn(std::uint8_t note, std::uint8_t velocity) noexcept {\n        if (!testInstrument_.enabled() || velocity == 0U) return false;\n        testInstrument_.noteOn(note, velocity);\n        return true;\n    }\n    void testNoteOff(std::uint8_t note) noexcept { testInstrument_.noteOff(note); }\n'''
-if getter_anchor in s:
-    s=s.replace(getter_anchor,getter_new,1)
-elif 'midiActivitySerial() const noexcept' not in s:
-    raise SystemExit('native getter anchor changed')
+# Ensure MIDI activity serial exists even if an earlier patch changed its anchor.
+if 'std::atomic<std::uint64_t> midiActivitySerial_' not in s:
+    anchor = '    BuiltinTestInstrument testInstrument_{};\n'
+    if anchor not in s:
+        raise SystemExit('BuiltinTestInstrument member anchor missing')
+    s = s.replace(anchor, anchor + '    std::atomic<std::uint64_t> midiActivitySerial_{0U};\n', 1)
 
-member_anchor = '''    BuiltinTestInstrument testInstrument_{};\n    std::atomic<std::uint64_t> midiActivitySerial_{0U};\n'''
-member_new = '''    BuiltinTestInstrument testInstrument_{};\n    std::atomic<std::uint64_t> midiActivitySerial_{0U};\n    std::atomic<int> midiLastStatus_{0};\n    std::atomic<int> midiLastData1_{0};\n    std::atomic<int> midiLastData2_{0};\n'''
-if member_anchor in s:
-    s=s.replace(member_anchor,member_new,1)
-elif 'midiLastStatus_{0}' not in s:
-    raise SystemExit('native diagnostics member anchor changed')
+# Add last-message atomics once.
+member_anchor = '    std::atomic<std::uint64_t> midiActivitySerial_{0U};\n'
+member_add = (
+    member_anchor +
+    '    std::atomic<int> midiLastStatus_{0};\n'
+    '    std::atomic<int> midiLastData1_{0};\n'
+    '    std::atomic<int> midiLastData2_{0};\n'
+)
+if 'std::atomic<int> midiLastStatus_' not in s:
+    if member_anchor not in s:
+        raise SystemExit('MIDI serial member anchor missing')
+    s = s.replace(member_anchor, member_add, 1)
 
-jni_anchor = '''extern "C" JNIEXPORT jint JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeMidiLastError(JNIEnv*,jobject){return sampler().midiLastError();}\n'''
-jni_new = jni_anchor + '''extern "C" JNIEXPORT jlong JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeMidiActivitySerial(JNIEnv*,jobject){return static_cast<jlong>(sampler().midiActivitySerial());}\nextern "C" JNIEXPORT jintArray JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeMidiLastMessage(JNIEnv* env,jobject){const std::array<jint,3>v{{sampler().midiLastStatus(),sampler().midiLastData1(),sampler().midiLastData2()}};jintArray a=env->NewIntArray(3);if(a!=nullptr)env->SetIntArrayRegion(a,0,3,v.data());return a;}\nextern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeAudioStarted(JNIEnv*,jobject){return sampler().started()?JNI_TRUE:JNI_FALSE;}\nextern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeTestInstrumentEnabled(JNIEnv*,jobject){return sampler().testInstrumentEnabled()?JNI_TRUE:JNI_FALSE;}\nextern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeTestNoteOn(JNIEnv*,jobject,jint note,jint velocity){return sampler().testNoteOn(static_cast<std::uint8_t>(std::clamp(note,0,127)),static_cast<std::uint8_t>(std::clamp(velocity,0,127)))?JNI_TRUE:JNI_FALSE;}\nextern "C" JNIEXPORT void JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeTestNoteOff(JNIEnv*,jobject,jint note){sampler().testNoteOff(static_cast<std::uint8_t>(std::clamp(note,0,127)));}\n'''
-if 'nativeMidiActivitySerial' not in s:
-    if jni_anchor not in s: raise SystemExit('JNI diagnostics anchor changed')
-    s=s.replace(jni_anchor,jni_new,1)
-cpp.write_text(s,encoding='utf-8')
+# Locate the midi() body structurally and insert diagnostics after channel decode.
+if 'midiLastStatus_.store' not in s:
+    midi_start = s.find('    bool midi(std::uint8_t status, std::uint8_t data1, std::uint8_t data2) noexcept {')
+    if midi_start < 0:
+        raise SystemExit('midi() method missing')
+    switch_pos = s.find('        switch (kind) {', midi_start)
+    if switch_pos < 0:
+        raise SystemExit('midi() switch missing')
+    body = s[midi_start:switch_pos]
+    ch_line = '        const std::uint8_t ch = static_cast<std::uint8_t>(status & 0x0FU);\n'
+    rel = body.find(ch_line)
+    if rel < 0:
+        raise SystemExit('midi() channel decode missing')
+    insert_pos = midi_start + rel + len(ch_line)
+    diag = (
+        '        midiLastStatus_.store(static_cast<int>(status), std::memory_order_relaxed);\n'
+        '        midiLastData1_.store(static_cast<int>(data1), std::memory_order_relaxed);\n'
+        '        midiLastData2_.store(static_cast<int>(data2), std::memory_order_relaxed);\n'
+    )
+    # If the serial increment is already elsewhere in the midi pre-switch body, keep it.
+    if 'midiActivitySerial_.fetch_add' not in body:
+        diag += '        midiActivitySerial_.fetch_add(1U, std::memory_order_release);\n'
+    s = s[:insert_pos] + diag + s[insert_pos:]
 
-k=native.read_text(encoding='utf-8')
-anchor='''    external fun nativeMidiLastError(): Int\n'''
-add='''    external fun nativeMidiLastError(): Int\n    external fun nativeMidiActivitySerial(): Long\n    external fun nativeMidiLastMessage(): IntArray\n    external fun nativeAudioStarted(): Boolean\n    external fun nativeTestInstrumentEnabled(): Boolean\n    external fun nativeTestNoteOn(note: Int, velocity: Int): Boolean\n    external fun nativeTestNoteOff(note: Int)\n'''
-if 'nativeMidiActivitySerial()' not in k:
-    if anchor not in k: raise SystemExit('NativeSamplerEngine MIDI anchor changed')
-    k=k.replace(anchor,add,1)
-native.write_text(k,encoding='utf-8')
+# Upgrade any existing serial increment to release ordering for UI observation.
+s = s.replace('midiActivitySerial_.fetch_add(1U, std::memory_order_relaxed);',
+              'midiActivitySerial_.fetch_add(1U, std::memory_order_release);')
 
-k=controller.read_text(encoding='utf-8')
-old='''        val droppedRealtimeEvents: Int\n    )\n'''
-new='''        val droppedRealtimeEvents: Int,\n        val running: Boolean,\n        val lastError: Int,\n        val testInstrumentEnabled: Boolean\n    )\n\n    data class MidiStatus(\n        val deviceCount: Int,\n        val lastError: Int,\n        val activitySerial: Long,\n        val status: Int,\n        val data1: Int,\n        val data2: Int\n    )\n'''
-if old in k:
-    k=k.replace(old,new,1)
-elif 'data class MidiStatus(' not in k:
-    raise SystemExit('AudioStatus anchor changed')
+# Public getters/test trigger. Insert independently so previous partial patches are accepted.
+getter_anchor = '    int midiLastError() const noexcept { return midiLastError_.load(std::memory_order_relaxed); }\n'
+if getter_anchor not in s:
+    raise SystemExit('midiLastError getter missing')
+getters = ''
+if 'midiActivitySerial() const noexcept' not in s:
+    getters += '    std::uint64_t midiActivitySerial() const noexcept { return midiActivitySerial_.load(std::memory_order_acquire); }\n'
+if 'midiLastStatus() const noexcept' not in s:
+    getters += '    int midiLastStatus() const noexcept { return midiLastStatus_.load(std::memory_order_relaxed); }\n'
+if 'midiLastData1() const noexcept' not in s:
+    getters += '    int midiLastData1() const noexcept { return midiLastData1_.load(std::memory_order_relaxed); }\n'
+if 'midiLastData2() const noexcept' not in s:
+    getters += '    int midiLastData2() const noexcept { return midiLastData2_.load(std::memory_order_relaxed); }\n'
+if 'testInstrumentEnabled() const noexcept' not in s:
+    getters += '    bool testInstrumentEnabled() const noexcept { return testInstrument_.enabled(); }\n'
+if 'testNoteOn(std::uint8_t note' not in s:
+    getters += (
+        '    bool testNoteOn(std::uint8_t note, std::uint8_t velocity) noexcept {\n'
+        '        if (!testInstrument_.enabled() || velocity == 0U) return false;\n'
+        '        testInstrument_.noteOn(note, velocity);\n'
+        '        return true;\n'
+        '    }\n'
+    )
+if 'testNoteOff(std::uint8_t note' not in s:
+    getters += '    void testNoteOff(std::uint8_t note) noexcept { testInstrument_.noteOff(note); }\n'
+if getters:
+    s = s.replace(getter_anchor, getter_anchor + getters, 1)
 
-old='''            limiterGainReductionDb = meters.getOrElse(2) { 0f },\n            activeVoices = meters.getOrElse(3) { 0f }.toInt(),\n            droppedRealtimeEvents = meters.getOrElse(4) { 0f }.toInt()\n        )\n    }\n'''
-new='''            limiterGainReductionDb = meters.getOrElse(2) { 0f },\n            activeVoices = meters.getOrElse(3) { 0f }.toInt(),\n            droppedRealtimeEvents = meters.getOrElse(4) { 0f }.toInt(),\n            running = engine.nativeAudioStarted(),\n            lastError = engine.nativeLastAudioError(),\n            testInstrumentEnabled = engine.nativeTestInstrumentEnabled()\n        )\n    }\n\n    fun midiStatus(): MidiStatus {\n        val msg = engine.nativeMidiLastMessage()\n        return MidiStatus(\n            deviceCount = engine.nativeMidiDeviceCount().coerceAtLeast(0),\n            lastError = engine.nativeMidiLastError(),\n            activitySerial = engine.nativeMidiActivitySerial(),\n            status = msg.getOrElse(0) { 0 },\n            data1 = msg.getOrElse(1) { 0 },\n            data2 = msg.getOrElse(2) { 0 }\n        )\n    }\n\n    fun testEpNoteOn(note: Int = 60, velocity: Int = 110): Boolean =\n        !closed.get() && engine.nativeTestNoteOn(note.coerceIn(0,127), velocity.coerceIn(1,127))\n\n    fun testEpNoteOff(note: Int = 60) {\n        if (!closed.get()) engine.nativeTestNoteOff(note.coerceIn(0,127))\n    }\n'''
-if old in k:
-    k=k.replace(old,new,1)
-elif 'fun midiStatus(): MidiStatus' not in k:
-    raise SystemExit('audioStatus return anchor changed')
-controller.write_text(k,encoding='utf-8')
+# JNI diagnostics. Add each family once after nativeMidiLastError.
+jni_anchor = 'extern "C" JNIEXPORT jint JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeMidiLastError(JNIEnv*,jobject){return sampler().midiLastError();}\n'
+if jni_anchor not in s:
+    raise SystemExit('JNI midiLastError anchor missing')
+jni = ''
+if 'Java_com_silveton_sampler_NativeSamplerEngine_nativeMidiActivitySerial' not in s:
+    jni += 'extern "C" JNIEXPORT jlong JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeMidiActivitySerial(JNIEnv*,jobject){return static_cast<jlong>(sampler().midiActivitySerial());}\n'
+if 'Java_com_silveton_sampler_NativeSamplerEngine_nativeMidiLastMessage' not in s:
+    jni += 'extern "C" JNIEXPORT jintArray JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeMidiLastMessage(JNIEnv* env,jobject){const std::array<jint,3>v{{sampler().midiLastStatus(),sampler().midiLastData1(),sampler().midiLastData2()}};jintArray a=env->NewIntArray(3);if(a!=nullptr)env->SetIntArrayRegion(a,0,3,v.data());return a;}\n'
+if 'Java_com_silveton_sampler_NativeSamplerEngine_nativeAudioStarted' not in s:
+    jni += 'extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeAudioStarted(JNIEnv*,jobject){return sampler().started()?JNI_TRUE:JNI_FALSE;}\n'
+if 'Java_com_silveton_sampler_NativeSamplerEngine_nativeTestInstrumentEnabled' not in s:
+    jni += 'extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeTestInstrumentEnabled(JNIEnv*,jobject){return sampler().testInstrumentEnabled()?JNI_TRUE:JNI_FALSE;}\n'
+if 'Java_com_silveton_sampler_NativeSamplerEngine_nativeTestNoteOn' not in s:
+    jni += 'extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeTestNoteOn(JNIEnv*,jobject,jint note,jint velocity){return sampler().testNoteOn(static_cast<std::uint8_t>(std::clamp(note,0,127)),static_cast<std::uint8_t>(std::clamp(velocity,0,127)))?JNI_TRUE:JNI_FALSE;}\n'
+if 'Java_com_silveton_sampler_NativeSamplerEngine_nativeTestNoteOff' not in s:
+    jni += 'extern "C" JNIEXPORT void JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeTestNoteOff(JNIEnv*,jobject,jint note){sampler().testNoteOff(static_cast<std::uint8_t>(std::clamp(note,0,127)));}\n'
+if jni:
+    s = s.replace(jni_anchor, jni_anchor + jni, 1)
+cpp.write_text(s, encoding='utf-8')
 
-k=view.read_text(encoding='utf-8')
-field_anchor='''    private var frameAudioStatus: SamplerAppController.AudioStatus = sampler.audioStatus()\n    private var frameUpperMeters: List<Pair<Float, Float>> = List(7) { 0f to 0f }\n'''
-field_new='''    private var frameAudioStatus: SamplerAppController.AudioStatus = sampler.audioStatus()\n    private var frameUpperMeters: List<Pair<Float, Float>> = List(7) { 0f to 0f }\n    private var frameMidiStatus: SamplerAppController.MidiStatus = sampler.midiStatus()\n    private var lastMidiSerial = frameMidiStatus.activitySerial\n    private var midiFlashUntilMs = 0L\n'''
-if 'frameMidiStatus:' not in k:
-    if field_anchor not in k: raise SystemExit('view diagnostic field anchor changed')
-    k=k.replace(field_anchor,field_new,1)
+# ---------- Kotlin native declarations ----------
+k = native.read_text(encoding='utf-8')
+anchor = '    external fun nativeMidiLastError(): Int\n'
+if anchor not in k:
+    raise SystemExit('NativeSamplerEngine MIDI anchor missing')
+add = ''
+for decl in [
+    '    external fun nativeMidiActivitySerial(): Long\n',
+    '    external fun nativeMidiLastMessage(): IntArray\n',
+    '    external fun nativeAudioStarted(): Boolean\n',
+    '    external fun nativeTestInstrumentEnabled(): Boolean\n',
+    '    external fun nativeTestNoteOn(note: Int, velocity: Int): Boolean\n',
+    '    external fun nativeTestNoteOff(note: Int)\n',
+]:
+    if decl.strip() not in k:
+        add += decl
+if add:
+    k = k.replace(anchor, anchor + add, 1)
+native.write_text(k, encoding='utf-8')
 
-old='''        frameAudioStatus = sampler.audioStatus()\n        frameUpperMeters = sampler.upperMeters()\n\n        val w = width.toFloat()\n'''
-new='''        frameAudioStatus = sampler.audioStatus()\n        frameUpperMeters = sampler.upperMeters()\n        frameMidiStatus = sampler.midiStatus()\n        if (frameMidiStatus.activitySerial != lastMidiSerial) {\n            lastMidiSerial = frameMidiStatus.activitySerial\n            midiFlashUntilMs = android.os.SystemClock.elapsedRealtime() + 220L\n        }\n\n        val w = width.toFloat()\n'''
-if old in k:
-    k=k.replace(old,new,1)
-elif 'midiFlashUntilMs = android.os.SystemClock.elapsedRealtime() + 220L' not in k:
-    raise SystemExit('view onDraw diagnostic anchor changed')
+# ---------- Controller wrappers ----------
+k = controller.read_text(encoding='utf-8')
+if 'data class MidiStatus(' not in k:
+    class_anchor = 'class SamplerAppController('
+    class_pos = k.find(class_anchor)
+    if class_pos < 0:
+        raise SystemExit('SamplerAppController class missing')
+    brace = k.find('{', class_pos)
+    if brace < 0:
+        raise SystemExit('SamplerAppController opening brace missing')
+    block = '''\n    data class MidiStatus(\n        val deviceCount: Int,\n        val lastError: Int,\n        val activitySerial: Long,\n        val status: Int,\n        val data1: Int,\n        val data2: Int\n    )\n'''
+    k = k[:brace+1] + block + k[brace+1:]
 
-def replace_method(text,start_sig,next_sig,body):
-    a=text.find(start_sig)
-    if a<0: raise SystemExit(f'missing {start_sig}')
-    b=text.find(next_sig,a)
-    if b<0: raise SystemExit(f'missing next after {start_sig}')
-    return text[:a]+body.rstrip()+'\n\n'+text[b:]
+# Add lightweight wrapper methods before panic(), avoiding AudioStatus schema churn.
+if 'fun midiStatus(): MidiStatus' not in k:
+    anchor = '    fun panic()'
+    pos = k.find(anchor)
+    if pos < 0:
+        raise SystemExit('controller panic anchor missing')
+    methods = '''    fun midiStatus(): MidiStatus {\n        val msg = engine.nativeMidiLastMessage()\n        return MidiStatus(\n            deviceCount = engine.nativeMidiDeviceCount().coerceAtLeast(0),\n            lastError = engine.nativeMidiLastError(),\n            activitySerial = engine.nativeMidiActivitySerial(),\n            status = msg.getOrElse(0) { 0 },\n            data1 = msg.getOrElse(1) { 0 },\n            data2 = msg.getOrElse(2) { 0 }\n        )\n    }\n\n    fun audioRunning(): Boolean = !closed.get() && engine.nativeAudioStarted()\n    fun audioLastError(): Int = engine.nativeLastAudioError()\n    fun testInstrumentEnabled(): Boolean = !closed.get() && engine.nativeTestInstrumentEnabled()\n    fun testEpNoteOn(note: Int = 60, velocity: Int = 110): Boolean =\n        !closed.get() && engine.nativeTestNoteOn(note.coerceIn(0,127), velocity.coerceIn(1,127))\n    fun testEpNoteOff(note: Int = 60) { if (!closed.get()) engine.nativeTestNoteOff(note.coerceIn(0,127)) }\n\n'''
+    k = k[:pos] + methods + k[pos:]
+controller.write_text(k, encoding='utf-8')
 
-header=r'''    private fun drawHeader(c: Canvas, w: Float, h: Float) {
+# ---------- GUI live status ----------
+k = view.read_text(encoding='utf-8')
+field_anchor = '    private var frameUpperMeters: List<Pair<Float, Float>> = List(7) { 0f to 0f }\n'
+if 'private var frameMidiStatus:' not in k:
+    if field_anchor not in k:
+        raise SystemExit('view frame meter anchor missing')
+    fields = (
+        field_anchor +
+        '    private var frameMidiStatus: SamplerAppController.MidiStatus = sampler.midiStatus()\n'
+        '    private var lastMidiSerial = frameMidiStatus.activitySerial\n'
+        '    private var midiFlashUntilMs = 0L\n'
+    )
+    k = k.replace(field_anchor, fields, 1)
+
+if 'midiFlashUntilMs = android.os.SystemClock.elapsedRealtime() + 220L' not in k:
+    draw_anchor = '        frameUpperMeters = sampler.upperMeters()\n'
+    if draw_anchor not in k:
+        raise SystemExit('view onDraw meter anchor missing')
+    draw_add = (
+        draw_anchor +
+        '        frameMidiStatus = sampler.midiStatus()\n'
+        '        if (frameMidiStatus.activitySerial != lastMidiSerial) {\n'
+        '            lastMidiSerial = frameMidiStatus.activitySerial\n'
+        '            midiFlashUntilMs = android.os.SystemClock.elapsedRealtime() + 220L\n'
+        '        }\n'
+    )
+    k = k.replace(draw_anchor, draw_add, 1)
+
+def replace_method(text: str, start_sig: str, next_sig: str, body: str) -> str:
+    a = text.find(start_sig)
+    if a < 0:
+        raise SystemExit(f'missing method {start_sig}')
+    b = text.find(next_sig, a)
+    if b < 0:
+        raise SystemExit(f'missing next method after {start_sig}')
+    return text[:a] + body.rstrip() + '\n\n' + text[b:]
+
+header = r'''    private fun drawHeader(c: Canvas, w: Float, h: Float) {
         val sx = w / DESIGN_W
         val sy = h / DESIGN_H
         val ss = min(sx, sy)
@@ -92,54 +199,105 @@ header=r'''    private fun drawHeader(c: Canvas, w: Float, h: Float) {
         c.drawRect(0f, 0f, w, hh, paint)
         paint.shader = null
         line(c, 16f*sx, hh-1f*sy, w-16f*sx, hh-1f*sy, Color.argb(28,255,255,255), 1f*ss)
-        val gear=RectF(16f*sx,12f*sy,84f*sx,64f*sy)
-        silvKey(c,gear,page==Page.SETTINGS,false); drawGear(c,gear.centerX(),gear.centerY(),12f*ss)
+
+        val gear = RectF(16f*sx,12f*sy,84f*sx,64f*sy)
+        silvKey(c,gear,page==Page.SETTINGS,false)
+        drawGear(c,gear.centerX(),gear.centerY(),12f*ss)
         hit(gear,{_,_-> page=Page.SETTINGS; refreshGlobal()})
-        val panic=RectF(96f*sx,12f*sy,244f*sx,64f*sy)
-        silvKey(c,panic,false,true); silvLed(c,panic.left+20f*sx,panic.centerY(),true,true,5.5f*ss)
+
+        val panic = RectF(96f*sx,12f*sy,244f*sx,64f*sy)
+        silvKey(c,panic,false,true)
+        silvLed(c,panic.left+20f*sx,panic.centerY(),true,true,5.5f*ss)
         text(c,"PANIC",panic.centerX()+8f*sx,panic.centerY()+6f*sy,17f*ss,C_TEXT,alignCenter=true,bold=true)
         hit(panic,{_,_->sampler.panic()})
-        val test=RectF(254f*sx,12f*sy,374f*sx,64f*sy)
-        val testReady=frameAudioStatus.testInstrumentEnabled
-        silvKey(c,test,testReady,false,enabled=testReady); silvLed(c,test.left+18f*sx,test.centerY(),testReady,false,4.5f*ss)
+
+        val test = RectF(254f*sx,12f*sy,374f*sx,64f*sy)
+        val testReady = sampler.testInstrumentEnabled()
+        silvKey(c,test,testReady,false,enabled=testReady)
+        silvLed(c,test.left+18f*sx,test.centerY(),testReady,false,4.5f*ss)
         text(c,"TEST EP",test.centerX()+7f*sx,test.centerY()+6f*sy,14f*ss,if(testReady)C_TEXT else C_TEXT_MUTED,alignCenter=true,bold=testReady)
         if(testReady) hit(test,{_,_-> if(sampler.testEpNoteOn(60,110)) postDelayed({sampler.testEpNoteOff(60)},650L)})
-        drawBrand(c,w*0.5f,38f*sy,sx,sy)
-        val a=frameAudioStatus; val m=frameMidiStatus; val now=android.os.SystemClock.elapsedRealtime()
-        val midiRx=now<midiFlashUntilMs; val midiConnected=max(midiConnections,m.deviceCount)>0
-        val midiValue=when { midiRx&&(m.status and 0xF0)==0x90&&m.data2>0 -> "RX ${midiNoteName(m.data1)}"; midiRx -> "RX"; midiConnected -> "ON"; m.lastError!=0 -> "E${-m.lastError}"; else -> "OFF" }
-        val audioOk=a.running&&a.sampleRate==96000&&a.framesPerBurst==96&&a.bufferSizeFrames==192
-        val audioValue=when { audioOk -> "96k 96x2"; a.running -> "${a.sampleRate/1000}k ${a.framesPerBurst}"; a.lastError!=0 -> "OFF E${-a.lastError}"; else -> "OFF" }
-        val chipY=16f*sy; val chipH=44f*sy; val gap=8f*sx; var right=w-16f*sx
-        val midiR=RectF(right-124f*sx,chipY,right,chipY+chipH); silvStatus(c,midiR,"MIDI",midiValue,midiConnected||midiRx,sx,sy); right=midiR.left-gap
-        val xrunR=RectF(right-108f*sx,chipY,right,chipY+chipH); silvStatus(c,xrunR,"XRUN",a.xrunCount.toString(),audioOk&&a.xrunCount==0,sx,sy); right=xrunR.left-gap
-        val audioR=RectF(right-164f*sx,chipY,right,chipY+chipH); silvStatus(c,audioR,"AUDIO",audioValue,audioOk,sx,sy)
-    }'''
-k=replace_method(k,'    private fun drawHeader(','    private fun drawRightNav(',header)
-k=k.replace('''        text(c, activeItem?.name ?: "Силветон", left+95f*sx, nowBottom-17f*sy, 42f*ss, C_TEXT)\n''','''        val currentName = activeItem?.name ?: if (frameAudioStatus.testInstrumentEnabled) "TEST EP" else "Силветон"\n        text(c, currentName, left+95f*sx, nowBottom-17f*sy, 42f*ss, C_TEXT)\n''',1)
-k=k.replace('''        text(c, if (activeItem != null) "%03d".format(currentNumber) else "–", left, nowBottom-16f*sy, 46f*ss, C_ACCENT)\n''','''        text(c, if (activeItem != null) "%03d".format(currentNumber) else if (frameAudioStatus.testInstrumentEnabled) "TST" else "–", left, nowBottom-16f*sy, 46f*ss, C_ACCENT)\n''',1)
-status=r'''    private fun silvStatus(c: Canvas, r: RectF, label: String, value: String, on: Boolean, sx: Float, sy: Float) {
-        val ss=min(sx,sy); paint.style=Paint.Style.FILL
-        paint.shader=LinearGradient(0f,r.top,0f,r.bottom,Color.rgb(27,33,42),Color.rgb(18,23,30),Shader.TileMode.CLAMP); c.drawRoundRect(r,r.height()*0.5f,r.height()*0.5f,paint); paint.shader=null
-        paint.style=Paint.Style.STROKE; paint.strokeWidth=1f*ss; paint.color=Color.argb(38,255,255,255); c.drawRoundRect(r,r.height()*0.5f,r.height()*0.5f,paint); paint.style=Paint.Style.FILL
-        if(label=="MIDI") { silvLed(c,r.left+17f*sx,r.centerY(),on,false,5f*ss); text(c,label,r.left+30f*sx,r.centerY()-2f*sy,9f*ss,C_TEXT_MUTED,bold=true); text(c,value,r.left+30f*sx,r.centerY()+14f*sy,13f*ss,if(on)C_TEXT else C_PANIC,bold=true) }
-        else { text(c,label,r.left+13f*sx,r.centerY()-3f*sy,9f*ss,C_TEXT_MUTED,bold=true); text(c,value,r.left+13f*sx,r.centerY()+14f*sy,14f*ss,if(on)C_TEXT else C_PANIC,bold=true) }
-    }'''
-k=replace_method(k,'    private fun silvStatus(','    private fun colorWithAlpha(',status)
-anchor='    private fun colorWithAlpha(color: Int, alpha: Int): Int = Color.argb(alpha, Color.red(color), Color.green(color), Color.blue(color))\n'
-helper='''    private fun midiNoteName(note: Int): String {\n        val n=note.coerceIn(0,127); val names=arrayOf("C","C#","D","D#","E","F","F#","G","G#","A","A#","B")\n        return names[n%12]+(n/12-1)\n    }\n\n'''
-if 'private fun midiNoteName(' not in k:
-    if anchor not in k: raise SystemExit('view helper anchor changed')
-    k=k.replace(anchor,helper+anchor,1)
-view.write_text(k,encoding='utf-8')
 
+        drawBrand(c,w*0.5f,38f*sy,sx,sy)
+
+        val a = frameAudioStatus
+        val m = frameMidiStatus
+        val now = android.os.SystemClock.elapsedRealtime()
+        val midiRx = now < midiFlashUntilMs
+        val midiConnected = max(midiConnections,m.deviceCount) > 0
+        val midiValue = when {
+            midiRx && (m.status and 0xF0) == 0x90 && m.data2 > 0 -> "RX ${midiNoteName(m.data1)}"
+            midiRx -> "RX"
+            midiConnected -> "ON"
+            m.lastError != 0 -> "E${-m.lastError}"
+            else -> "OFF"
+        }
+        val running = sampler.audioRunning()
+        val lastAudioError = sampler.audioLastError()
+        val audioOk = running && a.sampleRate == 96000 && a.framesPerBurst == 96 && a.bufferSizeFrames == 192
+        val audioValue = when {
+            audioOk -> "96k 96x2"
+            running -> "${a.sampleRate/1000}k ${a.framesPerBurst}"
+            lastAudioError != 0 -> "OFF E${-lastAudioError}"
+            else -> "OFF"
+        }
+
+        val chipY=16f*sy; val chipH=44f*sy; val gap=8f*sx; var right=w-16f*sx
+        val midiR=RectF(right-124f*sx,chipY,right,chipY+chipH)
+        silvStatus(c,midiR,"MIDI",midiValue,midiConnected||midiRx,sx,sy); right=midiR.left-gap
+        val xrunR=RectF(right-108f*sx,chipY,right,chipY+chipH)
+        silvStatus(c,xrunR,"XRUN",a.xrunCount.toString(),audioOk&&a.xrunCount==0,sx,sy); right=xrunR.left-gap
+        val audioR=RectF(right-164f*sx,chipY,right,chipY+chipH)
+        silvStatus(c,audioR,"AUDIO",audioValue,audioOk,sx,sy)
+    }'''
+k = replace_method(k, '    private fun drawHeader(', '    private fun drawRightNav(', header)
+
+# Show the fallback sound name when no list entry exists.
+k = k.replace(
+    '        text(c, activeItem?.name ?: "Силветон", left+95f*sx, nowBottom-17f*sy, 42f*ss, C_TEXT)\n',
+    '        val currentName = activeItem?.name ?: if (sampler.testInstrumentEnabled()) "TEST EP" else "Силветон"\n'
+    '        text(c, currentName, left+95f*sx, nowBottom-17f*sy, 42f*ss, C_TEXT)\n', 1)
+
+if 'private fun midiNoteName(' not in k:
+    anchor = '    private fun colorWithAlpha(color: Int, alpha: Int): Int = Color.argb(alpha, Color.red(color), Color.green(color), Color.blue(color))\n'
+    if anchor not in k:
+        raise SystemExit('view colorWithAlpha anchor missing')
+    helper = '''    private fun midiNoteName(note: Int): String {\n        val n = note.coerceIn(0,127)\n        val names = arrayOf("C","C#","D","D#","E","F","F#","G","G#","A","A#","B")\n        return names[n%12] + (n/12 - 1)\n    }\n\n'''
+    k = k.replace(anchor, helper + anchor, 1)
+view.write_text(k, encoding='utf-8')
+
+# ---------- Contracts ----------
 for path, needles in {
-    cpp:['midiLastStatus_.store','midiActivitySerial() const noexcept','testNoteOn(std::uint8_t note','nativeMidiActivitySerial','nativeAudioStarted','nativeTestNoteOn'],
-    native:['nativeMidiActivitySerial(): Long','nativeAudioStarted(): Boolean','nativeTestNoteOn(note: Int, velocity: Int)'],
-    controller:['data class MidiStatus(','running = engine.nativeAudioStarted()','fun testEpNoteOn(','fun midiStatus(): MidiStatus'],
-    view:['"TEST EP"','"AUDIO"','"XRUN"','"RX ${midiNoteName(m.data1)}"','frameMidiStatus = sampler.midiStatus()']
+    cpp: [
+        'midiLastStatus_.store',
+        'midiActivitySerial() const noexcept',
+        'testNoteOn(std::uint8_t note',
+        'nativeMidiActivitySerial',
+        'nativeAudioStarted',
+        'nativeTestNoteOn',
+    ],
+    native: [
+        'nativeMidiActivitySerial(): Long',
+        'nativeAudioStarted(): Boolean',
+        'nativeTestNoteOn(note: Int, velocity: Int)',
+    ],
+    controller: [
+        'data class MidiStatus(',
+        'fun midiStatus(): MidiStatus',
+        'fun audioRunning(): Boolean',
+        'fun testEpNoteOn(',
+    ],
+    view: [
+        '"TEST EP"',
+        '"AUDIO"',
+        '"XRUN"',
+        'RX ${midiNoteName(m.data1)}',
+        'frameMidiStatus = sampler.midiStatus()',
+    ],
 }.items():
-    text=path.read_text(encoding='utf-8')
+    text = path.read_text(encoding='utf-8')
     for n in needles:
-        if n not in text: raise SystemExit(f'live diagnostics contract missing in {path.name}: {n}')
+        if n not in text:
+            raise SystemExit(f'live diagnostics contract missing in {path.name}: {n}')
+
 print('PASS: live hardware diagnostics + TEST EP control installed (real AUDIO/XRUN/MIDI state, MIDI RX activity, audible C4 self-test)')

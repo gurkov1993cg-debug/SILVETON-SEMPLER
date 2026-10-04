@@ -68,44 +68,19 @@ refresh = r'''    fun refreshAudioPermissions(): Result {
 '''
 k = k[:start] + refresh + k[end:]
 
-# Remove su -c completely. Open a root shell and feed the script on stdin.
-# This avoids the device-specific "-c parameter not set" failure and also
-# rejects empty commands explicitly before starting su.
-run_start = k.find('    private fun runSu(script: String, timeoutSeconds: Long): Result')
-if run_start < 0:
-    raise SystemExit('runSu method missing')
-run_end = k.find('\n    }\n}', run_start)
-if run_end < 0:
-    raise SystemExit('runSu method end missing')
-new_run = r'''    private fun runSu(script: String, timeoutSeconds: Long): Result {
-        val command = script.trim()
-        if (command.isEmpty()) return Result(false, "Root command empty")
+# Remove su -c without rewriting the whole Kotlin method. The previous version
+# searched for the method's closing braces and was brittle after other patches.
+# Keep the already-tested timeout/error handling intact and only change process
+# creation + script delivery to stdin.
+old_proc = '''        val p = ProcessBuilder("su", "-c", script)\n            .redirectErrorStream(true)\n            .start()\n'''
+new_proc = '''        val p = ProcessBuilder("su")\n            .redirectErrorStream(true)\n            .start()\n        p.outputStream.bufferedWriter().use { writer ->\n            writer.write(script)\n            writer.newLine()\n            writer.flush()\n        }\n'''
+if old_proc in k:
+    k = k.replace(old_proc, new_proc, 1)
+elif 'ProcessBuilder("su")' in k and 'writer.write(script)' in k:
+    pass
+else:
+    raise SystemExit('runSu process creation anchor missing')
 
-        return try {
-            val p = ProcessBuilder("su")
-                .redirectErrorStream(true)
-                .start()
-
-            p.outputStream.bufferedWriter().use { writer ->
-                writer.write(command)
-                writer.newLine()
-                writer.flush()
-            }
-
-            if (!p.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
-                p.destroyForcibly()
-                p.waitFor(1, TimeUnit.SECONDS)
-                Result(false, "Root setup timed out")
-            } else {
-                val output = p.inputStream.bufferedReader().use { it.readText() }.trim()
-                if (p.exitValue() == 0) Result(true)
-                else Result(false, "Root setup failed (${p.exitValue()}): $output")
-            }
-        } catch (t: Throwable) {
-            Result(false, "Root unavailable: ${t.message ?: t.javaClass.simpleName}")
-        }
-    }'''
-k = k[:run_start] + new_run + k[run_end + len('\n    }'):]
 root_mode.write_text(k, encoding='utf-8')
 
 # Prove source order: permission grant must happen before native ALSA open.
@@ -132,7 +107,7 @@ for token in [
     'controlC0',
     'magiskpolicy',
     'ProcessBuilder("su")',
-    'val command = script.trim()',
+    'writer.write(script)',
 ]:
     if token not in final:
         raise SystemExit(f'pre-ALSA/root contract missing: {token}')

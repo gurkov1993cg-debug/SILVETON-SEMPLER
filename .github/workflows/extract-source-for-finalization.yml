@@ -1,0 +1,41 @@
+name: Extract sampler source for finalization
+
+on:
+  push:
+    branches:
+      - sampler-finalization
+    paths:
+      - '.github/workflows/extract-source-for-finalization.yml'
+      - 'SILVETON-SEMPLER-source.zip'
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: sampler-finalization
+      - name: Extract source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf source-tree
+          mkdir -p source-tree
+          unzip -q SILVETON-SEMPLER-source.zip -d source-tree
+          find source-tree -name '.DS_Store' -delete
+      - name: Commit extracted source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add source-tree
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m 'Extract sampler source for finalization [extract]'
+          git push origin HEAD:sampler-finalization

@@ -33,7 +33,6 @@ workflows:
           test -f "$PROJECT_DIR/android/app/src/main/cpp/CMakeLists.txt"
           test -f "$PROJECT_DIR/core/CMakeLists.txt"
 
-          # Strict -Wconversion fix for Android Clang in metersArray().
           python3 - "$PROJECT_DIR" <<'PYFIX'
           from pathlib import Path
           import sys
@@ -104,7 +103,6 @@ workflows:
         script: |
           set -euo pipefail
           cd "$PROJECT_DIR"
-
           python3 ci/audit_direct_alsa.py
           python3 ci/audit_direct_midi.py
           python3 ci/audit_gui_contract.py
@@ -113,7 +111,6 @@ workflows:
         script: |
           set -euo pipefail
           cd "$PROJECT_DIR"
-
           rm -rf build-core
           cmake -S core -B build-core \
             -DCMAKE_BUILD_TYPE=Release \
@@ -126,7 +123,6 @@ workflows:
         script: |
           set -euo pipefail
           cd "$PROJECT_DIR/android"
-
           CI=true "$GRADLE_BIN" --no-daemon --stacktrace clean assembleRelease
 
       - name: Verify and collect APK
@@ -154,9 +150,11 @@ workflows:
           echo "$BADGING" | grep -q "sdkVersion:'26'"
           echo "$BADGING" | grep -q "targetSdkVersion:'35'"
 
-          ABIS="$(unzip -Z1 "$APK" | awk -F/ '/^lib\/[^/]+\/[^/]+\.so$/ {print $2}' | sort -u)"
+          APK_LIST="$(unzip -Z1 "$APK")"
+          ABIS="$(printf '%s\n' "$APK_LIST" | grep '^lib/' | grep '\.so$' | cut -d/ -f2 | sort -u)"
           test "$ABIS" = "arm64-v8a"
-          unzip -Z1 "$APK" | grep -qx 'lib/arm64-v8a/libsilveton_jni.so'
+          printf '%s\n' "$APK_LIST" | grep -qx 'lib/arm64-v8a/libsilveton_jni.so'
+
           TMP_DIR="$(mktemp -d)"
           unzip -qq "$APK" 'lib/arm64-v8a/libsilveton_jni.so' -d "$TMP_DIR"
           "$READELF" -h "$TMP_DIR/lib/arm64-v8a/libsilveton_jni.so" | grep -Eq 'Machine:[[:space:]]+AArch64'

@@ -20,6 +20,7 @@ workflows:
           test -f "$CM_BUILD_DIR/$SILVETON_ZIP"
           test -f "$CM_BUILD_DIR/codemagic_runtime_fix.py"
           test -f "$CM_BUILD_DIR/codemagic_root_apk_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_resume_fix.py"
           test -f "$CM_BUILD_DIR/codemagic_live_dsp_fix.py"
           test -f "$CM_BUILD_DIR/codemagic_test_instrument_fix.py"
           test -f "$CM_BUILD_DIR/codemagic_gui_sampler3.py"
@@ -35,6 +36,7 @@ workflows:
 
           python3 "$CM_BUILD_DIR/codemagic_runtime_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_root_apk_fix.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_resume_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_live_dsp_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_test_instrument_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_gui_sampler3.py" "$PROJECT_DIR"
@@ -53,6 +55,7 @@ workflows:
           grep -F 'class BuiltinTestInstrument' "$BRIDGE"
           grep -F 'testInstrument_.render(renderBuffer_.data(), frames, sampleRate());' "$BRIDGE"
           grep -F 'SilvetonRootRuntime.enter()' "$RUNTIME"
+          grep -F 'Audio reopen failed' "$RUNTIME"
           grep -F 'magiskpolicy' "$ROOTMODE"
           grep -F '0x4100-0x41ff' "$ROOTMODE"
           grep -F '0x5500-0x55ff' "$ROOTMODE"

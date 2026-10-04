@@ -48,10 +48,9 @@ refresh = r'''    fun refreshAudioPermissions(): Result {
                     exit 54
                 }
 
-            # Match the state that was physically proven on this SM-X130:
-            # owner media (1013), group audio (1005), rw for all. SELinux still
-            # remains enforcing, so the app-domain magiskpolicy rule above is
-            # still required.
+            # Match the state physically proven on this SM-X130:
+            # owner media (1013), group audio (1005), rw for all. SELinux stays
+            # enforcing, so the app-domain magiskpolicy rule above is still used.
             for n in "${'$'}CTL" "${'$'}PCM" /dev/snd/midiC*D*; do
                 [ -e "${'$'}n" ] || continue
                 chown 1013:1005 "${'$'}n" 2>/dev/null || {
@@ -124,8 +123,19 @@ for token in [
         raise SystemExit(f'pre-ALSA/root contract missing: {token}')
 if 'ProcessBuilder("su", "-c", script)' in final:
     raise SystemExit('stale su -c execution remains')
-if "chmod 0660 \"${'$'}n\"" in final:
-    raise SystemExit('stale restrictive ALSA chmod remains in refreshed gate')
+
+# Validate only the refreshed audio-permission method. Other root/MIDI helpers
+# may legitimately contain 0660 and must not fail the Direct-ALSA gate audit.
+audio_start = final.find('    fun refreshAudioPermissions(): Result {')
+audio_end = final.find('    fun refreshMidiPermissions(): Result {', audio_start)
+if audio_start < 0 or audio_end < 0:
+    raise SystemExit('final audio permission method anchors missing')
+audio_block = final[audio_start:audio_end]
+if 'chmod 0660' in audio_block:
+    raise SystemExit('stale restrictive ALSA chmod remains in refreshAudioPermissions')
+if 'chmod 0666' not in audio_block or 'chown 1013:1005' not in audio_block:
+    raise SystemExit('SM-X130 ALSA node mode missing from refreshAudioPermissions')
+
 if "key=\"idle_${'$'}c_${'$'}(basename" in final:
     raise SystemExit('stale shell $c_ nounset bug remains')
 

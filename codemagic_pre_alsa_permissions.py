@@ -124,7 +124,7 @@ for token in [
         raise SystemExit(f'pre-ALSA/root contract missing: {token}')
 if 'ProcessBuilder("su", "-c", script)' in final:
     raise SystemExit('stale su -c execution remains')
-if 'chmod 0660 "${'$'}n"' in final:
+if "chmod 0660 \"${'$'}n\"" in final:
     raise SystemExit('stale restrictive ALSA chmod remains in refreshed gate')
 if "key=\"idle_${'$'}c_${'$'}(basename" in final:
     raise SystemExit('stale shell $c_ nounset bug remains')

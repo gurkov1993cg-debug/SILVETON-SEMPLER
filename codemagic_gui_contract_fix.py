@@ -57,9 +57,9 @@ if 'private val statusChanged: (String?) -> Unit = {},' not in pre_body:
 controller.write_text(s, encoding='utf-8')
 print('PASS: Kotlin controller structure valid (MidiStatus in class body)')
 
-# Replace the old formatting-sensitive audit with a semantic contract audit.
-# It checks that the real native Canvas GUI still exposes all functional pages,
-# hit targets, live diagnostics and the playable TEST EP path.
+# Semantic GUI contract audit. The user-facing hardware-test instrument is now
+# labelled PIANO / STAGE PIANO, while the existing internal native wrapper names
+# testEpNoteOn/testEpNoteOff remain implementation details.
 content = r'''#!/usr/bin/env python3
 from pathlib import Path
 import re
@@ -88,7 +88,8 @@ required_view = {
     "EFFECTS renderer": "drawEffects(",
     "SETTINGS renderer": "drawSettings(",
     "panic action": "sampler.panic()",
-    "TEST EP control": '"TEST EP"',
+    "PIANO control": '"PIANO"',
+    "STAGE PIANO set-list slot": '"STAGE PIANO"',
     "AUDIO status": '"AUDIO"',
     "XRUN status": '"XRUN"',
     "MIDI live status": "frameMidiStatus = sampler.midiStatus()",
@@ -116,23 +117,21 @@ if settings_hit is None:
 print("PASS - GUI SETTINGS has real hit route")
 
 if "sampler.testEpNoteOn" not in view or "sampler.testEpNoteOff" not in view:
-    raise SystemExit("MISSING GUI contract: TEST EP is not wired to note on/off")
-print("PASS - GUI TEST EP is wired to native note on/off")
+    raise SystemExit("MISSING GUI contract: PIANO control is not wired to native note on/off")
+print("PASS - GUI PIANO control is wired to native note on/off")
 
 required_controller = {
     "MIDI status wrapper": "fun midiStatus(): MidiStatus",
     "audio running wrapper": "fun audioRunning(): Boolean",
     "audio error wrapper": "fun audioLastError(): Int",
-    "TEST EP note on": "fun testEpNoteOn(",
-    "TEST EP note off": "fun testEpNoteOff(",
+    "PIANO note on": "fun testEpNoteOn(",
+    "PIANO note off": "fun testEpNoteOff(",
 }
 for name, token in required_controller.items():
     if token not in controller:
         raise SystemExit(f"MISSING GUI/controller contract: {name}: {token}")
     print(f"PASS - controller {name}")
 
-# This catches the exact Kotlin regression that previously slipped through
-# source-token audits.
 class_pos = controller.find("class SamplerAppController(")
 body_pos = controller.find(") : AutoCloseable {", class_pos)
 if class_pos < 0 or body_pos < 0:
@@ -145,4 +144,4 @@ print("GUI contract audit: PASS")
 '''
 
 audit.write_text(content, encoding='utf-8')
-print('PASS: GUI audit upgraded to semantic functional contract + Kotlin structure guard')
+print('PASS: GUI audit aligned with PIANO/STAGE PIANO live-performance contract')

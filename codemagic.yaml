@@ -1,7 +1,7 @@
 workflows:
   silveton-sampler-android:
     name: SILVETON Sampler Android
-    instance_type: linux_x2
+    instance_type: mac_mini_m2
     max_build_duration: 60
 
     environment:
@@ -95,7 +95,7 @@ workflows:
           cmake -S core -B build-core \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_STANDARD=17
-          cmake --build build-core --parallel "$(nproc)"
+          cmake --build build-core --parallel "$(sysctl -n hw.ncpu)"
           ctest --test-dir build-core --output-on-failure
 
       - name: Build release APK
@@ -113,13 +113,33 @@ workflows:
           APK="$(find android/app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print -quit)"
           test -n "$APK"
 
-          ANDROID_BUILD_TOOLS_VERSION="$ANDROID_BUILD_TOOLS_VERSION" \
-          ANDROID_NDK_HOME="$ANDROID_NDK_HOME" \
-            bash ci/verify_apk.sh "$APK"
+          AAPT="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION/aapt"
+          APKSIGNER="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION/apksigner"
+          ZIPALIGN="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION/zipalign"
+          READELF="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-readelf"
+          test -x "$AAPT"
+          test -x "$APKSIGNER"
+          test -x "$ZIPALIGN"
+          test -x "$READELF"
+
+          BADGING="$($AAPT dump badging "$APK")"
+          echo "$BADGING" | grep -q "package: name='com.silveton.sampler'"
+          echo "$BADGING" | grep -q "sdkVersion:'26'"
+          echo "$BADGING" | grep -q "targetSdkVersion:'35'"
+
+          ABIS="$(unzip -Z1 "$APK" | awk -F/ '/^lib\/[^/]+\/[^/]+\.so$/ {print $2}' | sort -u)"
+          test "$ABIS" = "arm64-v8a"
+          unzip -Z1 "$APK" | grep -qx 'lib/arm64-v8a/libsilveton_jni.so'
+          TMP_DIR="$(mktemp -d)"
+          unzip -qq "$APK" 'lib/arm64-v8a/libsilveton_jni.so' -d "$TMP_DIR"
+          "$READELF" -h "$TMP_DIR/lib/arm64-v8a/libsilveton_jni.so" | grep -Eq 'Machine:[[:space:]]+AArch64'
+          "$ZIPALIGN" -c -P 16 -v 4 "$APK"
+          "$APKSIGNER" verify --verbose --print-certs "$APK"
+          rm -rf "$TMP_DIR"
 
           mkdir -p "$CM_BUILD_DIR/artifacts"
           cp "$APK" "$CM_BUILD_DIR/artifacts/SILVETON-SAMPLER-release.apk"
-          sha256sum "$CM_BUILD_DIR/artifacts/SILVETON-SAMPLER-release.apk" \
+          shasum -a 256 "$CM_BUILD_DIR/artifacts/SILVETON-SAMPLER-release.apk" \
             > "$CM_BUILD_DIR/artifacts/SILVETON-SAMPLER-release.apk.sha256.txt"
 
           echo "APK ready:"

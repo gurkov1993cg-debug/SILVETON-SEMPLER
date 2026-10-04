@@ -1,6 +1,6 @@
 workflows:
   silveton-sampler-android:
-    name: SILVETON Sampler Android
+    name: SILVETON Sampler Android Direct ALSA
     instance_type: mac_mini_m2
     max_build_duration: 60
 
@@ -20,7 +20,7 @@ workflows:
 
           test -f "$CM_BUILD_DIR/$SILVETON_ZIP"
           test -f "$CM_BUILD_DIR/codemagic_runtime_fix.py"
-          test -f "$CM_BUILD_DIR/codemagic_make_audio_privilege_module.py"
+          test -f "$CM_BUILD_DIR/codemagic_make_audio_boot_layer.py"
           rm -rf "$CM_BUILD_DIR/_silveton_src"
           mkdir -p "$CM_BUILD_DIR/_silveton_src"
           unzip -q "$CM_BUILD_DIR/$SILVETON_ZIP" -d "$CM_BUILD_DIR/_silveton_src"
@@ -117,20 +117,28 @@ workflows:
           python3 ci/audit_direct_midi.py
           python3 ci/audit_gui_contract.py
 
-      - name: Build SM-X130 Direct ALSA privilege module
+      - name: Build SM-X130 Direct ALSA boot layer
         script: |
           set -euo pipefail
           mkdir -p "$CM_BUILD_DIR/artifacts"
-          python3 "$CM_BUILD_DIR/codemagic_make_audio_privilege_module.py" "$CM_BUILD_DIR/artifacts"
-          MODULE="$CM_BUILD_DIR/artifacts/SILVETON-SM-X130-DIRECT-ALSA-MAGISK.zip"
-          test -f "$MODULE"
-          unzip -p "$MODULE" module.prop | grep -F 'id=silveton_direct_alsa'
-          unzip -p "$MODULE" system/etc/permissions/silveton-direct-alsa.xml \
+          python3 "$CM_BUILD_DIR/codemagic_make_audio_boot_layer.py" "$CM_BUILD_DIR/artifacts"
+          BOOT_LAYER="$CM_BUILD_DIR/artifacts/SILVETON-SM-X130-DIRECT-ALSA-BOOT-LAYER.zip"
+          test -f "$BOOT_LAYER"
+          unzip -p "$BOOT_LAYER" system/etc/permissions/silveton-direct-alsa.xml \
             | grep -F 'com.silveton.sampler.permission.DIRECT_ALSA'
-          unzip -p "$MODULE" system/etc/permissions/silveton-direct-alsa.xml \
+          unzip -p "$BOOT_LAYER" system/etc/permissions/silveton-direct-alsa.xml \
             | grep -F '<group gid="audio" />'
-          unzip -p "$MODULE" sepolicy.rule | grep -F 'audio_device:chr_file'
-          shasum -a 256 "$MODULE" > "$MODULE.sha256.txt"
+          unzip -p "$BOOT_LAYER" rootdir/etc/init/silveton-direct-alsa.rc \
+            | grep -F 'chmod 0660 /dev/snd/pcmC0D0p'
+          unzip -p "$BOOT_LAYER" sepolicy/silveton-direct-alsa.te \
+            | grep -F 'audio_device:chr_file'
+          unzip -p "$BOOT_LAYER" sepolicy/silveton-direct-alsa.te \
+            | grep -F '0x4100-0x41ff'
+          if unzip -l "$BOOT_LAYER" | grep -qi magisk; then
+            echo "ERROR: Magisk content present in boot-layer artifact" >&2
+            exit 1
+          fi
+          shasum -a 256 "$BOOT_LAYER" > "$BOOT_LAYER.sha256.txt"
 
       - name: Build and test native core
         script: |
@@ -240,5 +248,5 @@ workflows:
     artifacts:
       - artifacts/SILVETON-SAMPLER-release.apk
       - artifacts/SILVETON-SAMPLER-release.apk.sha256.txt
-      - artifacts/SILVETON-SM-X130-DIRECT-ALSA-MAGISK.zip
-      - artifacts/SILVETON-SM-X130-DIRECT-ALSA-MAGISK.zip.sha256.txt
+      - artifacts/SILVETON-SM-X130-DIRECT-ALSA-BOOT-LAYER.zip
+      - artifacts/SILVETON-SM-X130-DIRECT-ALSA-BOOT-LAYER.zip.sha256.txt

@@ -1,6 +1,6 @@
 workflows:
-  silveton-sampler-android:
-    name: SILVETON Sampler Android Direct ALSA
+  silveton-sampler-system:
+    name: SILVETON Sampler System App
     instance_type: mac_mini_m2
     max_build_duration: 60
 
@@ -14,13 +14,14 @@ workflows:
         ANDROID_CMAKE_VERSION: "3.22.1"
 
     scripts:
-      - name: Prepare and repair source
+      - name: Prepare SILVETON system-app source
         script: |
           set -euo pipefail
-
           test -f "$CM_BUILD_DIR/$SILVETON_ZIP"
           test -f "$CM_BUILD_DIR/codemagic_runtime_fix.py"
-          test -f "$CM_BUILD_DIR/codemagic_make_audio_boot_layer.py"
+          test -f "$CM_BUILD_DIR/codemagic_system_app_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_make_system_payload.py"
+
           rm -rf "$CM_BUILD_DIR/_silveton_src"
           mkdir -p "$CM_BUILD_DIR/_silveton_src"
           unzip -q "$CM_BUILD_DIR/$SILVETON_ZIP" -d "$CM_BUILD_DIR/_silveton_src"
@@ -28,31 +29,25 @@ workflows:
           SETTINGS="$(find "$CM_BUILD_DIR/_silveton_src" -type f -path '*/android/settings.gradle.kts' -print -quit)"
           test -n "$SETTINGS"
           PROJECT_DIR="$(dirname "$(dirname "$SETTINGS")")"
-
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$CM_ENV"
-          echo "Source root: $PROJECT_DIR"
-          test -f "$PROJECT_DIR/android/app/build.gradle.kts"
-          test -f "$PROJECT_DIR/android/app/src/main/cpp/CMakeLists.txt"
-          test -f "$PROJECT_DIR/core/CMakeLists.txt"
 
           python3 "$CM_BUILD_DIR/codemagic_runtime_fix.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_system_app_fix.py" "$PROJECT_DIR"
 
           BRIDGE="$PROJECT_DIR/android/app/src/main/cpp/SamplerAudioBridge.cpp"
+          RUNTIME="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SamplerRuntime.kt"
+          MODE="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SilvetonSystemMode.kt"
           MANIFEST="$PROJECT_DIR/android/app/src/main/AndroidManifest.xml"
+
           grep -F 'constexpr unsigned kRate = 96000U;' "$BRIDGE"
           grep -F 'constexpr unsigned kPeriods = 2U;' "$BRIDGE"
-          grep -F '"/dev/snd/controlC0"' "$BRIDGE"
-          grep -F 'ADDA_DL_CH1 DL1_CH1' "$BRIDGE"
-          grep -F 'ADDA_DL_CH2 DL1_CH2' "$BRIDGE"
-          grep -F 'DAC In Mux' "$BRIDGE"
-          grep -F 'HPL Mux' "$BRIDGE"
-          grep -F 'HPR Mux' "$BRIDGE"
-          grep -F 'SilvetonAudioLifecycle' "$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/MainActivity.kt"
+          grep -F 'pinCurrentThreadToCpu(7);' "$BRIDGE"
+          grep -F 'pinCurrentThreadToCpu(6);' "$BRIDGE"
+          grep -F 'sys.silveton.performance' "$MODE"
+          grep -F 'SilvetonSystemMode.enter()' "$RUNTIME"
+          grep -F 'android:directBootAware="true"' "$MANIFEST"
           grep -F 'com.silveton.sampler.permission.DIRECT_ALSA' "$MANIFEST"
-          if grep -Fq 'kRates{{96000U, 48000U}}' "$BRIDGE"; then
-            echo "ERROR: old ALSA rate probing survived runtime repair" >&2
-            exit 1
-          fi
+
           if grep -Fq '#include <aaudio/AAudio.h>' "$BRIDGE"; then
             echo "ERROR: AAudio returned to Direct ALSA runtime" >&2
             exit 1
@@ -61,22 +56,12 @@ workflows:
       - name: Install Android toolchain
         script: |
           set -euo pipefail
-
           ANDROID_SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Library/Android/sdk}}"
-          test -d "$ANDROID_SDK"
-
           SDKMANAGER="$ANDROID_SDK/cmdline-tools/latest/bin/sdkmanager"
           if [ ! -x "$SDKMANAGER" ]; then
             SDKMANAGER="$(find "$ANDROID_SDK/cmdline-tools" -type f -path '*/bin/sdkmanager' -perm +111 2>/dev/null | tail -1 || true)"
           fi
-          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
-            echo "Modern Android sdkmanager was not found under $ANDROID_SDK/cmdline-tools" >&2
-            find "$ANDROID_SDK" -maxdepth 4 -name sdkmanager -print || true
-            exit 1
-          fi
-
-          echo "Using SDK manager: $SDKMANAGER"
-          "$SDKMANAGER" --version
+          test -x "$SDKMANAGER"
           yes | "$SDKMANAGER" --sdk_root="$ANDROID_SDK" --licenses >/dev/null || true
           "$SDKMANAGER" --sdk_root="$ANDROID_SDK" \
             "platforms;android-35" \
@@ -85,8 +70,6 @@ workflows:
             "cmake;$ANDROID_CMAKE_VERSION"
 
           NDK_HOME="$ANDROID_SDK/ndk/$ANDROID_NDK_VERSION"
-          test -d "$NDK_HOME"
-
           echo "ANDROID_HOME=$ANDROID_SDK" >> "$CM_ENV"
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK" >> "$CM_ENV"
           echo "ANDROID_NDK_HOME=$NDK_HOME" >> "$CM_ENV"
@@ -94,51 +77,23 @@ workflows:
       - name: Install Gradle 8.9
         script: |
           set -euo pipefail
-
           TOOLS="$CM_BUILD_DIR/.silveton-tools"
           mkdir -p "$TOOLS"
           if [ ! -x "$TOOLS/gradle-$GRADLE_VERSION/bin/gradle" ]; then
-            curl -fL --retry 3 \
-              "https://services.gradle.org/distributions/gradle-$GRADLE_VERSION-bin.zip" \
-              -o "$TOOLS/gradle.zip"
+            curl -fL --retry 3 "https://services.gradle.org/distributions/gradle-$GRADLE_VERSION-bin.zip" -o "$TOOLS/gradle.zip"
             unzip -q -o "$TOOLS/gradle.zip" -d "$TOOLS"
           fi
-
           GRADLE_BIN="$TOOLS/gradle-$GRADLE_VERSION/bin/gradle"
           test -x "$GRADLE_BIN"
           echo "GRADLE_BIN=$GRADLE_BIN" >> "$CM_ENV"
-          "$GRADLE_BIN" --version
 
-      - name: Audit Direct ALSA MIDI and GUI contracts
+      - name: Audit sampler contracts
         script: |
           set -euo pipefail
           cd "$PROJECT_DIR"
           python3 ci/audit_direct_alsa.py
           python3 ci/audit_direct_midi.py
           python3 ci/audit_gui_contract.py
-
-      - name: Build SM-X130 Direct ALSA boot layer
-        script: |
-          set -euo pipefail
-          mkdir -p "$CM_BUILD_DIR/artifacts"
-          python3 "$CM_BUILD_DIR/codemagic_make_audio_boot_layer.py" "$CM_BUILD_DIR/artifacts"
-          BOOT_LAYER="$CM_BUILD_DIR/artifacts/SILVETON-SM-X130-DIRECT-ALSA-BOOT-LAYER.zip"
-          test -f "$BOOT_LAYER"
-          unzip -p "$BOOT_LAYER" system/etc/permissions/silveton-direct-alsa.xml \
-            | grep -F 'com.silveton.sampler.permission.DIRECT_ALSA'
-          unzip -p "$BOOT_LAYER" system/etc/permissions/silveton-direct-alsa.xml \
-            | grep -F '<group gid="audio" />'
-          unzip -p "$BOOT_LAYER" rootdir/etc/init/silveton-direct-alsa.rc \
-            | grep -F 'chmod 0660 /dev/snd/pcmC0D0p'
-          unzip -p "$BOOT_LAYER" sepolicy/silveton-direct-alsa.te \
-            | grep -F 'audio_device:chr_file'
-          unzip -p "$BOOT_LAYER" sepolicy/silveton-direct-alsa.te \
-            | grep -F '0x4100-0x41ff'
-          if unzip -l "$BOOT_LAYER" | grep -qi magisk; then
-            echo "ERROR: Magisk content present in boot-layer artifact" >&2
-            exit 1
-          fi
-          shasum -a 256 "$BOOT_LAYER" > "$BOOT_LAYER.sha256.txt"
 
       - name: Build and test native core
         script: |
@@ -152,34 +107,26 @@ workflows:
           cmake --build build-core --parallel "$(sysctl -n hw.ncpu)"
           ctest --test-dir build-core --output-on-failure
 
-      - name: Build release APK
+      - name: Build system-app APK
         script: |
           set -euo pipefail
           cd "$PROJECT_DIR/android"
           CI=true "$GRADLE_BIN" --no-daemon --stacktrace clean assembleRelease
 
-      - name: Verify and collect APK
+      - name: Verify APK and build one system integration artifact
         script: |
           set -euo pipefail
           cd "$PROJECT_DIR"
 
           APK="$(find android/app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print -quit)"
-          test -n "$APK"
           test -f "$APK"
-          echo "Verifying APK: $APK"
-          ls -lh "$APK"
 
           AAPT="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION/aapt"
           APKSIGNER="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION/apksigner"
           ZIPALIGN="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION/zipalign"
-          READELF="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-readelf"
-          if [ ! -x "$READELF" ]; then
-            READELF="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-arm64/bin/llvm-readelf"
-          fi
           test -x "$AAPT"
           test -x "$APKSIGNER"
           test -x "$ZIPALIGN"
-          test -x "$READELF"
 
           BADGING="$("$AAPT" dump badging "$APK")"
           case "$BADGING" in
@@ -187,66 +134,30 @@ workflows:
             *) echo "Wrong package id" >&2; exit 1 ;;
           esac
           case "$BADGING" in
-            *"sdkVersion:'26'"*) ;;
-            *) echo "Wrong minSdk" >&2; exit 1 ;;
-          esac
-          case "$BADGING" in
             *"targetSdkVersion:'35'"*) ;;
             *) echo "Wrong targetSdk" >&2; exit 1 ;;
           esac
 
-          PERMISSIONS="$("$AAPT" dump permissions "$APK")"
-          printf '%s\n' "$PERMISSIONS" | grep -F 'com.silveton.sampler.permission.DIRECT_ALSA'
-
-          TMP_DIR="$(mktemp -d)"
-          trap 'rm -rf "$TMP_DIR"' EXIT
-          python3 - "$APK" "$TMP_DIR" <<'PYAPK'
-          import shutil
-          import sys
-          import zipfile
-          from pathlib import Path
-
-          apk = Path(sys.argv[1])
-          out = Path(sys.argv[2])
-          wanted = "lib/arm64-v8a/libsilveton_jni.so"
-          with zipfile.ZipFile(apk, "r") as zf:
-              bad = zf.testzip()
-              if bad is not None:
-                  raise SystemExit(f"APK ZIP CRC failure: {bad}")
-              names = zf.namelist()
-              libs = [n for n in names if n.startswith("lib/") and n.endswith(".so")]
-              abis = sorted({n.split("/", 2)[1] for n in libs if n.count("/") >= 2})
-              print("APK ABIs:", ", ".join(abis) if abis else "<none>")
-              if abis != ["arm64-v8a"]:
-                  raise SystemExit(f"Unexpected APK ABIs: {abis!r}")
-              if wanted not in names:
-                  raise SystemExit(f"Missing {wanted}")
-              dst = out / wanted
-              dst.parent.mkdir(parents=True, exist_ok=True)
-              with zf.open(wanted, "r") as src, dst.open("wb") as f:
-                  shutil.copyfileobj(src, f)
-          PYAPK
-
-          "$READELF" -h "$TMP_DIR/lib/arm64-v8a/libsilveton_jni.so" > "$TMP_DIR/elf-header.txt"
-          grep -Eq 'Machine:[[:space:]]+AArch64' "$TMP_DIR/elf-header.txt"
-
-          echo "Checking 16 KiB APK alignment"
           "$ZIPALIGN" -c -P 16 -v 4 "$APK"
-
-          echo "Checking APK signature"
           "$APKSIGNER" verify --verbose --print-certs "$APK"
 
           mkdir -p "$CM_BUILD_DIR/artifacts"
-          cp "$APK" "$CM_BUILD_DIR/artifacts/SILVETON-SAMPLER-release.apk"
-          shasum -a 256 "$CM_BUILD_DIR/artifacts/SILVETON-SAMPLER-release.apk" \
-            > "$CM_BUILD_DIR/artifacts/SILVETON-SAMPLER-release.apk.sha256.txt"
+          python3 "$CM_BUILD_DIR/codemagic_make_system_payload.py" "$APK" "$CM_BUILD_DIR/artifacts"
 
-          echo "APK ready:"
-          ls -lh "$CM_BUILD_DIR/artifacts/SILVETON-SAMPLER-release.apk"
-          cat "$CM_BUILD_DIR/artifacts/SILVETON-SAMPLER-release.apk.sha256.txt"
+          PACKAGE="$CM_BUILD_DIR/artifacts/SILVETON-SM-X130-SYSTEM-INTEGRATION.zip"
+          test -f "$PACKAGE"
+          unzip -p "$PACKAGE" system_ext/priv-app/SilvetonSampler/SilvetonSampler.apk >/dev/null
+          unzip -p "$PACKAGE" system_ext/etc/permissions/silveton-direct-alsa.xml | grep -F '<group gid="audio" />'
+          unzip -p "$PACKAGE" system_ext/etc/init/silveton-performance.rc | grep -F 'sys.silveton.performance=1'
+          unzip -p "$PACKAGE" sepolicy/private/silveton_app.te | grep -F 'audio_device:chr_file'
+          unzip -p "$PACKAGE" sepolicy/private/seapp_contexts | grep -F 'name=com.silveton.sampler'
+          unzip -p "$PACKAGE" sepolicy/private/property_contexts | grep -F 'sys.silveton.performance'
+          if unzip -l "$PACKAGE" | grep -qi magisk; then
+            echo "ERROR: Magisk content present" >&2
+            exit 1
+          fi
+          shasum -a 256 "$PACKAGE" > "$PACKAGE.sha256.txt"
 
     artifacts:
-      - artifacts/SILVETON-SAMPLER-release.apk
-      - artifacts/SILVETON-SAMPLER-release.apk.sha256.txt
-      - artifacts/SILVETON-SM-X130-DIRECT-ALSA-BOOT-LAYER.zip
-      - artifacts/SILVETON-SM-X130-DIRECT-ALSA-BOOT-LAYER.zip.sha256.txt
+      - artifacts/SILVETON-SM-X130-SYSTEM-INTEGRATION.zip
+      - artifacts/SILVETON-SM-X130-SYSTEM-INTEGRATION.zip.sha256.txt

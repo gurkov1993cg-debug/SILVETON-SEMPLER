@@ -108,7 +108,10 @@ status = r'''    private fun silvStatus(c: Canvas, r: RectF, label: String, valu
             text(c, value, r.left+13f*sx, r.centerY()+14f*sy, 17f*ss, C_TEXT, bold=true)
         }
     }'''
-s = replace_method(s, '    private fun silvStatus(', '    private fun lighten(', status)
+# Keep the helpers inserted by codemagic_live_diagnostics_fix.py. Replacing through
+# lighten() used to delete midiNoteName() and colorWithAlpha(), which then made the
+# final Kotlin source fail compilation with unresolved references.
+s = replace_method(s, '    private fun silvStatus(', '    private fun midiNoteName(', status)
 
 # The forced built-in test instrument is a real DSP sound and is already driven by
 # external raw MIDI. When the user's set list is empty, expose it as slot 001 rather
@@ -160,6 +163,8 @@ required = [
     'silvStatus(c,audioR,"AUDIO",audioValue,audioSignal',
     '"STAGE PIANO"',
     '"BUILT-IN  •  RAW MIDI"',
+    'private fun midiNoteName(',
+    'private fun colorWithAlpha(',
 ]
 for needle in required:
     if needle not in s:

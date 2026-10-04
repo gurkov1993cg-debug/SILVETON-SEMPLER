@@ -7,18 +7,19 @@ workflows:
     environment:
       java: 17
       vars:
-        SILVETON_ZIP: SILVETON-SEMPLER-source.zip
+        SILVETON_ZIP: SILVETON-SEMPLER-source-fixed.zip
         GRADLE_VERSION: "8.9"
         ANDROID_BUILD_TOOLS_VERSION: "35.0.0"
         ANDROID_NDK_VERSION: "27.2.12479018"
         ANDROID_CMAKE_VERSION: "3.22.1"
 
     scripts:
-      - name: Prepare source
+      - name: Prepare and repair source
         script: |
           set -euo pipefail
 
           test -f "$CM_BUILD_DIR/$SILVETON_ZIP"
+          test -f "$CM_BUILD_DIR/codemagic_runtime_fix.py"
           rm -rf "$CM_BUILD_DIR/_silveton_src"
           mkdir -p "$CM_BUILD_DIR/_silveton_src"
           unzip -q "$CM_BUILD_DIR/$SILVETON_ZIP" -d "$CM_BUILD_DIR/_silveton_src"
@@ -33,20 +34,14 @@ workflows:
           test -f "$PROJECT_DIR/android/app/src/main/cpp/CMakeLists.txt"
           test -f "$PROJECT_DIR/core/CMakeLists.txt"
 
-          python3 - "$PROJECT_DIR" <<'PYFIX'
-          from pathlib import Path
-          import sys
+          python3 "$CM_BUILD_DIR/codemagic_runtime_fix.py" "$PROJECT_DIR"
 
-          project_dir = Path(sys.argv[1])
-          p = project_dir / "android/app/src/main/cpp/SamplerAudioBridge.cpp"
-          s = p.read_text()
-          old = """    for (int i=0;i<kUpperCount;++i) {\n        v[5 + i*2] = m.upperPeakLeft[static_cast<std::size_t>(i)];\n        v[6 + i*2] = m.upperPeakRight[static_cast<std::size_t>(i)];\n    }\n"""
-          new = """    for (std::size_t i = 0; i < static_cast<std::size_t>(kUpperCount); ++i) {\n        const std::size_t base = 5U + i * 2U;\n        v[base] = m.upperPeakLeft[i];\n        v[base + 1U] = m.upperPeakRight[i];\n    }\n"""
-          if old in s:
-              p.write_text(s.replace(old, new))
-          elif new not in s:
-              raise SystemExit("Unexpected metersArray source; refusing blind patch")
-          PYFIX
+          grep -F 'constexpr unsigned kRate = 96000U;' "$PROJECT_DIR/android/app/src/main/cpp/SamplerAudioBridge.cpp"
+          grep -F 'constexpr unsigned kPeriods = 2U;' "$PROJECT_DIR/android/app/src/main/cpp/SamplerAudioBridge.cpp"
+          if grep -Fq 'kRates{{96000U, 48000U}}' "$PROJECT_DIR/android/app/src/main/cpp/SamplerAudioBridge.cpp"; then
+            echo "ERROR: old ALSA rate probing survived runtime repair" >&2
+            exit 1
+          fi
 
       - name: Install Android toolchain
         script: |

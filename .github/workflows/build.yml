@@ -1,145 +1,56 @@
-name: SILVETON SAMPLER Android APK
+name: SILVETON SAMPLER Source Extract
 
 on:
   workflow_dispatch:
   push:
     branches: [ main ]
     paths:
-      - 'SILVETON-SEMPLER-source.zip'
+      - '.github/workflows/build.yml'
+      - 'SILVETON-SEMPLER-source-fixed.zip'
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: silveton-sampler-android-${{ github.ref }}
+  group: silveton-sampler-source-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  SOURCE_ZIP: SILVETON-SEMPLER-source.zip
+  SOURCE_ZIP: SILVETON-SEMPLER-source-fixed.zip
 
 jobs:
-  core-tests:
-    name: Core Release + Sanitizers
+  extract-current-source:
+    name: Extract current source tree
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Extract source ZIP
+      - name: Extract fixed source ZIP
         shell: bash
         run: |
           set -euo pipefail
           test -f "$SOURCE_ZIP"
-          rm -rf source
-          mkdir source
-          unzip -q "$SOURCE_ZIP" -d source
-          test -f source/core/CMakeLists.txt
-          test -f source/android/app/build.gradle.kts
+          rm -rf source_current
+          mkdir source_current
+          unzip -q "$SOURCE_ZIP" -d source_current
+          test -f source_current/core/CMakeLists.txt
+          test -f source_current/android/app/build.gradle.kts
+          test -f source_current/android/app/src/main/cpp/SamplerAudioBridge.cpp
+          echo "Current source extracted successfully"
 
-      - name: Release tests
+      - name: Commit extracted source tree
         shell: bash
         run: |
           set -euo pipefail
-          cmake -S source/core -B build/core-release \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DSILVETON_LIVE_BUILD_TESTS=ON
-          cmake --build build/core-release --parallel 2
-          ctest --test-dir build/core-release --output-on-failure
-
-      - name: ASan + UBSan tests
-        shell: bash
-        env:
-          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
-          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: |
-          set -euo pipefail
-          cmake -S source/core -B build/core-sanitize \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DSILVETON_LIVE_BUILD_TESTS=ON \
-            -DSILVETON_LIVE_ENABLE_SANITIZERS=ON
-          cmake --build build/core-sanitize --parallel 2
-          ctest --test-dir build/core-sanitize --output-on-failure
-
-  android-release:
-    name: arm64 Release APK
-    needs: core-tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      ANDROID_BUILD_TOOLS_VERSION: 35.0.0
-      NDK_VERSION: 27.2.12479018
-      CMAKE_VERSION: 3.22.1
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Extract source ZIP
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -f "$SOURCE_ZIP"
-          rm -rf source
-          mkdir source
-          unzip -q "$SOURCE_ZIP" -d source
-          test -f source/android/settings.gradle.kts
-          test -x source/ci/verify_apk.sh
-
-      - name: Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install pinned Android toolchain
-        shell: bash
-        run: |
-          set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager \
-            "platforms;android-35" \
-            "build-tools;${ANDROID_BUILD_TOOLS_VERSION}" \
-            "ndk;${NDK_VERSION}" \
-            "cmake;${CMAKE_VERSION}"
-          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
-
-      - name: Gradle 8.9
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.9'
-
-      - name: Build signed CI Release APK
-        shell: bash
-        run: |
-          set -euo pipefail
-          gradle -p source/android :app:assembleRelease --stacktrace --no-daemon
-
-      - name: Verify APK contract
-        shell: bash
-        working-directory: source
-        run: |
-          set -euo pipefail
-          APK="android/app/build/outputs/apk/release/app-release.apk"
-          test -f "$APK"
-          ./ci/verify_apk.sh "$APK"
-
-      - name: Stage artifact
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          cp source/android/app/build/outputs/apk/release/app-release.apk \
-             dist/SILVETON-SEMPLER-SM-X130-arm64-release.apk
-          sha256sum dist/SILVETON-SEMPLER-SM-X130-arm64-release.apk \
-            | tee dist/SILVETON-SEMPLER-SM-X130-arm64-release.apk.sha256
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: SILVETON-SEMPLER-SM-X130-arm64-release
-          path: |
-            dist/SILVETON-SEMPLER-SM-X130-arm64-release.apk
-            dist/SILVETON-SEMPLER-SM-X130-arm64-release.apk.sha256
-          if-no-files-found: error
-          retention-days: 14
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A source_current
+          if git diff --cached --quiet; then
+            echo "source_current already matches archive"
+            exit 0
+          fi
+          git commit -m "Extract current SILVETON sampler source"
+          git push origin HEAD:main

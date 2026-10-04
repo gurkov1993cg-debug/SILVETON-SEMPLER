@@ -1,6 +1,6 @@
 workflows:
-  silveton-sampler-system:
-    name: SILVETON Sampler System App
+  silveton-sampler-root-apk:
+    name: SILVETON Sampler Root APK
     instance_type: mac_mini_m2
     max_build_duration: 60
 
@@ -14,14 +14,14 @@ workflows:
         ANDROID_CMAKE_VERSION: "3.22.1"
 
     scripts:
-      - name: Prepare SILVETON system-app source
+      - name: Prepare SILVETON rooted APK source
         script: |
           set -euo pipefail
           test -f "$CM_BUILD_DIR/$SILVETON_ZIP"
           test -f "$CM_BUILD_DIR/codemagic_runtime_fix.py"
-          test -f "$CM_BUILD_DIR/codemagic_system_app_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_root_apk_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_live_dsp_fix.py"
           test -f "$CM_BUILD_DIR/codemagic_gui_sampler3.py"
-          test -f "$CM_BUILD_DIR/codemagic_make_system_payload.py"
 
           rm -rf "$CM_BUILD_DIR/_silveton_src"
           mkdir -p "$CM_BUILD_DIR/_silveton_src"
@@ -33,29 +33,42 @@ workflows:
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$CM_ENV"
 
           python3 "$CM_BUILD_DIR/codemagic_runtime_fix.py" "$PROJECT_DIR"
-          python3 "$CM_BUILD_DIR/codemagic_system_app_fix.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_root_apk_fix.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_live_dsp_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_gui_sampler3.py" "$PROJECT_DIR"
 
           BRIDGE="$PROJECT_DIR/android/app/src/main/cpp/SamplerAudioBridge.cpp"
           RUNTIME="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SamplerRuntime.kt"
-          MODE="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SilvetonSystemMode.kt"
+          ROOTMODE="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SilvetonRootRuntime.kt"
+          ENGINE="$PROJECT_DIR/core/src/sampler/SamplerEngine.cpp"
+          SINC="$PROJECT_DIR/core/include/silveton/sampler/SincInterpolator.h"
           VIEW="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SilvetonSamplerView.kt"
-          MANIFEST="$PROJECT_DIR/android/app/src/main/AndroidManifest.xml"
 
           grep -F 'constexpr unsigned kRate = 96000U;' "$BRIDGE"
           grep -F 'constexpr unsigned kPeriods = 2U;' "$BRIDGE"
-          grep -F 'pinCurrentThreadToCpu(7);' "$BRIDGE"
-          grep -F 'pinCurrentThreadToCpu(6);' "$BRIDGE"
-          grep -F 'sys.silveton.performance' "$MODE"
-          grep -F 'SilvetonSystemMode.enter()' "$RUNTIME"
+          grep -F 'configureRealtimeThread("SilvAudioRT", 7, 7, 80);' "$BRIDGE"
+          grep -F 'configureRealtimeThread("SilvMidiRT", 0, 5, 70);' "$BRIDGE"
+          grep -F 'SilvetonRootRuntime.enter()' "$RUNTIME"
+          grep -F 'magiskpolicy' "$ROOTMODE"
+          grep -F '0x4100-0x41ff' "$ROOTMODE"
+          grep -F '0x5500-0x55ff' "$ROOTMODE"
+          grep -F '0x5700-0x57ff' "$ROOTMODE"
+          grep -F 'LiveCubic4 = 4' "$SINC"
+          grep -F 'InterpolationQuality::LiveCubic4' "$ENGINE"
+          grep -F 'upperRouteMask' "$ENGINE"
           grep -F 'SILVETON-sampler-3.zip' "$VIEW"
           grep -F 'DESIGN_W = 1340f' "$VIEW"
-          grep -F 'private fun drawBrand' "$VIEW"
-          grep -F 'android:directBootAware="true"' "$MANIFEST"
-          grep -F 'com.silveton.sampler.permission.DIRECT_ALSA' "$MANIFEST"
 
           if grep -Fq '#include <aaudio/AAudio.h>' "$BRIDGE"; then
             echo "ERROR: AAudio returned to Direct ALSA runtime" >&2
+            exit 1
+          fi
+          if grep -Fq 'pinCurrentThreadToCpu(6);' "$BRIDGE"; then
+            echo "ERROR: MIDI must not occupy CPU6" >&2
+            exit 1
+          fi
+          if grep -Fq 'cmd activity kill-all' "$ROOTMODE"; then
+            echo "ERROR: live mode must not kill cached apps" >&2
             exit 1
           fi
 
@@ -113,13 +126,13 @@ workflows:
           cmake --build build-core --parallel "$(sysctl -n hw.ncpu)"
           ctest --test-dir build-core --output-on-failure
 
-      - name: Build system-app APK
+      - name: Build rooted release APK
         script: |
           set -euo pipefail
           cd "$PROJECT_DIR/android"
           CI=true "$GRADLE_BIN" --no-daemon --stacktrace clean assembleRelease
 
-      - name: Verify APK and build one system integration artifact
+      - name: Verify and publish one APK
         script: |
           set -euo pipefail
           cd "$PROJECT_DIR"
@@ -148,22 +161,10 @@ workflows:
           "$APKSIGNER" verify --verbose --print-certs "$APK"
 
           mkdir -p "$CM_BUILD_DIR/artifacts"
-          python3 "$CM_BUILD_DIR/codemagic_make_system_payload.py" "$APK" "$CM_BUILD_DIR/artifacts"
-
-          PACKAGE="$CM_BUILD_DIR/artifacts/SILVETON-SM-X130-SYSTEM-INTEGRATION.zip"
-          test -f "$PACKAGE"
-          unzip -p "$PACKAGE" system_ext/priv-app/SilvetonSampler/SilvetonSampler.apk >/dev/null
-          unzip -p "$PACKAGE" system_ext/etc/permissions/silveton-direct-alsa.xml | grep -F '<group gid="audio" />'
-          unzip -p "$PACKAGE" system_ext/etc/init/silveton-performance.rc | grep -F 'sys.silveton.performance=1'
-          unzip -p "$PACKAGE" sepolicy/private/silveton_app.te | grep -F 'audio_device:chr_file'
-          unzip -p "$PACKAGE" sepolicy/private/seapp_contexts | grep -F 'name=com.silveton.sampler'
-          unzip -p "$PACKAGE" sepolicy/private/property_contexts | grep -F 'sys.silveton.performance'
-          if unzip -l "$PACKAGE" | grep -qi magisk; then
-            echo "ERROR: Magisk content present" >&2
-            exit 1
-          fi
-          shasum -a 256 "$PACKAGE" > "$PACKAGE.sha256.txt"
+          OUT="$CM_BUILD_DIR/artifacts/SILVETON-SAMPLER-SM-X130.apk"
+          cp -f "$APK" "$OUT"
+          shasum -a 256 "$OUT" > "$OUT.sha256.txt"
 
     artifacts:
-      - artifacts/SILVETON-SM-X130-SYSTEM-INTEGRATION.zip
-      - artifacts/SILVETON-SM-X130-SYSTEM-INTEGRATION.zip.sha256.txt
+      - artifacts/SILVETON-SAMPLER-SM-X130.apk
+      - artifacts/SILVETON-SAMPLER-SM-X130.apk.sha256.txt

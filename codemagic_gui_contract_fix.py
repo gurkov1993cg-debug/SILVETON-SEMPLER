@@ -1,12 +1,61 @@
 from pathlib import Path
+import re
 import sys
 
 root = Path(sys.argv[1])
 view = root / 'android/app/src/main/java/com/silveton/sampler/SilvetonSamplerView.kt'
+controller = root / 'android/app/src/main/java/com/silveton/sampler/SamplerAppController.kt'
 audit = root / 'ci/audit_gui_contract.py'
-for p in (view, audit):
+for p in (view, controller, audit):
     if not p.is_file():
         raise SystemExit(f'missing required GUI source: {p}')
+
+# Repair the diagnostics patch if MidiStatus was inserted into the constructor's
+# statusChanged default lambda. That placement is invalid Kotlin and caused
+# compileReleaseKotlin to fail even though all source audits passed.
+s = controller.read_text(encoding='utf-8')
+ctor_start = s.find('class SamplerAppController(')
+body_anchor = ') : AutoCloseable {'
+body_pos = s.find(body_anchor, ctor_start)
+if ctor_start < 0 or body_pos < 0:
+    raise SystemExit('SamplerAppController class header missing')
+pre_body = s[ctor_start:body_pos]
+if 'data class MidiStatus(' in pre_body:
+    m = re.search(
+        r'\n\s*data class MidiStatus\(\n'
+        r'\s*val deviceCount: Int,\n'
+        r'\s*val lastError: Int,\n'
+        r'\s*val activitySerial: Long,\n'
+        r'\s*val status: Int,\n'
+        r'\s*val data1: Int,\n'
+        r'\s*val data2: Int\n'
+        r'\s*\)\n',
+        pre_body,
+    )
+    if not m:
+        raise SystemExit('malformed MidiStatus block not recognized')
+    midi_block = '''\n    data class MidiStatus(\n        val deviceCount: Int,\n        val lastError: Int,\n        val activitySerial: Long,\n        val status: Int,\n        val data1: Int,\n        val data2: Int\n    )\n'''
+    pre_body = pre_body[:m.start()] + pre_body[m.end():]
+    pre_body = pre_body.replace(
+        'private val statusChanged: (String?) -> Unit = {\n},',
+        'private val statusChanged: (String?) -> Unit = {},'
+    )
+    s = s[:ctor_start] + pre_body + s[body_pos:]
+    body_pos = s.find(body_anchor, ctor_start)
+    insert_at = body_pos + len(body_anchor)
+    s = s[:insert_at] + midi_block + s[insert_at:]
+
+body_pos = s.find(body_anchor, ctor_start)
+pre_body = s[ctor_start:body_pos]
+post_body = s[body_pos:]
+if 'data class MidiStatus(' in pre_body:
+    raise SystemExit('Kotlin structure invalid: MidiStatus still inside constructor parameters')
+if 'data class MidiStatus(' not in post_body:
+    raise SystemExit('Kotlin structure invalid: MidiStatus missing from class body')
+if 'private val statusChanged: (String?) -> Unit = {},' not in pre_body:
+    raise SystemExit('Kotlin structure invalid: statusChanged default lambda')
+controller.write_text(s, encoding='utf-8')
+print('PASS: Kotlin controller structure valid (MidiStatus in class body)')
 
 # Replace the old formatting-sensitive audit with a semantic contract audit.
 # It checks that the real native Canvas GUI still exposes all functional pages,
@@ -51,15 +100,12 @@ for name, token in required_view.items():
         raise SystemExit(f"MISSING GUI contract: {name}: {token}")
     print(f"PASS - GUI {name}")
 
-# Settings must be reachable by a real hit target, not merely drawn as text.
 settings_hit = re.search(
     r"hit\s*\(\s*gear\s*,.*?Page\.SETTINGS",
     view,
     flags=re.DOTALL,
 )
 if settings_hit is None:
-    # The navigation list may route generically via page = p; in that case
-    # require SETTINGS to be one of the clickable labels and page assignment.
     nav_ok = (
         'Page.SETTINGS to "НАСТРОЙКИ"' in view
         and "hit(b" in view
@@ -69,7 +115,6 @@ if settings_hit is None:
         raise SystemExit("MISSING GUI contract: SETTINGS has no real hit route")
 print("PASS - GUI SETTINGS has real hit route")
 
-# TEST EP must call a controller method, not be decorative text only.
 if "sampler.testEpNoteOn" not in view or "sampler.testEpNoteOff" not in view:
     raise SystemExit("MISSING GUI contract: TEST EP is not wired to note on/off")
 print("PASS - GUI TEST EP is wired to native note on/off")
@@ -86,8 +131,18 @@ for name, token in required_controller.items():
         raise SystemExit(f"MISSING GUI/controller contract: {name}: {token}")
     print(f"PASS - controller {name}")
 
+# This catches the exact Kotlin regression that previously slipped through
+# source-token audits.
+class_pos = controller.find("class SamplerAppController(")
+body_pos = controller.find(") : AutoCloseable {", class_pos)
+if class_pos < 0 or body_pos < 0:
+    raise SystemExit("MISSING GUI/controller contract: SamplerAppController class header")
+if "data class MidiStatus(" in controller[class_pos:body_pos]:
+    raise SystemExit("INVALID KOTLIN: MidiStatus is inside constructor parameters")
+print("PASS - controller Kotlin class structure")
+
 print("GUI contract audit: PASS")
 '''
 
 audit.write_text(content, encoding='utf-8')
-print('PASS: GUI audit upgraded to semantic functional contract')
+print('PASS: GUI audit upgraded to semantic functional contract + Kotlin structure guard')

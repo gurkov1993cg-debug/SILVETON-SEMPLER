@@ -42,4 +42,14 @@ if 'kPreferredMinimumPeriodFrames = 96U;' not in final:
 if 'constexpr unsigned kPeriods = 2U;' not in final:
     raise SystemExit('2-period low-latency contract missing')
 
-print('PASS: SILVETON Direct ALSA target locked to 48 kHz / 96 frames x 2 periods')
+# Apply the explicit root chmod/chown + SELinux grant immediately before the
+# native ALSA open/reopen path. This stays out of the realtime audio thread.
+perm = Path(__file__).with_name('codemagic_pre_alsa_permissions.py')
+if not perm.is_file():
+    raise SystemExit(f'missing pre-ALSA permission patch: {perm}')
+exec(compile(perm.read_text(encoding='utf-8'), str(perm), 'exec'), {
+    '__name__': '__main__',
+    '__file__': str(perm),
+})
+
+print('PASS: SILVETON Direct ALSA target locked to 48 kHz / 96 frames x 2 periods + pre-open root grant')

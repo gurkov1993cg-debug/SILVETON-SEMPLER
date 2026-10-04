@@ -1,0 +1,131 @@
+workflows:
+  silveton-sampler-android:
+    name: SILVETON Sampler Android
+    instance_type: linux_x2
+    max_build_duration: 60
+
+    environment:
+      java: 17
+      vars:
+        SILVETON_ZIP: SILVETON-SEMPLER-source.zip
+        GRADLE_VERSION: "8.9"
+        ANDROID_BUILD_TOOLS_VERSION: "35.0.0"
+        ANDROID_NDK_VERSION: "27.2.12479018"
+        ANDROID_CMAKE_VERSION: "3.22.1"
+
+    scripts:
+      - name: Prepare source
+        script: |
+          set -euo pipefail
+
+          test -f "$CM_BUILD_DIR/$SILVETON_ZIP"
+          rm -rf "$CM_BUILD_DIR/_silveton_src"
+          mkdir -p "$CM_BUILD_DIR/_silveton_src"
+          unzip -q "$CM_BUILD_DIR/$SILVETON_ZIP" -d "$CM_BUILD_DIR/_silveton_src"
+
+          SETTINGS="$(find "$CM_BUILD_DIR/_silveton_src" -type f -path '*/android/settings.gradle.kts' -print -quit)"
+          test -n "$SETTINGS"
+          PROJECT_DIR="$(dirname "$(dirname "$SETTINGS")")"
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$CM_ENV"
+          echo "Source root: $PROJECT_DIR"
+          test -f "$PROJECT_DIR/android/app/build.gradle.kts"
+          test -f "$PROJECT_DIR/android/app/src/main/cpp/CMakeLists.txt"
+          test -f "$PROJECT_DIR/core/CMakeLists.txt"
+
+      - name: Install Android toolchain
+        script: |
+          set -euo pipefail
+
+          SDKMANAGER="$(command -v sdkmanager || true)"
+          if [ -z "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Library/Android/sdk}}" -type f -name sdkmanager -print -quit)"
+          fi
+          test -x "$SDKMANAGER"
+
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" \
+            "platforms;android-35" \
+            "build-tools;$ANDROID_BUILD_TOOLS_VERSION" \
+            "ndk;$ANDROID_NDK_VERSION" \
+            "cmake;$ANDROID_CMAKE_VERSION"
+
+          ANDROID_SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          test -n "$ANDROID_SDK"
+          NDK_HOME="$ANDROID_SDK/ndk/$ANDROID_NDK_VERSION"
+          test -d "$NDK_HOME"
+
+          echo "ANDROID_HOME=$ANDROID_SDK" >> "$CM_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK" >> "$CM_ENV"
+          echo "ANDROID_NDK_HOME=$NDK_HOME" >> "$CM_ENV"
+
+      - name: Install Gradle 8.9
+        script: |
+          set -euo pipefail
+
+          TOOLS="$CM_BUILD_DIR/.silveton-tools"
+          mkdir -p "$TOOLS"
+          if [ ! -x "$TOOLS/gradle-$GRADLE_VERSION/bin/gradle" ]; then
+            curl -fL --retry 3 \
+              "https://services.gradle.org/distributions/gradle-$GRADLE_VERSION-bin.zip" \
+              -o "$TOOLS/gradle.zip"
+            unzip -q -o "$TOOLS/gradle.zip" -d "$TOOLS"
+          fi
+
+          GRADLE_BIN="$TOOLS/gradle-$GRADLE_VERSION/bin/gradle"
+          test -x "$GRADLE_BIN"
+          echo "GRADLE_BIN=$GRADLE_BIN" >> "$CM_ENV"
+          "$GRADLE_BIN" --version
+
+      - name: Audit Direct ALSA MIDI and GUI contracts
+        script: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          python3 ci/audit_direct_alsa.py
+          python3 ci/audit_direct_midi.py
+          python3 ci/audit_gui_contract.py
+
+      - name: Build and test native core
+        script: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          rm -rf build-core
+          cmake -S core -B build-core \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_STANDARD=17
+          cmake --build build-core --parallel "$(nproc)"
+          ctest --test-dir build-core --output-on-failure
+
+      - name: Build release APK
+        script: |
+          set -euo pipefail
+          cd "$PROJECT_DIR/android"
+
+          CI=true "$GRADLE_BIN" --no-daemon --stacktrace clean assembleRelease
+
+      - name: Verify and collect APK
+        script: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          APK="$(find android/app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          test -n "$APK"
+
+          ANDROID_BUILD_TOOLS_VERSION="$ANDROID_BUILD_TOOLS_VERSION" \
+          ANDROID_NDK_HOME="$ANDROID_NDK_HOME" \
+            bash ci/verify_apk.sh "$APK"
+
+          mkdir -p "$CM_BUILD_DIR/artifacts"
+          cp "$APK" "$CM_BUILD_DIR/artifacts/SILVETON-SAMPLER-release.apk"
+          sha256sum "$CM_BUILD_DIR/artifacts/SILVETON-SAMPLER-release.apk" \
+            > "$CM_BUILD_DIR/artifacts/SILVETON-SAMPLER-release.apk.sha256.txt"
+
+          echo "APK ready:"
+          ls -lh "$CM_BUILD_DIR/artifacts/SILVETON-SAMPLER-release.apk"
+          cat "$CM_BUILD_DIR/artifacts/SILVETON-SAMPLER-release.apk.sha256.txt"
+
+    artifacts:
+      - artifacts/SILVETON-SAMPLER-release.apk
+      - artifacts/SILVETON-SAMPLER-release.apk.sha256.txt

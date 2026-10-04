@@ -10,8 +10,8 @@ for p in (root_mode, runtime):
     if not p.is_file():
         raise SystemExit(f'missing required source: {p}')
 
-# Replace the audio permission refresh with an explicit pre-ALSA root gate.
-# It runs before nativeAudioOpen(), never from the RT audio thread.
+# Transitional rooted-APK permission gate. It runs immediately before the
+# Direct-ALSA open and mirrors the SM-X130 node state proven manually to work.
 k = root_mode.read_text(encoding='utf-8')
 start = k.find('    fun refreshAudioPermissions(): Result {')
 end = k.find('    fun refreshMidiPermissions(): Result {', start)
@@ -19,7 +19,6 @@ if start < 0 or end < 0:
     raise SystemExit('refreshAudioPermissions/refreshMidiPermissions anchors missing')
 
 refresh = r'''    fun refreshAudioPermissions(): Result {
-        val uid = Process.myUid()
         val pid = Process.myPid()
         val script = """
             set -u
@@ -49,12 +48,17 @@ refresh = r'''    fun refreshAudioPermissions(): Result {
                     exit 54
                 }
 
-            for n in "${'$'}CTL" "${'$'}PCM"; do
-                chown ''' + '${uid}' + r''':1005 "${'$'}n" 2>/dev/null || {
+            # Match the state that was physically proven on this SM-X130:
+            # owner media (1013), group audio (1005), rw for all. SELinux still
+            # remains enforcing, so the app-domain magiskpolicy rule above is
+            # still required.
+            for n in "${'$'}CTL" "${'$'}PCM" /dev/snd/midiC*D*; do
+                [ -e "${'$'}n" ] || continue
+                chown 1013:1005 "${'$'}n" 2>/dev/null || {
                     echo "ALSA grant: chown failed for ${'$'}n"
                     exit 55
                 }
-                chmod 0660 "${'$'}n" 2>/dev/null || {
+                chmod 0666 "${'$'}n" 2>/dev/null || {
                     echo "ALSA grant: chmod failed for ${'$'}n"
                     exit 56
                 }
@@ -68,9 +72,7 @@ refresh = r'''    fun refreshAudioPermissions(): Result {
 '''
 k = k[:start] + refresh + k[end:]
 
-# Fix the shell nounset bug in the older root bootstrap. With `set -u`, the
-# text `$c_` is parsed by /system/bin/sh as a variable named `c_`, not `$c`
-# followed by an underscore. Emit `${c}_` instead in both save/restore loops.
+# Android /system/bin/sh + `set -u`: `$c_` is parsed as variable `c_`.
 bad_idle_key = "key=\"idle_${'$'}c_${'$'}(basename"
 good_idle_key = "key=\"idle_${'$'}{c}_${'$'}(basename"
 if bad_idle_key in k:
@@ -78,10 +80,7 @@ if bad_idle_key in k:
 elif good_idle_key not in k:
     raise SystemExit('CPU idle key shell anchor missing')
 
-# Remove su -c without rewriting the whole Kotlin method. The previous version
-# searched for the method's closing braces and was brittle after other patches.
-# Keep the already-tested timeout/error handling intact and only change process
-# creation + script delivery to stdin.
+# Avoid `su -c` on this device: open su and feed the command script on stdin.
 old_proc = '''        val p = ProcessBuilder("su", "-c", script)\n            .redirectErrorStream(true)\n            .start()\n'''
 new_proc = '''        val p = ProcessBuilder("su")\n            .redirectErrorStream(true)\n            .start()\n        p.outputStream.bufferedWriter().use { writer ->\n            writer.write(script)\n            writer.newLine()\n            writer.flush()\n        }\n'''
 if old_proc in k:
@@ -93,7 +92,7 @@ else:
 
 root_mode.write_text(k, encoding='utf-8')
 
-# Prove source order: permission grant must happen before native ALSA open.
+# Permission refresh must execute before every native ALSA open/reopen.
 r = runtime.read_text(encoding='utf-8')
 for method, next_method in [
     ('    fun start(): Boolean {', '    fun suspendAudio()'),
@@ -111,8 +110,9 @@ for method, next_method in [
 
 final = root_mode.read_text(encoding='utf-8')
 for token in [
-    'chown ${uid}:1005',
-    'chmod 0660',
+    'chown 1013:1005',
+    'chmod 0666',
+    '/dev/snd/midiC*D*',
     'pcmC0D0p',
     'controlC0',
     'magiskpolicy',
@@ -124,7 +124,9 @@ for token in [
         raise SystemExit(f'pre-ALSA/root contract missing: {token}')
 if 'ProcessBuilder("su", "-c", script)' in final:
     raise SystemExit('stale su -c execution remains')
+if 'chmod 0660 "${'$'}n"' in final:
+    raise SystemExit('stale restrictive ALSA chmod remains in refreshed gate')
 if "key=\"idle_${'$'}c_${'$'}(basename" in final:
     raise SystemExit('stale shell $c_ nounset bug remains')
 
-print('PASS: pre-ALSA root gate installed; su -c removed; shell CPU-idle variable expansion fixed')
+print('PASS: SM-X130 pre-ALSA gate matches proven media:audio / 0666 node state')

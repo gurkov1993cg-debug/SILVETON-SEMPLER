@@ -20,6 +20,7 @@ workflows:
 
           test -f "$CM_BUILD_DIR/$SILVETON_ZIP"
           test -f "$CM_BUILD_DIR/codemagic_runtime_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_make_audio_privilege_module.py"
           rm -rf "$CM_BUILD_DIR/_silveton_src"
           mkdir -p "$CM_BUILD_DIR/_silveton_src"
           unzip -q "$CM_BUILD_DIR/$SILVETON_ZIP" -d "$CM_BUILD_DIR/_silveton_src"
@@ -36,10 +37,24 @@ workflows:
 
           python3 "$CM_BUILD_DIR/codemagic_runtime_fix.py" "$PROJECT_DIR"
 
-          grep -F 'constexpr unsigned kRate = 96000U;' "$PROJECT_DIR/android/app/src/main/cpp/SamplerAudioBridge.cpp"
-          grep -F 'constexpr unsigned kPeriods = 2U;' "$PROJECT_DIR/android/app/src/main/cpp/SamplerAudioBridge.cpp"
-          if grep -Fq 'kRates{{96000U, 48000U}}' "$PROJECT_DIR/android/app/src/main/cpp/SamplerAudioBridge.cpp"; then
+          BRIDGE="$PROJECT_DIR/android/app/src/main/cpp/SamplerAudioBridge.cpp"
+          MANIFEST="$PROJECT_DIR/android/app/src/main/AndroidManifest.xml"
+          grep -F 'constexpr unsigned kRate = 96000U;' "$BRIDGE"
+          grep -F 'constexpr unsigned kPeriods = 2U;' "$BRIDGE"
+          grep -F '"/dev/snd/controlC0"' "$BRIDGE"
+          grep -F 'ADDA_DL_CH1 DL1_CH1' "$BRIDGE"
+          grep -F 'ADDA_DL_CH2 DL1_CH2' "$BRIDGE"
+          grep -F 'DAC In Mux' "$BRIDGE"
+          grep -F 'HPL Mux' "$BRIDGE"
+          grep -F 'HPR Mux' "$BRIDGE"
+          grep -F 'SilvetonAudioLifecycle' "$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/MainActivity.kt"
+          grep -F 'com.silveton.sampler.permission.DIRECT_ALSA' "$MANIFEST"
+          if grep -Fq 'kRates{{96000U, 48000U}}' "$BRIDGE"; then
             echo "ERROR: old ALSA rate probing survived runtime repair" >&2
+            exit 1
+          fi
+          if grep -Fq '#include <aaudio/AAudio.h>' "$BRIDGE"; then
+            echo "ERROR: AAudio returned to Direct ALSA runtime" >&2
             exit 1
           fi
 
@@ -102,6 +117,21 @@ workflows:
           python3 ci/audit_direct_midi.py
           python3 ci/audit_gui_contract.py
 
+      - name: Build SM-X130 Direct ALSA privilege module
+        script: |
+          set -euo pipefail
+          mkdir -p "$CM_BUILD_DIR/artifacts"
+          python3 "$CM_BUILD_DIR/codemagic_make_audio_privilege_module.py" "$CM_BUILD_DIR/artifacts"
+          MODULE="$CM_BUILD_DIR/artifacts/SILVETON-SM-X130-DIRECT-ALSA-MAGISK.zip"
+          test -f "$MODULE"
+          unzip -p "$MODULE" module.prop | grep -F 'id=silveton_direct_alsa'
+          unzip -p "$MODULE" system/etc/permissions/silveton-direct-alsa.xml \
+            | grep -F 'com.silveton.sampler.permission.DIRECT_ALSA'
+          unzip -p "$MODULE" system/etc/permissions/silveton-direct-alsa.xml \
+            | grep -F '<group gid="audio" />'
+          unzip -p "$MODULE" sepolicy.rule | grep -F 'audio_device:chr_file'
+          shasum -a 256 "$MODULE" > "$MODULE.sha256.txt"
+
       - name: Build and test native core
         script: |
           set -euo pipefail
@@ -157,6 +187,9 @@ workflows:
             *) echo "Wrong targetSdk" >&2; exit 1 ;;
           esac
 
+          PERMISSIONS="$("$AAPT" dump permissions "$APK")"
+          printf '%s\n' "$PERMISSIONS" | grep -F 'com.silveton.sampler.permission.DIRECT_ALSA'
+
           TMP_DIR="$(mktemp -d)"
           trap 'rm -rf "$TMP_DIR"' EXIT
           python3 - "$APK" "$TMP_DIR" <<'PYAPK'
@@ -207,3 +240,5 @@ workflows:
     artifacts:
       - artifacts/SILVETON-SAMPLER-release.apk
       - artifacts/SILVETON-SAMPLER-release.apk.sha256.txt
+      - artifacts/SILVETON-SM-X130-DIRECT-ALSA-MAGISK.zip
+      - artifacts/SILVETON-SM-X130-DIRECT-ALSA-MAGISK.zip.sha256.txt

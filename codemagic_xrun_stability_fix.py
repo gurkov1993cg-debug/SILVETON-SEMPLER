@@ -147,4 +147,33 @@ exec(compile(bank_v2.read_text(encoding='utf-8'), str(bank_v2), 'exec'), {
     '__file__': str(bank_v2),
 })
 
-print('PASS: SM-X130 XRUN stability + CPU isolation + slider UI + final bank runtime v2 applied')
+# The final bank runtime intentionally changed SamplerEngine::setState from the
+# old destructive voice reset to a block-boundary graph swap. Existing voices own
+# their immutable old graph and must continue naturally. Align the one legacy
+# regression assertion in testGlobalAdvancedControls with that live-performance
+# contract instead of weakening the engine back to note-cutting behavior.
+sampler_tests = root / 'core/tests/SamplerTests.cpp'
+if not sampler_tests.is_file():
+    raise SystemExit(f'missing sampler regression tests: {sampler_tests}')
+tests_text = sampler_tests.read_text(encoding='utf-8')
+fn_start = tests_text.find('void testGlobalAdvancedControls()')
+if fn_start < 0:
+    raise SystemExit('testGlobalAdvancedControls not found')
+fn_end = tests_text.find('\nvoid test', fn_start + 1)
+if fn_end < 0:
+    fn_end = tests_text.find('\nint main(', fn_start + 1)
+if fn_end < 0:
+    raise SystemExit('cannot bound testGlobalAdvancedControls')
+fn_block = tests_text[fn_start:fn_end]
+legacy = 'assert(e.activeVoiceCount()==0U);'
+seamless = 'assert(e.activeVoiceCount()>0U); // seamless state swap must not kill an already sounding voice'
+if legacy in fn_block:
+    if fn_block.count(legacy) != 1:
+        raise SystemExit('ambiguous legacy activeVoiceCount assertion in testGlobalAdvancedControls')
+    fn_block = fn_block.replace(legacy, seamless, 1)
+    tests_text = tests_text[:fn_start] + fn_block + tests_text[fn_end:]
+elif seamless not in fn_block:
+    raise SystemExit('expected seamless-state regression assertion not found')
+sampler_tests.write_text(tests_text, encoding='utf-8')
+
+print('PASS: SM-X130 XRUN stability + CPU isolation + slider UI + final bank runtime v2 + seamless-state regression alignment applied')

@@ -110,6 +110,17 @@ exec(compile(playback.read_text(encoding='utf-8'), str(playback), 'exec'), {
     '__file__': str(playback),
 })
 
+# Normalize the final Canvas-view interaction anchors first. Earlier GUI
+# performance patches are allowed to add drag/immediate-touch fields; this pass
+# preserves them and structurally adds only the long-press hooks needed below.
+normalize_ui = Path(__file__).with_name('codemagic_list_ui_anchor_normalize.py')
+if not normalize_ui.is_file():
+    raise SystemExit(f'missing LIST UI anchor normalizer: {normalize_ui}')
+exec(compile(normalize_ui.read_text(encoding='utf-8'), str(normalize_ui), 'exec'), {
+    '__name__': '__main__',
+    '__file__': str(normalize_ui),
+})
+
 # Final tablet interaction layer: right-click-style long-press LIST management
 # and large professional parameter pages. This runs after all previous GUI/list
 # rewrites so no later visual patch can erase it.

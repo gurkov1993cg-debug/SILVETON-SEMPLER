@@ -126,15 +126,14 @@ exec(compile(ui_perf.read_text(encoding='utf-8'), str(ui_perf), 'exec'), {
     '__file__': str(ui_perf),
 })
 
-# Final data-model pass: 500 fixed SOUND/COMBI positions plus stable uint32
-# SAMPLE/MULTISAMPLE IDs in SILVETON_BANK.sv v2. Run last so no earlier patch can
-# restore positional resource indexes.
-slot_ids = Path(__file__).with_name('codemagic_fixed_slot_ids.py')
-if not slot_ids.is_file():
-    raise SystemExit(f'missing fixed slot/resource-ID patch: {slot_ids}')
-exec(compile(slot_ids.read_text(encoding='utf-8'), str(slot_ids), 'exec'), {
+# Final bank/runtime pass. This owns the completed data model and realtime switch
+# behavior so earlier patches cannot restore positional IDs or ALSA stop/restart.
+bank_v2 = Path(__file__).with_name('codemagic_bank_runtime_v2.py')
+if not bank_v2.is_file():
+    raise SystemExit(f'missing final bank runtime v2 patch: {bank_v2}')
+exec(compile(bank_v2.read_text(encoding='utf-8'), str(bank_v2), 'exec'), {
     '__name__': '__main__',
-    '__file__': str(slot_ids),
+    '__file__': str(bank_v2),
 })
 
-print('PASS: SM-X130 XRUN stability + CPU isolation + slider UI + fixed slot/resource-ID model applied')
+print('PASS: SM-X130 XRUN stability + CPU isolation + slider UI + final bank runtime v2 applied')

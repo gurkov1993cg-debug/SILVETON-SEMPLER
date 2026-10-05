@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from pathlib import Path
+import atexit
 import re
 import sys
 
@@ -8,6 +9,9 @@ engine = ROOT / "core/src/sampler/SamplerEngine.cpp"
 if not engine.is_file():
     raise SystemExit(f"missing {engine}")
 
+# -----------------------------------------------------------------------------
+# Normalize the real startVoice signature after the earlier DSP patches.
+# -----------------------------------------------------------------------------
 s = engine.read_text(encoding="utf-8")
 needle = "void startVoice(SamplerEngine::Impl& impl,"
 start = s.find(needle)
@@ -53,23 +57,68 @@ if sig != canonical:
     s = s[:start] + canonical + s[end:]
     engine.write_text(s, encoding="utf-8")
 
-final = engine.read_text(encoding="utf-8")
-if canonical not in final:
+if canonical not in engine.read_text(encoding="utf-8"):
     raise SystemExit("startVoice signature normalization failed")
 
-# The final SV v2 patch intentionally upgrades an existing v1 bank-reader test.
-# Earlier source patches can reformat or partially touch those one-line records,
-# which made exact string replacement brittle. Canonicalize the six test anchors
-# back to their v1 forms here; codemagic_bank_runtime_v2.py then performs the
-# actual v2 conversion and verifies the resulting stable IDs.
+# -----------------------------------------------------------------------------
+# Select the test file that ACTUALLY owns the SV-bank test.
+# There are builds where both CoreTests.cpp and SamplerCoreTests.cpp exist.
+# The old code simply picked the first existing file, which is why Codemagic kept
+# failing with "test SOUND 500" / "SvSoundRecord sound: found 0".
+# -----------------------------------------------------------------------------
 test_candidates = [
     ROOT / "core/tests/CoreTests.cpp",
     ROOT / "core/tests/SamplerCoreTests.cpp",
 ]
-test_path = next((p for p in test_candidates if p.is_file()), None)
-if test_path is None:
-    raise SystemExit("missing sampler core test source")
 
+def owns_sv_test(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    text = path.read_text(encoding="utf-8")
+    return (
+        "SvSoundRecord sound" in text
+        and "SvSoundLayerRecord layer" in text
+        and "SvMultisampleRecord ms" in text
+        and "SvSampleRecord sample" in text
+        and "SvZoneRecord zone" in text
+    )
+
+test_path = next((p for p in test_candidates if owns_sv_test(p)), None)
+if test_path is None:
+    present = []
+    for p in test_candidates:
+        if p.is_file():
+            present.append(f"{p.name}:present-no-sv-test")
+        else:
+            present.append(f"{p.name}:missing")
+    raise SystemExit("cannot locate real SV bank core test: " + ", ".join(present))
+
+# codemagic_bank_runtime_v2.py historically chooses the first existing candidate.
+# If CoreTests.cpp exists but the SV test lives in SamplerCoreTests.cpp, hide the
+# unrelated file only for the lifetime of this Python process. atexit restores it
+# before the build/compiler starts, including when a later patch aborts.
+primary = test_candidates[0]
+hold = primary.with_name(primary.name + ".silveton_hold")
+renamed_primary = False
+if test_path != primary and primary.is_file():
+    if hold.exists():
+        raise SystemExit(f"stale temporary test hold exists: {hold}")
+    primary.rename(hold)
+    renamed_primary = True
+
+    def restore_primary() -> None:
+        try:
+            if hold.exists() and not primary.exists():
+                hold.rename(primary)
+        except Exception as exc:
+            print(f"WARNING: could not restore {primary.name}: {exc}", file=sys.stderr)
+
+    atexit.register(restore_primary)
+
+# -----------------------------------------------------------------------------
+# Canonicalize only the v1 fixture lines that the final v2 patch intentionally
+# upgrades. This is test-fixture normalization, not runtime behavior.
+# -----------------------------------------------------------------------------
 t = test_path.read_text(encoding="utf-8")
 
 def normalize_record(type_name: str, var_name: str, canonical_line: str) -> None:
@@ -77,7 +126,9 @@ def normalize_record(type_name: str, var_name: str, canonical_line: str) -> None
     pattern = rf"(?m)^[ \t]*{re.escape(type_name)}[ \t]+{re.escape(var_name)}\{{\}};[^\n]*$"
     matches = list(re.finditer(pattern, t))
     if len(matches) != 1:
-        raise SystemExit(f"cannot uniquely normalize {type_name} {var_name}: found {len(matches)}")
+        raise SystemExit(
+            f"cannot uniquely normalize {type_name} {var_name} in {test_path.name}: found {len(matches)}"
+        )
     t = t[:matches[0].start()] + canonical_line + t[matches[0].end():]
 
 normalize_record(
@@ -104,15 +155,17 @@ normalize_record(
 assert_pattern = r"(?m)^[ \t]*assert\(loaded\.data\.programs\[0\]\.address\.bank==[^\n]*$"
 assert_matches = list(re.finditer(assert_pattern, t))
 if len(assert_matches) != 1:
-    raise SystemExit(f"cannot uniquely normalize SV bank address assertion: found {len(assert_matches)}")
+    raise SystemExit(
+        f"cannot uniquely normalize SV bank address assertion in {test_path.name}: found {len(assert_matches)}"
+    )
 t = (
     t[:assert_matches[0].start()]
     + "    assert(loaded.data.programs[0].address.bank==2U && loaded.data.programs[0].address.page==3U && loaded.data.programs[0].address.slot==4U);"
     + t[assert_matches[0].end():]
 )
 
-# Remove a stable-ID assertion line left by an earlier partial application, if any;
-# the final v2 patch will add the canonical pair exactly once.
+# Remove a stable-ID assertion line from a partial previous application, if one
+# exists. The final bank-v2 patch adds the canonical assertions exactly once.
 t = re.sub(
     r"(?m)^[ \t]*assert\(loaded\.data\.samples\[0\]\.id==3000001U\);[ \t]*assert\(loaded\.data\.multisamples\[0\]\.id==4000001U\);[ \t]*\n?",
     "",
@@ -132,6 +185,10 @@ required_test_anchors = [
 check = test_path.read_text(encoding="utf-8")
 for token in required_test_anchors:
     if token not in check:
-        raise SystemExit(f"SV v2 test-anchor normalization failed: {token}")
+        raise SystemExit(f"SV v2 test-anchor normalization failed in {test_path.name}: {token}")
 
-print("PASS: startVoice + SV v2 test anchors normalized for final bank runtime patch")
+print(
+    "PASS: startVoice + SV v2 test anchors normalized in "
+    + test_path.name
+    + (" (unrelated CoreTests.cpp temporarily hidden)" if renamed_primary else "")
+)

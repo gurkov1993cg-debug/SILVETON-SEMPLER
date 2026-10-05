@@ -33,6 +33,7 @@ workflows:
           test -f "$CM_BUILD_DIR/codemagic_kotlin_compile_fix.py"
           test -f "$CM_BUILD_DIR/codemagic_48khz_fix.py"
           test -f "$CM_BUILD_DIR/codemagic_live_performance_indicators.py"
+          test -f "$CM_BUILD_DIR/codemagic_xrun_stability_fix.py"
 
           rm -rf "$CM_BUILD_DIR/_silveton_src"
           mkdir -p "$CM_BUILD_DIR/_silveton_src"
@@ -58,6 +59,7 @@ workflows:
           python3 "$CM_BUILD_DIR/codemagic_kotlin_compile_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_48khz_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_live_performance_indicators.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_xrun_stability_fix.py" "$PROJECT_DIR"
 
           BRIDGE="$PROJECT_DIR/android/app/src/main/cpp/SamplerAudioBridge.cpp"
           RUNTIME="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SamplerRuntime.kt"
@@ -70,8 +72,9 @@ workflows:
           CONTROLLER="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SamplerAppController.kt"
 
           grep -F 'constexpr unsigned kRate = 48000U;' "$BRIDGE"
-          grep -F 'constexpr unsigned kPeriods = 2U;' "$BRIDGE"
+          grep -F 'constexpr unsigned kPeriods = 3U;' "$BRIDGE"
           grep -F 'kPreferredMinimumPeriodFrames = 96U;' "$BRIDGE"
+          grep -F 'config.bufferFrames - config.periodFrames' "$BRIDGE"
           grep -F 'configureRealtimeThread("SilvAudioRT", 7, 7, 80);' "$BRIDGE"
           grep -F 'configureRealtimeThread("SilvMidiRT", 0, 5, 70);' "$BRIDGE"
           grep -F 'class BuiltinTestInstrument' "$BRIDGE"
@@ -111,12 +114,17 @@ workflows:
           grep -F 'BUILT-IN  •  RAW MIDI' "$VIEW"
           grep -F 'val keyFlash = midiRx' "$VIEW"
           grep -F 'val audioSignal = a.activeVoices > 0' "$VIEW"
-          grep -F '"48k 96x2"' "$VIEW"
+          grep -F '"48k 96x3"' "$VIEW"
+          grep -F 'a.bufferSizeFrames == 288' "$VIEW"
           grep -F 'data class MidiStatus(' "$CONTROLLER"
           grep -F 'private val statusChanged: (String?) -> Unit = {},' "$CONTROLLER"
 
           if grep -Fq 'constexpr unsigned kRate = 96000U;' "$BRIDGE"; then
             echo "ERROR: stale 96 kHz target remains" >&2
+            exit 1
+          fi
+          if grep -Fq 'constexpr unsigned kPeriods = 2U;' "$BRIDGE"; then
+            echo "ERROR: stale unstable 96x2 queue remains" >&2
             exit 1
           fi
           if grep -Fq '#include <aaudio/AAudio.h>' "$BRIDGE"; then

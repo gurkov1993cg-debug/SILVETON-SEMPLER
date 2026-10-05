@@ -11,21 +11,34 @@ for p in (root_mode, runtime, cpp):
     if not p.is_file():
         raise SystemExit(f'missing final audio source: {p}')
 
-# This is the final audio gate. It is intentionally narrow in scope:
-# - keep global SELinux ENFORCING;
-# - keep Android/kernel thermal and speaker-protection mechanisms untouched;
-# - never write unknown SmartPA/speaker-protection mixer controls;
-# - only reassert the already-proven Direct-ALSA device access and mixer route.
+# Restore the proven runtime model:
+#   enter() = one-time root/performance bootstrap while the Activity is alive.
+#   refreshAudioPermissions() = the only operation repeated before PCM
+#   open/resume/recovery. Re-running the whole bootstrap on every resume can
+#   disturb an already working MediaTek audio state.
 k = root_mode.read_text(encoding='utf-8')
+enter0 = k.find('    fun enter(): Result = synchronized(lock) {')
+if enter0 < 0:
+    raise SystemExit('SilvetonRootRuntime.enter() missing')
+uid0 = k.find('        val uid = Process.myUid()', enter0)
+if uid0 < 0:
+    raise SystemExit('enter() uid anchor missing')
+enter_prefix = k[enter0:uid0]
 
-# Android may recreate /dev/snd nodes while the process remains alive. Never let
-# the cached in-process active flag skip the live refresh path.
-k = k.replace('        if (active) return@synchronized Result(true)\n\n',
-              '        // active state does not replace live ALSA permission refresh.\n\n', 1)
+# Remove comments inserted by the two experimental reassert patches.
+for stale in [
+    '        // Reassert live sampler grants/tuning even when already active.\n\n',
+    '        // active state does not replace live ALSA permission refresh.\n\n',
+]:
+    enter_prefix = enter_prefix.replace(stale, '')
+
+# Normalize to exactly one active short-circuit.
+enter_prefix = enter_prefix.replace('        if (active) return@synchronized Result(true)\n\n', '')
+enter_prefix += '        if (active) return@synchronized Result(true)\n\n'
+k = k[:enter0] + enter_prefix + k[uid0:]
 root_mode.write_text(k, encoding='utf-8')
 
-# Validate the FINAL refreshAudioPermissions implementation after every previous
-# Codemagic patch has run.
+# Validate the FINAL dedicated ALSA refresh gate.
 k = root_mode.read_text(encoding='utf-8')
 a0 = k.find('    fun refreshAudioPermissions(): Result {')
 a1 = k.find('    fun refreshMidiPermissions(): Result {', a0)
@@ -51,8 +64,8 @@ for token in required_audio:
     if token not in audio:
         raise SystemExit(f'final Direct-ALSA audio contract missing: {token}')
 
-# Do not globally weaken the OS or defeat physical protection systems. We only
-# grant this app domain access to the live ALSA character devices.
+# Physical/system protection remains intact. SELinux is only extended for this
+# application domain and ALSA character devices; global enforcing is untouched.
 for forbidden in [
     'setenforce 0',
     'setenforce permissive',
@@ -67,7 +80,7 @@ for forbidden in [
     if forbidden in k:
         raise SystemExit(f'unsafe global/physical protection override detected: {forbidden}')
 
-# The PCM runtime itself must remain the measured stable SM-X130 configuration.
+# Proven SM-X130 PCM configuration.
 s = cpp.read_text(encoding='utf-8')
 for token in [
     'constexpr unsigned kRate = 48000U;',
@@ -79,8 +92,8 @@ for token in [
     if token not in s:
         raise SystemExit(f'final PCM stability contract missing: {token}')
 
-# The privileged root gate owns the mixer route. The ordinary APK must not make
-# controlC0 a second mandatory permission boundary before opening PCM.
+# Root owns the mixer route. The ordinary APK must not require controlC0 in the
+# openLocked PCM path.
 open0 = s.find('    bool openLocked() {')
 open1 = s.find('\n    bool startLocked() {', open0)
 if open0 < 0 or open1 < 0:
@@ -91,12 +104,9 @@ if 'configureOutputRouteLocked()' in open_block:
 if 'chooseAndOpenPcmLocked()' not in open_block:
     raise SystemExit('Direct ALSA PCM open missing')
 
-# Every hardware start/restart path must refresh access immediately before using
-# ALSA. This is what prevents Android from silently re-applying an EACCES barrier.
+# Dedicated refresh must run before hardware use on every path, while enter()
+# itself stays one-time.
 r = runtime.read_text(encoding='utf-8')
-if 'SilvetonRootRuntime.refreshAudioPermissions()' not in r:
-    raise SystemExit('runtime no longer refreshes Direct-ALSA permissions')
-
 start0 = r.find('    fun start(): Boolean {')
 start1 = r.find('    fun suspendAudio()', start0)
 resume0 = r.find('    fun resumeAudio(): Boolean {')
@@ -105,24 +115,28 @@ if min(start0, start1, resume0, resume1) < 0:
     raise SystemExit('runtime start/resume method boundaries missing')
 start_block = r[start0:start1]
 resume_block = r[resume0:resume1]
-if 'refreshAudioPermissions()' not in start_block or 'nativeAudioOpen()' not in start_block:
-    raise SystemExit('start path lost pre-open ALSA refresh')
+if 'SilvetonRootRuntime.enter()' not in start_block or 'refreshAudioPermissions()' not in start_block or 'nativeAudioOpen()' not in start_block:
+    raise SystemExit('start path lost root/ALSA sequence')
 if start_block.find('refreshAudioPermissions()') > start_block.find('nativeAudioOpen()'):
     raise SystemExit('start path refresh happens after PCM open')
-if 'refreshAudioPermissions()' not in resume_block or 'nativeAudioStart()' not in resume_block:
-    raise SystemExit('resume path lost ALSA refresh')
+if 'SilvetonRootRuntime.enter()' not in resume_block or 'refreshAudioPermissions()' not in resume_block or 'nativeAudioStart()' not in resume_block:
+    raise SystemExit('resume path lost root/ALSA sequence')
 
-# Recovery is allowed to differ structurally, but it must refresh access before
-# native recovery/restart if that path exists.
 rec = r.find('private val recoveryPoll')
 if rec >= 0:
     rec_end = r.find('    fun start(): Boolean {', rec)
     recovery = r[rec:rec_end if rec_end >= 0 else len(r)]
     if 'nativeAudioNeedsRecovery()' in recovery:
         if 'refreshAudioPermissions()' not in recovery:
-            raise SystemExit('audio recovery path lost ALSA permission refresh')
+            raise SystemExit('audio recovery path lost ALSA refresh')
         recover_call = recovery.find('nativeAudioRecover()')
         if recover_call >= 0 and recovery.find('refreshAudioPermissions()') > recover_call:
             raise SystemExit('recovery refresh happens after native recovery')
 
-print('PASS: final audio guard — Direct ALSA access reasserted; SELinux/thermal/speaker protection left intact')
+final_root = root_mode.read_text(encoding='utf-8')
+enter0 = final_root.find('    fun enter(): Result = synchronized(lock) {')
+uid0 = final_root.find('        val uid = Process.myUid()', enter0)
+if final_root[enter0:uid0].count('if (active) return@synchronized Result(true)') != 1:
+    raise SystemExit('root bootstrap is not exactly-once while active')
+
+print('PASS: proven audio lifecycle restored — one-time root bootstrap + dedicated ALSA refresh; physical protections untouched')

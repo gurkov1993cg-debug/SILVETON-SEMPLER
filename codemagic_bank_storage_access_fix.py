@@ -25,6 +25,23 @@ if "android.permission.MANAGE_EXTERNAL_STORAGE" not in manifest:
 manifest_path.write_text(manifest, encoding="utf-8")
 
 runtime = root_runtime_path.read_text(encoding="utf-8")
+
+# IMPORTANT: do not trust the in-process 'active' flag as proof that Android has
+# kept our cpuset/governor/ALSA/SELinux state. The OS may recreate nodes or
+# restore scheduling constraints while this process stays alive. enter() is
+# deliberately idempotent: saved original values are protected by STATE/active,
+# while the live performance envelope must be reasserted on every start/resume/
+# recovery call.
+early_return = '        if (active) return@synchronized Result(true)\n\n'
+if early_return in runtime:
+    runtime = runtime.replace(
+        early_return,
+        '        // Reassert live sampler grants/tuning even when already active.\n\n',
+        1,
+    )
+if 'if (active) return@synchronized Result(true)' in runtime:
+    raise SystemExit("stale root active short-circuit still present")
+
 if "MANAGE_EXTERNAL_STORAGE allow" not in runtime:
     anchor = '''            STATE=/data/local/tmp/silveton-root-state
             mkdir -p "${'$'}STATE"
@@ -62,9 +79,10 @@ for token in [
     "MANAGE_EXTERNAL_STORAGE allow",
     "fun refreshBankStorageAccess(): Result",
     "cmd appops set com.silveton.sampler MANAGE_EXTERNAL_STORAGE allow",
+    "Reassert live sampler grants/tuning even when already active.",
 ]:
     if token not in runtime:
-        raise SystemExit(f"missing root bank-access token: {token}")
+        raise SystemExit(f"missing root bank/performance token: {token}")
 root_runtime_path.write_text(runtime, encoding="utf-8")
 
 controller = controller_path.read_text(encoding="utf-8")
@@ -180,4 +198,4 @@ for token in [
         raise SystemExit(f"missing SOUND picker diagnostic token: {token}")
 view_path.write_text(view, encoding="utf-8")
 
-print("PASS: Android 15 bank storage access + direct mmap bank discovery + SOUND diagnostics installed")
+print("PASS: Android 15 bank access + root performance envelope reassert + SOUND diagnostics installed")

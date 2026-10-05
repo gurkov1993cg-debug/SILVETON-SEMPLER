@@ -140,30 +140,64 @@ if not callable(restore_tests):
     raise SystemExit('bank compatibility restore hook missing')
 restore_tests()
 
-# Align the one legacy regression assertion with seamless state switching.
+# Align legacy state-replacement regressions with the completed seamless runtime.
+# setState() adopts the new graph at the block boundary while already sounding
+# voices keep ownership of their immutable old graph until normal note-off/end.
 sampler_tests = root / 'core/tests/SamplerTests.cpp'
 if not sampler_tests.is_file():
     raise SystemExit(f'missing sampler regression tests after bank-v2 restore: {sampler_tests}')
 tests_text = sampler_tests.read_text(encoding='utf-8')
-fn_start = tests_text.find('void testGlobalAdvancedControls()')
-if fn_start < 0:
-    raise SystemExit('testGlobalAdvancedControls not found')
-fn_end = tests_text.find('\nvoid test', fn_start + 1)
-if fn_end < 0:
-    fn_end = tests_text.find('\nint main(', fn_start + 1)
-if fn_end < 0:
-    raise SystemExit('cannot bound testGlobalAdvancedControls')
-fn_block = tests_text[fn_start:fn_end]
-legacy = 'assert(e.activeVoiceCount()==0U);'
-seamless_a = 'assert(e.activeVoiceCount()>0U); // seamless state swap must not kill an already sounding voice'
-seamless_b = 'assert(e.activeVoiceCount()>0U); // seamless state swap must preserve the held voice'
-if legacy in fn_block:
-    if fn_block.count(legacy) != 1:
+
+def function_block(text: str, function_name: str):
+    start = text.find(f'void {function_name}()')
+    if start < 0:
+        raise SystemExit(f'{function_name} not found')
+    end = text.find('\nvoid test', start + 1)
+    if end < 0:
+        end = text.find('\nint main(', start + 1)
+    if end < 0:
+        raise SystemExit(f'cannot bound {function_name}')
+    return start, end, text[start:end]
+
+# Older global-controls test used the pre-seamless destructive setState contract.
+start, end, block = function_block(tests_text, 'testGlobalAdvancedControls')
+legacy_global = 'assert(e.activeVoiceCount()==0U);'
+seamless_global_a = 'assert(e.activeVoiceCount()>0U); // seamless state swap must not kill an already sounding voice'
+seamless_global_b = 'assert(e.activeVoiceCount()>0U); // seamless state swap must preserve the held voice'
+if legacy_global in block:
+    if block.count(legacy_global) != 1:
         raise SystemExit('ambiguous legacy activeVoiceCount assertion in testGlobalAdvancedControls')
-    fn_block = fn_block.replace(legacy, seamless_a, 1)
-    tests_text = tests_text[:fn_start] + fn_block + tests_text[fn_end:]
-elif seamless_a not in fn_block and seamless_b not in fn_block:
-    raise SystemExit('expected seamless-state regression assertion not found')
+    block = block.replace(legacy_global, seamless_global_a, 1)
+    tests_text = tests_text[:start] + block + tests_text[end:]
+elif seamless_global_a not in block and seamless_global_b not in block:
+    raise SystemExit('expected seamless-state regression assertion not found in testGlobalAdvancedControls')
+
+# Safe replacement must prove the opposite of the old behavior: replacing the
+# state cannot invalidate or abruptly kill a voice that was already sounding.
+start, end, block = function_block(tests_text, 'testSafeStateReplacement')
+legacy_safe_variants = [
+    'assert(engine.activeVoiceCount() == 0U);',
+    'assert(engine.activeVoiceCount()==0U);',
+]
+seamless_safe = 'assert(engine.activeVoiceCount() > 0U); // replaced state must preserve the already sounding voice safely'
+if seamless_safe not in block:
+    matches = [token for token in legacy_safe_variants if token in block]
+    if len(matches) != 1 or block.count(matches[0]) != 1:
+        raise SystemExit('cannot uniquely locate legacy voice-reset assertion in testSafeStateReplacement')
+    block = block.replace(matches[0], seamless_safe, 1)
+    tests_text = tests_text[:start] + block + tests_text[end:]
+
+# Refuse to ship if either state-replacement test still encodes the destructive
+# zero-voice behavior. Panic/note-off tests elsewhere are intentionally untouched.
+for function_name, forbidden in [
+    ('testGlobalAdvancedControls', ['assert(e.activeVoiceCount()==0U);']),
+    ('testSafeStateReplacement', legacy_safe_variants),
+]:
+    _, _, block = function_block(tests_text, function_name)
+    for token in forbidden:
+        if token in block:
+            raise SystemExit(f'stale destructive state-replacement assertion remains in {function_name}')
+
 sampler_tests.write_text(tests_text, encoding='utf-8')
 
 # Final product cleanup: no synthetic TEST EP / Stage Piano is allowed now that
@@ -176,4 +210,4 @@ exec(compile(remove_test_piano.read_text(encoding='utf-8'), str(remove_test_pian
     '__file__': str(remove_test_piano),
 })
 
-print('PASS: SM-X130 XRUN stability + CPU isolation + slider UI + bank runtime v2 + restored tests + real-bank-only sound applied')
+print('PASS: SM-X130 XRUN stability + CPU isolation + slider UI + bank runtime v2 + seamless state regressions + real-bank-only sound applied')

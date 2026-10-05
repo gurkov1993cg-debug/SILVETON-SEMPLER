@@ -43,11 +43,7 @@ piano_header = '''        val test = RectF(254f*sx,12f*sy,374f*sx,64f*sy)
 
 '''
 v = v.replace(piano_header, '', 1)
-
-# Earlier hardware-diagnostic patch may have inserted a small TEST EP label.
 v = re.sub(r'(?m)^\s*text\(c,\s*"TEST EP"[^\n]*\)\s*\n?', '', v)
-
-# No synthetic fallback title when the real list has not populated yet.
 v = v.replace(
     '        val currentName = activeItem?.name ?: if (sampler.testInstrumentEnabled()) "STAGE PIANO" else "Силветон"\n',
     '        val currentName = activeItem?.name ?: "Силветон"\n',
@@ -58,7 +54,6 @@ v = v.replace(
     '        val currentName = activeItem?.name ?: "Силветон"\n',
     1,
 )
-
 v = v.replace('        val builtInPiano = entries.isEmpty() && sampler.testInstrumentEnabled()\n\n', '', 1)
 
 built_in_slot = '''            if (builtInPiano && idx == 0) {
@@ -97,10 +92,7 @@ if '"PIANO control"' in a or '"STAGE PIANO set-list slot"' in a or 'PIANO contro
 audit.write_text(a, encoding='utf-8')
 
 # Final regression normalization for the complete seamless state-replacement
-# contract. The old test expected setState() to hard-kill a sounding voice and
-# produce immediate silence. The production engine intentionally keeps the old
-# immutable graph alive for that voice until normal note-off/end, so both voice
-# count and rendered audio must remain non-zero immediately after replacement.
+# contract. Existing voices continue from their immutable owner state.
 t = tests.read_text(encoding='utf-8')
 start = t.find('void testSafeStateReplacement()')
 if start < 0:
@@ -150,4 +142,19 @@ if 'testInstrument_.setEnabled(false);' not in final_cpp:
 if 'testInstrument_.setEnabled(!hasPlayableProgram);' in final_cpp or 'testInstrument_.setEnabled(true);' in final_cpp:
     raise SystemExit('obsolete TEST EP enable path remains')
 
-print('PASS: production bank-only sound + full seamless state-replacement regression contract applied')
+# Final UI workflow is deliberately applied last so no earlier visual-skin patch
+# can hide these user-facing controls again.
+workflow = Path(__file__).with_name('codemagic_visible_combi_list_workflow.py')
+if not workflow.is_file():
+    raise SystemExit(f'missing visible COMBI/LIST workflow patch: {workflow}')
+exec(compile(workflow.read_text(encoding='utf-8'), str(workflow), 'exec'), {
+    '__name__': '__main__',
+    '__file__': str(workflow),
+})
+
+final_view = view.read_text(encoding='utf-8')
+for token in ['"WRITE COMBI"', '"ADD TO LIST"', '"EDIT COMBI"']:
+    if token not in final_view:
+        raise SystemExit(f'visible COMBI/LIST button missing after final patch: {token}')
+
+print('PASS: production bank-only sound + seamless regression + visible COMBI/LIST workflow applied')

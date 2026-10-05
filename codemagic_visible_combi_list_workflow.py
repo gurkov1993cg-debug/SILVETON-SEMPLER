@@ -197,4 +197,20 @@ for token in [
         raise SystemExit(f"missing visible COMBI/LIST workflow: {token}")
 
 view_path.write_text(view, encoding="utf-8")
-print("PASS: robust visible WRITE COMBI / ADD TO LIST / EDIT COMBI workflow installed")
+
+# Add the real saved-COMBI browser after the basic WRITE/LIST workflow so
+# BLENDS is guaranteed to be visible in the final generated sampler UI.
+blends = Path(__file__).with_name("codemagic_blends_browser_fix.py")
+if not blends.is_file():
+    raise SystemExit(f"missing BLENDS browser patch: {blends}")
+exec(compile(blends.read_text(encoding="utf-8"), str(blends), "exec"), {
+    "__name__": "__main__",
+    "__file__": str(blends),
+})
+
+final_view = view_path.read_text(encoding="utf-8")
+for token in ['button(c, blendsR, "BLENDS", true)', "showBlendPicker()", "sampler.combiCatalog()"]:
+    if token not in final_view:
+        raise SystemExit(f"BLENDS browser missing after final workflow: {token}")
+
+print("PASS: visible WRITE COMBI / ADD TO LIST / EDIT COMBI + real BLENDS browser installed")

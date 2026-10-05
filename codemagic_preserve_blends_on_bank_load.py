@@ -20,7 +20,7 @@ old = '''        const auto loaded = SvBankRuntime::load(path, 4096U, false);
             return false;
         }
 '''
-new = '''        const auto loaded = SvBankRuntime::load(path, 4096U, false);
+new = '''        const auto loaded = SvBankRuntime::load(path, 65536U, false);
         if (!loaded.ok()) { setTextError(loaded.error); return false; }
         if (loaded.data.programs.empty() || loaded.data.programs.front().program == nullptr) {
             setTextError("SILVETON bank contains no playable SOUND");
@@ -64,7 +64,8 @@ new = '''        const auto loaded = SvBankRuntime::load(path, 4096U, false);
 if old in s:
     s = s.replace(old, new, 1)
 elif 'const auto preserved = library_.snapshot();' in s and 'merged.combis = preserved.combis;' in s:
-    pass
+    # Keep older generated trees idempotent, then normalize their preload below.
+    s = s.replace('SvBankRuntime::load(path, 4096U, false)', 'SvBankRuntime::load(path, 65536U, false)')
 else:
     raise SystemExit('loadSvBank replacement anchor changed')
 
@@ -75,6 +76,7 @@ for token in [
     'upper.soundSlotId',
     'library_.program(SlotAddress{0U, 0U, upper.soundSlotId})',
     'library_.writeCombi(saved.address, rebound)',
+    'SvBankRuntime::load(path, 65536U, false)',
 ]:
     if token not in s:
         raise SystemExit(f'BLENDS preservation contract missing: {token}')
@@ -103,6 +105,13 @@ exec(compile(playback.read_text(encoding='utf-8'), str(playback), 'exec'), {
     '__name__': '__main__', '__file__': str(playback),
 })
 
+streaming = Path(__file__).with_name('codemagic_bank_realtime_streaming_fix.py')
+if not streaming.is_file():
+    raise SystemExit(f'missing realtime bank streaming fix: {streaming}')
+exec(compile(streaming.read_text(encoding='utf-8'), str(streaming), 'exec'), {
+    '__name__': '__main__', '__file__': str(streaming),
+})
+
 # Final tablet interaction layer. It wraps the CURRENT touch engine instead of
 # assuming GestureDetector exists, so the practical drag/immediate-touch layer
 # remains the one that owns normal touch handling.
@@ -120,4 +129,4 @@ exec(compile(compile_fix.read_text(encoding='utf-8'), str(compile_fix), 'exec'),
     '__name__': '__main__', '__file__': str(compile_fix),
 })
 
-print('PASS: bank playback + persistent BLENDS + current-touch long-press LIST management + professional parameter pages')
+print('PASS: bank playback + realtime streaming + persistent BLENDS + current-touch long-press LIST management + professional parameter pages')

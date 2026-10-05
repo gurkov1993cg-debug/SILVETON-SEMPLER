@@ -126,6 +126,17 @@ exec(compile(ui_perf.read_text(encoding='utf-8'), str(ui_perf), 'exec'), {
     '__file__': str(ui_perf),
 })
 
+# Normalize only source formatting/signature drift introduced by earlier patches.
+# This does not change DSP behavior; it gives the final bank patch a deterministic
+# startVoice anchor while validating that the function still has the expected API.
+compat = Path(__file__).with_name('codemagic_bank_runtime_compat.py')
+if not compat.is_file():
+    raise SystemExit(f'missing bank runtime compatibility normalizer: {compat}')
+exec(compile(compat.read_text(encoding='utf-8'), str(compat), 'exec'), {
+    '__name__': '__main__',
+    '__file__': str(compat),
+})
+
 # Final bank/runtime pass. This owns the completed data model and realtime switch
 # behavior so earlier patches cannot restore positional IDs or ALSA stop/restart.
 bank_v2 = Path(__file__).with_name('codemagic_bank_runtime_v2.py')

@@ -15,14 +15,8 @@ if not bridge.is_file():
 if tests is None:
     raise SystemExit('missing sampler core test source')
 
-# ---------------------------------------------------------------------------
-# Bank load is not considered successful merely because SOUND names/catalog
-# records exist. Pick a genuinely playable SOUND and prove its complete path
-# (SOUND -> MULTISAMPLE -> ZONE -> SAMPLE stream -> SamplerEngine render) on the
-# control thread before publishing it to the live engine.
-# This patch deliberately does NOT touch Direct ALSA, root, SELinux, mixer,
-# thermal or speaker-protection code.
-# ---------------------------------------------------------------------------
+# This patch validates the real bank playback graph only. It deliberately does
+# not touch Direct ALSA, root, SELinux, mixer, thermal or speaker protection.
 s = bridge.read_text(encoding='utf-8')
 
 old = '''        auto state = std::make_shared<EngineState>();
@@ -38,8 +32,8 @@ old = '''        auto state = std::make_shared<EngineState>();
         return true;
 '''
 
-new = '''        // A visible catalog entry is not enough. Resolve a SOUND that has at
-        // least one enabled layer, a real multisample zone and valid sample data.
+new = '''        // Do not accept a bank merely because SOUND names are visible. Select
+        // a SOUND that resolves all the way to a valid SAMPLE.
         const ProgramSlot* selectedSound = nullptr;
         std::uint8_t selectedKey = 60U;
         std::uint8_t selectedVelocity = 100U;
@@ -68,10 +62,8 @@ new = '''        // A visible catalog entry is not enough. Resolve a SOUND that 
             return false;
         }
 
-        // Offline DSP proof using the exact mmap-backed bank objects. This does
-        // not stop/reopen Direct ALSA and cannot alter the hardware audio route.
-        // If this probe is silent, the bank is rejected instead of pretending
-        // that a visible SOUND is playable.
+        // Offline proof with the exact mmap-backed objects. No hardware audio
+        // route is opened, stopped or changed by this probe.
         auto probeState = std::make_shared<EngineState>();
         probeState->combi.name = selectedSound->program->name;
         auto& probeUpper = probeState->combi.uppers[0];
@@ -126,21 +118,39 @@ if old in s:
 elif 'SILVETON bank loaded but SAMPLE playback path is silent' in s and 'const ProgramSlot* selectedSound = nullptr;' in s:
     pass
 else:
-    raise SystemExit('final bank state-install anchor changed')
+    load0 = s.find('    bool loadSvBank(const std::string& path) {')
+    load1 = s.find('\n    bool loadSet(', load0)
+    if load0 < 0 or load1 < 0:
+        raise SystemExit('loadSvBank boundaries changed')
+    block = s[load0:load1]
+    begin = block.find('        auto state = std::make_shared<EngineState>();')
+    finish_token = '        setTextError({});\n        return true;\n'
+    finish = block.find(finish_token, begin)
+    if begin < 0 or finish < 0:
+        raise SystemExit('final bank state-install block changed')
+    finish += len(finish_token)
+    block = block[:begin] + new + block[finish:]
+    s = s[:load0] + block + s[load1:]
 
 bridge.write_text(s, encoding='utf-8')
 
-# ---------------------------------------------------------------------------
-# Regression test: the existing synthetic .sv test must now prove audio output,
-# not merely metadata/catalog reconstruction.
-# ---------------------------------------------------------------------------
+# Regression: locate testSvBankRuntime structurally. The preceding stable-ID
+# patch rewrites metadata assertions, so they must never be used as an anchor.
 t = tests.read_text(encoding='utf-8')
-anchor = '''    assert(program->layers[0].multisample==loaded.data.multisamples[0].multisample);
-    assert(program->layers[0].multisample->zones[0].sample==sp);
-'''
-probe_test = anchor + '''
-    // End-to-end bank playback contract: a successfully loaded SOUND must
-    // create a voice and produce non-zero stereo audio from its SAMPLE stream.
+if 'End-to-end bank playback contract' not in t:
+    fn0 = t.find('void testSvBankRuntime()')
+    fn1 = t.find('void testSampleRecorderRf64()', fn0)
+    if fn0 < 0 or fn1 < 0:
+        raise SystemExit('testSvBankRuntime function boundaries changed')
+    block = t[fn0:fn1]
+    insert_at = block.find('    auto corrupted=file;')
+    if insert_at < 0:
+        insert_at = block.find('    auto corrupted = file;')
+    if insert_at < 0:
+        raise SystemExit('testSvBankRuntime corruption-check anchor changed')
+
+    probe_test = '''    // End-to-end bank playback contract: successful bank load must create
+    // a real voice and non-zero stereo audio from the SAMPLE stream.
     auto playbackState=std::make_shared<EngineState>();
     playbackState->combi.name=program->name;
     playbackState->combi.uppers[0].name=program->name;
@@ -154,14 +164,13 @@ probe_test = anchor + '''
     float bankPeak=0.0F; for(const float v:bankAudio){const float a=v<0.0F?-v:v;if(a>bankPeak)bankPeak=a;}
     assert(bankEngine.activeVoiceCount()>0U);
     assert(bankPeak>1.0e-6F);
+
 '''
-if anchor in t and 'End-to-end bank playback contract' not in t:
-    t = t.replace(anchor, probe_test, 1)
-elif 'End-to-end bank playback contract' not in t:
-    raise SystemExit('testSvBankRuntime playback anchor changed')
+    block = block[:insert_at] + probe_test + block[insert_at:]
+    t = t[:fn0] + block + t[fn1:]
+
 tests.write_text(t, encoding='utf-8')
 
-# Final hard contracts. No audio/root files are modified by this patch.
 final_bridge = bridge.read_text(encoding='utf-8')
 for token in [
     'const ProgramSlot* selectedSound = nullptr;',

@@ -37,6 +37,7 @@ workflows:
           test -f "$CM_BUILD_DIR/codemagic_remove_test_piano.py"
           test -f "$CM_BUILD_DIR/codemagic_live_note_latency_fix.py"
           test -f "$CM_BUILD_DIR/codemagic_ultra_low_latency_output_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_crackle_fix.py"
 
           rm -rf "$CM_BUILD_DIR/_silveton_src"
           mkdir -p "$CM_BUILD_DIR/_silveton_src"
@@ -63,6 +64,8 @@ workflows:
           python3 "$CM_BUILD_DIR/codemagic_48khz_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_live_performance_indicators.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_xrun_stability_fix.py" "$PROJECT_DIR"
+          # Must stay LAST: works on the fully generated tree.
+          python3 "$CM_BUILD_DIR/codemagic_crackle_fix.py" "$PROJECT_DIR"
 
           BRIDGE="$PROJECT_DIR/android/app/src/main/cpp/SamplerAudioBridge.cpp"
           RUNTIME="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SamplerRuntime.kt"
@@ -75,6 +78,8 @@ workflows:
           VIEW="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SilvetonSamplerView.kt"
           CONTROLLER="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SamplerAppController.kt"
           SAMPLER_TESTS="$PROJECT_DIR/core/tests/SamplerTests.cpp"
+          BANK_RUNTIME="$PROJECT_DIR/core/src/sampler/SvBankRuntime.cpp"
+          PREFETCH_H="$PROJECT_DIR/core/include/silveton/sampler/SampleStreamPrefetcher.h"
 
           test -f "$SAMPLER_TESTS"
           grep -F 'constexpr unsigned kRate = 96000U;' "$BRIDGE"
@@ -126,7 +131,28 @@ workflows:
           grep -F '48 kHz SAMPLE must play through 96 kHz engine' "$SAMPLER_TESTS"
           grep -F 'data class MidiStatus(' "$CONTROLLER"
           grep -F 'private val statusChanged: (String?) -> Unit = {},' "$CONTROLLER"
+          grep -F 'SILVETON_CRACKLE_FIX_V1' "$ENGINE"
+          grep -F 'softKill(impl, tail);' "$ENGINE"
+          grep -F 'softKill(impl, existing);' "$ENGINE"
+          grep -F 'publishVoiceWindows(*impl_, vi);' "$ENGINE"
+          grep -F 'void readStereo(' "$SINC"
+          grep -F 'class SampleStreamPrefetcher' "$PREFETCH_H"
+          grep -F 'prefetcher_.start()' "$BRIDGE"
+          grep -F 'MADV_NORMAL' "$BANK_RUNTIME"
+          grep -F 'testLoopedSampleKeepsAttack();' "$SAMPLER_TESTS"
 
+          if grep -Fq 'if (resolved < loopStart && frame >= 0)' "$SINC_CPP"; then
+            echo "ERROR: looped samples would lose their attack again (loop-start clamp returned)" >&2
+            exit 1
+          fi
+          if grep -Fq 'MADV_SEQUENTIAL' "$BANK_RUNTIME"; then
+            echo "ERROR: bank mapping returned to MADV_SEQUENTIAL (Android drops loop pages first)" >&2
+            exit 1
+          fi
+          if grep -Fq 'existing.active = false;' "$ENGINE"; then
+            echo "ERROR: MONO/LEGATO note change cuts the previous note in one sample again" >&2
+            exit 1
+          fi
           if grep -Fq 'constexpr unsigned kRate = 48000U;' "$BRIDGE"; then
             echo "ERROR: stale 48 kHz final output target remains" >&2
             exit 1

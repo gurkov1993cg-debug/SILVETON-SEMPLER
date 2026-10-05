@@ -193,6 +193,31 @@ t = re.sub(
     t,
 )
 
+# The final bank runtime performs state replacement at the realtime block boundary
+# and deliberately keeps already-playing voices alive through SOUND/COMBI/global
+# state changes. The legacy test expected setState() to kill them immediately.
+# Update only that one assertion inside testGlobalAdvancedControls so CI verifies
+# the new seamless-switch contract instead of the removed click-producing behavior.
+fn_start = t.find("void testGlobalAdvancedControls()")
+if fn_start < 0:
+    raise SystemExit("testGlobalAdvancedControls not found in sampler tests")
+fn_end = t.find("\nvoid ", fn_start + 1)
+if fn_end < 0:
+    fn_end = len(t)
+fn_block = t[fn_start:fn_end]
+legacy_voice_assert = "assert(e.activeVoiceCount()==0U);"
+if fn_block.count(legacy_voice_assert) != 1:
+    raise SystemExit(
+        "cannot uniquely locate legacy activeVoiceCount assertion in testGlobalAdvancedControls: "
+        + str(fn_block.count(legacy_voice_assert))
+    )
+fn_block = fn_block.replace(
+    legacy_voice_assert,
+    "assert(e.activeVoiceCount()>0U); // seamless state swap must preserve the held voice",
+    1,
+)
+t = t[:fn_start] + fn_block + t[fn_end:]
+
 test_path.write_text(t, encoding="utf-8")
 
 required_test_anchors = [
@@ -202,6 +227,7 @@ required_test_anchors = [
     "SvSampleRecord sample{}; sample.nameOffset=sampleName;",
     "SvZoneRecord zone{}; zone.sampleIndex=0U;",
     "loaded.data.programs[0].address.bank==2U",
+    "assert(e.activeVoiceCount()>0U); // seamless state swap must preserve the held voice",
 ]
 check = test_path.read_text(encoding="utf-8")
 for token in required_test_anchors:
@@ -213,4 +239,4 @@ if aliased_sampler_tests:
     mode = " (SamplerTests.cpp presented as SamplerCoreTests.cpp for final v2 patch)"
 elif renamed_primary:
     mode = " (unrelated CoreTests.cpp temporarily hidden)"
-print("PASS: startVoice + SV v2 test anchors normalized in " + original_test_path.name + mode)
+print("PASS: startVoice + SV v2 test anchors + seamless voice regression normalized in " + original_test_path.name + mode)

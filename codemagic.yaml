@@ -79,7 +79,7 @@ workflows:
           grep -F 'configureRealtimeThread("SilvMidiRT", 0, 5, 70);' "$BRIDGE"
           grep -F 'class BuiltinTestInstrument' "$BRIDGE"
           grep -F 'testInstrument_.render(renderBuffer_.data(), frames, sampleRate());' "$BRIDGE"
-          grep -F 'testInstrument_.setEnabled(true);' "$BRIDGE"
+          grep -F 'testInstrument_.setEnabled(!hasPlayableProgram);' "$BRIDGE"
           grep -F 'testInstrument_.noteOn(data1, data2);' "$BRIDGE"
           grep -F 'const bool midiOk = startDirectMidiLocked();' "$BRIDGE"
           grep -F 'kControlDevice = "/dev/snd/controlC0"' "$BRIDGE"

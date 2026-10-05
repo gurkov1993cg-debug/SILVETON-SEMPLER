@@ -121,4 +121,12 @@ exec(compile(pro_ui.read_text(encoding='utf-8'), str(pro_ui), 'exec'), {
     '__file__': str(pro_ui),
 })
 
+compile_fix = Path(__file__).with_name('codemagic_list_ui_compile_fix.py')
+if not compile_fix.is_file():
+    raise SystemExit(f'missing professional LIST/UI compile guard: {compile_fix}')
+exec(compile(compile_fix.read_text(encoding='utf-8'), str(compile_fix), 'exec'), {
+    '__name__': '__main__',
+    '__file__': str(compile_fix),
+})
+
 print('PASS: bank playback + persistent BLENDS + long-press LIST management + professional parameter pages')

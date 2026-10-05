@@ -69,7 +69,6 @@ elif 'const auto preserved = library_.snapshot();' in s and 'merged.combis = pre
 else:
     raise SystemExit('loadSvBank replacement anchor changed')
 
-# Hard contracts: a bank load must never be allowed to erase user COMBI/LIST.
 for token in [
     'const auto preserved = library_.snapshot();',
     'merged.combis = preserved.combis;',
@@ -81,7 +80,6 @@ for token in [
     if token not in s:
         raise SystemExit(f'BLENDS preservation contract missing: {token}')
 
-# The destructive direct replacement must no longer occur in loadSvBank.
 start = s.find('    bool loadSvBank(const std::string& path) {')
 end = s.find('\n    bool loadSet(', start)
 if start < 0 or end < 0:
@@ -91,4 +89,15 @@ if 'library_.replace(loaded.data);' in block:
     raise SystemExit('destructive bank replacement still erases BLENDS')
 
 bridge.write_text(s, encoding='utf-8')
-print('PASS: SILVETON bank load preserves BLENDS/COMBI and LIST, then rebinds fixed SOUND slots')
+
+# Also persist BLENDS/LIST across complete app restarts. This patch stores only
+# COMBI/LIST data and fixed SOUND-slot references; it does not duplicate bank audio.
+persist = Path(__file__).with_name('codemagic_blends_persistence_fix.py')
+if not persist.is_file():
+    raise SystemExit(f'missing BLENDS persistence patch: {persist}')
+exec(compile(persist.read_text(encoding='utf-8'), str(persist), 'exec'), {
+    '__name__': '__main__',
+    '__file__': str(persist),
+})
+
+print('PASS: bank load preserves BLENDS/COMBI + LIST and persistent user state is wired')

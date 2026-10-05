@@ -37,10 +37,11 @@ for token in [
         raise SystemExit(f'Direct ALSA/MIDI protection contract lost: {token}')
 bridge.write_text(b, encoding='utf-8')
 
-# Root/safety policy must remain untouched by the latency cleanup.
+# Root promotion after the XRUN/isolation patch is deliberately stronger than
+# the non-root C++ fallback: audio CPU7/FIFO85, MIDI CPU6/FIFO75.
 r = root_mode.read_text(encoding='utf-8')
-if 'promote SilvAudioRT 80 80' not in r or 'promote SilvMidiRT 3f 70' not in r:
-    raise SystemExit('realtime root promotion topology changed unexpectedly')
+if 'promote SilvAudioRT 80 85' not in r or 'promote SilvMidiRT 40 75' not in r:
+    raise SystemExit('final rooted realtime promotion topology changed unexpectedly')
 for forbidden in ['setenforce 0', 'thermal disable', 'Speaker Protect 0', 'SmartPA 0', 'chmod 777']:
     if forbidden in r:
         raise SystemExit(f'unsafe root change detected: {forbidden}')

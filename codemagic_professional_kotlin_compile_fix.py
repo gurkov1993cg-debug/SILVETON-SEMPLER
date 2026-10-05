@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from pathlib import Path
 import re
+import subprocess
 import sys
 
 root = Path(sys.argv[1]).resolve()
@@ -51,8 +52,6 @@ if "breakText(" in s:
 
 # The interaction/performance layer upgraded the four TONE callbacks to
 # (index, value, final). The professional polish must preserve that contract.
-# It had replaced drawToneSection with the older Function2 signature, producing
-# the four compile errors in AMP/FILTER/LFO/EQ.
 tone_sig2 = "commit: (Int, Float) -> Unit)"
 tone_sig3 = "commit: (Int, Float, Boolean) -> Unit)"
 tone_start = s.find("private fun drawToneSection(")
@@ -67,9 +66,6 @@ if tone_sig2 in tone:
 elif tone_sig3 not in tone:
     raise SystemExit("drawToneSection callback contract is neither Function2 nor Function3")
 
-# Smooth drag changes are real commits so the sound follows the finger; exact
-# entry/reset are also final commits. This keeps the performance-layer call sites
-# with their explicit 'final' parameter type-correct and functional.
 tone = tone.replace("commit(i, nv)", "commit(i, nv, true)")
 tone = tone.replace("commit(i, it)", "commit(i, it, true)")
 tone = tone.replace("commit(i, default)", "commit(i, default, true)")
@@ -79,7 +75,6 @@ if re.search(r"\bcommit\s*\(\s*i\s*,\s*(?:nv|it|default)\s*\)", tone):
     raise SystemExit("stale Function2 tone commit invocation remains")
 s = s[:tone_start] + tone + s[tone_end:]
 
-# Compile-surface guards for the new professional controls.
 for forbidden in [
     "MotionEvent.INVALID_POINTER_ID",
     "maxWidth.isFinite()",
@@ -102,4 +97,12 @@ for required in [
         raise SystemExit(f"professional UI contract lost during Kotlin compile fix: {required}")
 
 view.write_text(s, encoding="utf-8")
-print(f"PASS: professional UI Kotlin compatibility normalized; TONE Function3/final contract preserved; ALSA/MIDI untouched (breakText fixes: {replaced_break_text})")
+print(f"PASS: professional UI Kotlin compatibility normalized; TONE Function3/final contract preserved (breakText fixes: {replaced_break_text})")
+
+# This runs after the complete GUI/bank patch chain, so latency changes cannot be
+# overwritten by earlier stability patches. It deliberately preserves ALSA 48k/96x3
+# and the existing RT/root safety topology.
+latency_patch = Path(__file__).resolve().parent / "codemagic_live_note_latency_fix.py"
+if not latency_patch.is_file():
+    raise SystemExit(f"missing final live-note latency patch: {latency_patch}")
+subprocess.run([sys.executable, str(latency_patch), str(root)], check=True)

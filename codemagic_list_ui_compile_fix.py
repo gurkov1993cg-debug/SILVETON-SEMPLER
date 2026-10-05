@@ -9,25 +9,30 @@ for p in (view, controller):
     if not p.is_file():
         raise SystemExit(f"missing LIST UI compile source: {p}")
 
-# First normalize the dedicated SILVETON DSP portamento to the approved 0..100
-# user scale. This runs after the older GUI/touch patches so 0..5000 ms cannot
-# reappear later in the generated source.
+# Normalize SILVETON DSP portamento to the approved 0..100 user scale after all
+# older GUI/touch rewrites, so the obsolete 0..5000 ms surface cannot return.
 porta = Path(__file__).with_name("codemagic_portamento_100_fix.py")
 if not porta.is_file():
     raise SystemExit(f"missing 0..100 portamento patch: {porta}")
 exec(compile(porta.read_text(encoding="utf-8"), str(porta), "exec"), {
-    "__name__": "__main__",
-    "__file__": str(porta),
+    "__name__": "__main__", "__file__": str(porta),
 })
 
-# Final conservative pass: real smooth controls, exact numeric entry, bounded
-# typography and a read-only re-audit of Direct ALSA/MIDI/root protections.
+# Professional control/typography pass plus read-only ALSA/MIDI/root safety audit.
 polish = Path(__file__).with_name("codemagic_professional_polish_final.py")
 if not polish.is_file():
     raise SystemExit(f"missing final professional UI/realtime audit patch: {polish}")
 exec(compile(polish.read_text(encoding="utf-8"), str(polish), "exec"), {
-    "__name__": "__main__",
-    "__file__": str(polish),
+    "__name__": "__main__", "__file__": str(polish),
+})
+
+# The seven UPPER rows need the same precision contract as TUNE/TONE/FX: the
+# real level and pan bars drag continuously and their value fields allow exact entry.
+upper = Path(__file__).with_name("codemagic_upper_row_polish.py")
+if not upper.is_file():
+    raise SystemExit(f"missing final UPPER-row polish patch: {upper}")
+exec(compile(upper.read_text(encoding="utf-8"), str(upper), "exec"), {
+    "__name__": "__main__", "__file__": str(upper),
 })
 
 v = view.read_text(encoding="utf-8")
@@ -59,6 +64,10 @@ required_view = [
     "SeekBar.OnSeekBarChangeListener",
     "maxWidth:Float=Float.POSITIVE_INFINITY",
     "Typeface.create(\"sans-serif-medium\"",
+    "registerSmoothSlider(volBar, -60f, 12f, 0.1f)",
+    "registerSmoothSlider(panBar, -1f, 1f, 0.01f)",
+    "showNumber(\"UPPER ${i + 1} LEVEL dB\"",
+    "showNumber(\"UPPER ${i + 1} PAN\"",
 ]
 for token in required_view:
     if token not in v:
@@ -88,4 +97,4 @@ for token in [
     if token not in c:
         raise SystemExit(f"professional LIST controller token missing: {token}")
 
-print("PASS: final professional UI + smooth exact controls + LIST tools + 0..100 portamento + protected ALSA/MIDI audit verified")
+print("PASS: final professional UI + all live sliders precise + LIST tools + 0..100 portamento + protected ALSA/MIDI audit verified")

@@ -62,13 +62,13 @@ if canonical not in engine.read_text(encoding="utf-8"):
 
 # -----------------------------------------------------------------------------
 # Select the test file that ACTUALLY owns the SV-bank test.
-# There are builds where both CoreTests.cpp and SamplerCoreTests.cpp exist.
-# The old code simply picked the first existing file, which is why Codemagic kept
-# failing with "test SOUND 500" / "SvSoundRecord sound: found 0".
+# The source has existed with three test filenames over the project history.
+# Detect by content instead of assuming one fixed filename.
 # -----------------------------------------------------------------------------
 test_candidates = [
     ROOT / "core/tests/CoreTests.cpp",
     ROOT / "core/tests/SamplerCoreTests.cpp",
+    ROOT / "core/tests/SamplerTests.cpp",
 ]
 
 def owns_sv_test(path: Path) -> bool:
@@ -93,27 +93,48 @@ if test_path is None:
             present.append(f"{p.name}:missing")
     raise SystemExit("cannot locate real SV bank core test: " + ", ".join(present))
 
-# codemagic_bank_runtime_v2.py historically chooses the first existing candidate.
-# If CoreTests.cpp exists but the SV test lives in SamplerCoreTests.cpp, hide the
-# unrelated file only for the lifetime of this Python process. atexit restores it
-# before the build/compiler starts, including when a later patch aborts.
+# codemagic_bank_runtime_v2.py historically looks only at CoreTests.cpp and
+# SamplerCoreTests.cpp. Keep that patch untouched by temporarily presenting the
+# real SamplerTests.cpp under the expected SamplerCoreTests.cpp name. All renames
+# are restored automatically before this Python process exits, even on failure.
 primary = test_candidates[0]
-hold = primary.with_name(primary.name + ".silveton_hold")
+secondary = test_candidates[1]
+primary_hold = primary.with_name(primary.name + ".silveton_hold")
+secondary_hold = secondary.with_name(secondary.name + ".silveton_hold")
+original_test_path = test_path
 renamed_primary = False
+renamed_secondary = False
+aliased_sampler_tests = False
+
 if test_path != primary and primary.is_file():
-    if hold.exists():
-        raise SystemExit(f"stale temporary test hold exists: {hold}")
-    primary.rename(hold)
+    if primary_hold.exists():
+        raise SystemExit(f"stale temporary test hold exists: {primary_hold}")
+    primary.rename(primary_hold)
     renamed_primary = True
 
-    def restore_primary() -> None:
-        try:
-            if hold.exists() and not primary.exists():
-                hold.rename(primary)
-        except Exception as exc:
-            print(f"WARNING: could not restore {primary.name}: {exc}", file=sys.stderr)
+if test_path == test_candidates[2]:
+    if secondary.exists():
+        if secondary_hold.exists():
+            raise SystemExit(f"stale temporary test hold exists: {secondary_hold}")
+        secondary.rename(secondary_hold)
+        renamed_secondary = True
+    test_path.rename(secondary)
+    test_path = secondary
+    aliased_sampler_tests = True
 
-    atexit.register(restore_primary)
+
+def restore_test_files() -> None:
+    try:
+        if aliased_sampler_tests and secondary.exists() and not original_test_path.exists():
+            secondary.rename(original_test_path)
+        if renamed_secondary and secondary_hold.exists() and not secondary.exists():
+            secondary_hold.rename(secondary)
+        if renamed_primary and primary_hold.exists() and not primary.exists():
+            primary_hold.rename(primary)
+    except Exception as exc:
+        print(f"WARNING: could not restore sampler test filenames: {exc}", file=sys.stderr)
+
+atexit.register(restore_test_files)
 
 # -----------------------------------------------------------------------------
 # Canonicalize only the v1 fixture lines that the final v2 patch intentionally
@@ -187,8 +208,9 @@ for token in required_test_anchors:
     if token not in check:
         raise SystemExit(f"SV v2 test-anchor normalization failed in {test_path.name}: {token}")
 
-print(
-    "PASS: startVoice + SV v2 test anchors normalized in "
-    + test_path.name
-    + (" (unrelated CoreTests.cpp temporarily hidden)" if renamed_primary else "")
-)
+mode = ""
+if aliased_sampler_tests:
+    mode = " (SamplerTests.cpp presented as SamplerCoreTests.cpp for final v2 patch)"
+elif renamed_primary:
+    mode = " (unrelated CoreTests.cpp temporarily hidden)"
+print("PASS: startVoice + SV v2 test anchors normalized in " + original_test_path.name + mode)

@@ -35,8 +35,6 @@ while i < len(lines):
         indent = line[:len(line) - len(line.lstrip())]
         out.append(f"{indent}var count=shown.length\n")
         out.append(f"{indent}while(count>0 && paint.measureText(shown,0,count)>room){{ count-- }}\n")
-        # The generated helper places the old 'shown=if(count...)' assignment on
-        # the following line. Remove it independent of whitespace formatting.
         if i + 1 < len(lines):
             next_compact = "".join(lines[i + 1].split())
             if next_compact.startswith("shown=if(count<=0)ell"):
@@ -48,9 +46,38 @@ while i < len(lines):
     i += 1
 s = "".join(out)
 
-# If breakText appeared, every occurrence must have been normalized.
 if "breakText(" in s:
     raise SystemExit("Kotlin compatibility hazard remains: Paint.breakText overload")
+
+# The interaction/performance layer upgraded the four TONE callbacks to
+# (index, value, final). The professional polish must preserve that contract.
+# It had replaced drawToneSection with the older Function2 signature, producing
+# the four compile errors in AMP/FILTER/LFO/EQ.
+tone_sig2 = "commit: (Int, Float) -> Unit)"
+tone_sig3 = "commit: (Int, Float, Boolean) -> Unit)"
+tone_start = s.find("private fun drawToneSection(")
+if tone_start < 0:
+    raise SystemExit("drawToneSection missing during Kotlin compatibility fix")
+tone_end = s.find("\n    private fun drawUpperFx(", tone_start)
+if tone_end < 0:
+    raise SystemExit("cannot bound drawToneSection during Kotlin compatibility fix")
+tone = s[tone_start:tone_end]
+if tone_sig2 in tone:
+    tone = tone.replace(tone_sig2, tone_sig3, 1)
+elif tone_sig3 not in tone:
+    raise SystemExit("drawToneSection callback contract is neither Function2 nor Function3")
+
+# Smooth drag changes are real commits so the sound follows the finger; exact
+# entry/reset are also final commits. This keeps the performance-layer call sites
+# with their explicit 'final' parameter type-correct and functional.
+tone = tone.replace("commit(i, nv)", "commit(i, nv, true)")
+tone = tone.replace("commit(i, it)", "commit(i, it, true)")
+tone = tone.replace("commit(i, default)", "commit(i, default, true)")
+if tone_sig3 not in tone:
+    raise SystemExit("drawToneSection Function3 contract was not installed")
+if re.search(r"\bcommit\s*\(\s*i\s*,\s*(?:nv|it|default)\s*\)", tone):
+    raise SystemExit("stale Function2 tone commit invocation remains")
+s = s[:tone_start] + tone + s[tone_end:]
 
 # Compile-surface guards for the new professional controls.
 for forbidden in [
@@ -69,9 +96,10 @@ for required in [
     "registerSmoothSlider(",
     "registerSmoothRange(",
     "maxWidth:Float=Float.POSITIVE_INFINITY",
+    "commit: (Int, Float, Boolean) -> Unit)",
 ]:
     if required not in s:
         raise SystemExit(f"professional UI contract lost during Kotlin compile fix: {required}")
 
 view.write_text(s, encoding="utf-8")
-print(f"PASS: professional UI Kotlin compatibility normalized without touching ALSA/MIDI (breakText fixes: {replaced_break_text})")
+print(f"PASS: professional UI Kotlin compatibility normalized; TONE Function3/final contract preserved; ALSA/MIDI untouched (breakText fixes: {replaced_break_text})")

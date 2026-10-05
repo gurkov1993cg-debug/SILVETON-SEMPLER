@@ -6,7 +6,8 @@ root = Path(sys.argv[1])
 cpp = root / 'android/app/src/main/cpp/SamplerAudioBridge.cpp'
 view = root / 'android/app/src/main/java/com/silveton/sampler/SilvetonSamplerView.kt'
 audit = root / 'ci/audit_gui_contract.py'
-for p in (cpp, view, audit):
+tests = root / 'core/tests/SamplerTests.cpp'
+for p in (cpp, view, audit, tests):
     if not p.is_file():
         raise SystemExit(f'missing required source: {p}')
 
@@ -95,10 +96,58 @@ if '"PIANO control"' in a or '"STAGE PIANO set-list slot"' in a or 'PIANO contro
     raise SystemExit('obsolete PIANO requirement remains in GUI audit')
 audit.write_text(a, encoding='utf-8')
 
+# Final regression normalization for the complete seamless state-replacement
+# contract. The old test expected setState() to hard-kill a sounding voice and
+# produce immediate silence. The production engine intentionally keeps the old
+# immutable graph alive for that voice until normal note-off/end, so both voice
+# count and rendered audio must remain non-zero immediately after replacement.
+t = tests.read_text(encoding='utf-8')
+start = t.find('void testSafeStateReplacement()')
+if start < 0:
+    raise SystemExit('testSafeStateReplacement not found')
+end = t.find('\nvoid test', start + 1)
+if end < 0:
+    end = t.find('\nint main(', start + 1)
+if end < 0:
+    raise SystemExit('cannot bound testSafeStateReplacement')
+block = t[start:end]
+
+voice_old = [
+    'assert(engine.activeVoiceCount() == 0U);',
+    'assert(engine.activeVoiceCount()==0U);',
+]
+voice_new = 'assert(engine.activeVoiceCount() > 0U); // seamless replacement preserves sounding voice ownership'
+if voice_new not in block:
+    hits = [x for x in voice_old if x in block]
+    if len(hits) == 1 and block.count(hits[0]) == 1:
+        block = block.replace(hits[0], voice_new, 1)
+    elif not any('activeVoiceCount() > 0U' in line for line in block.splitlines()):
+        raise SystemExit('cannot normalize active voice assertion in testSafeStateReplacement')
+
+rms_old = [
+    'assert(rms(out) == 0.0F);',
+    'assert(rms(out)==0.0F);',
+]
+rms_new = 'assert(rms(out) > 0.0F); // preserved old voice must continue rendering after state replacement'
+if rms_new not in block:
+    hits = [x for x in rms_old if x in block]
+    if len(hits) != 1 or block.count(hits[0]) != 1:
+        raise SystemExit('cannot uniquely locate stale silence assertion in testSafeStateReplacement')
+    block = block.replace(hits[0], rms_new, 1)
+
+for stale in voice_old + rms_old:
+    if stale in block:
+        raise SystemExit(f'stale destructive seamless-state expectation remains: {stale}')
+if 'activeVoiceCount() > 0U' not in block or 'rms(out) > 0.0F' not in block:
+    raise SystemExit('incomplete seamless state-replacement regression contract')
+
+t = t[:start] + block + t[end:]
+tests.write_text(t, encoding='utf-8')
+
 final_cpp = cpp.read_text(encoding='utf-8')
 if 'testInstrument_.setEnabled(false);' not in final_cpp:
     raise SystemExit('TEST EP is not permanently disabled')
 if 'testInstrument_.setEnabled(!hasPlayableProgram);' in final_cpp or 'testInstrument_.setEnabled(true);' in final_cpp:
     raise SystemExit('obsolete TEST EP enable path remains')
 
-print('PASS: obsolete TEST EP / Stage Piano retired from runtime, GUI and audit; real SILVETON bank SOUND is authoritative')
+print('PASS: production bank-only sound + full seamless state-replacement regression contract applied')

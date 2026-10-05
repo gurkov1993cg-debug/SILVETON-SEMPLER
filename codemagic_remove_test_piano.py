@@ -152,9 +152,32 @@ exec(compile(workflow.read_text(encoding='utf-8'), str(workflow), 'exec'), {
     '__file__': str(workflow),
 })
 
-final_view = view.read_text(encoding='utf-8')
-for token in ['"WRITE COMBI"', '"ADD TO LIST"', '"EDIT COMBI"']:
-    if token not in final_view:
-        raise SystemExit(f'visible COMBI/LIST button missing after final patch: {token}')
+# Android 15 scoped-storage fix is applied after all runtime/UI rewrites so no
+# earlier patch can remove the bank permission, root app-op, or SOUND diagnostics.
+bank_access = Path(__file__).with_name('codemagic_bank_storage_access_fix.py')
+if not bank_access.is_file():
+    raise SystemExit(f'missing bank storage access patch: {bank_access}')
+exec(compile(bank_access.read_text(encoding='utf-8'), str(bank_access), 'exec'), {
+    '__name__': '__main__',
+    '__file__': str(bank_access),
+})
 
-print('PASS: production bank-only sound + seamless regression + visible COMBI/LIST workflow applied')
+final_view = view.read_text(encoding='utf-8')
+for token in ['"WRITE COMBI"', '"ADD TO LIST"', '"EDIT COMBI"', '"BANK HAS NO SOUNDS"']:
+    if token not in final_view:
+        raise SystemExit(f'visible COMBI/LIST/bank UI token missing after final patch: {token}')
+
+root_mode = root / 'android/app/src/main/java/com/silveton/sampler/SilvetonRootRuntime.kt'
+manifest = root / 'android/app/src/main/AndroidManifest.xml'
+controller = root / 'android/app/src/main/java/com/silveton/sampler/SamplerAppController.kt'
+for p in (root_mode, manifest, controller):
+    if not p.is_file():
+        raise SystemExit(f'missing final bank access source: {p}')
+if 'MANAGE_EXTERNAL_STORAGE allow' not in root_mode.read_text(encoding='utf-8'):
+    raise SystemExit('root all-files app-op missing after final patch')
+if 'android.permission.MANAGE_EXTERNAL_STORAGE' not in manifest.read_text(encoding='utf-8'):
+    raise SystemExit('MANAGE_EXTERNAL_STORAGE manifest permission missing after final patch')
+if 'SilvetonRootRuntime.refreshBankStorageAccess()' not in controller.read_text(encoding='utf-8'):
+    raise SystemExit('bank storage refresh is not wired into startup')
+
+print('PASS: production bank-only sound + seamless regression + visible COMBI/LIST + Android 15 bank access applied')

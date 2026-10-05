@@ -20,9 +20,6 @@ if 'constexpr unsigned kPeriods = 2U;' in s:
 elif 'constexpr unsigned kPeriods = 3U;' not in s:
     raise SystemExit('Direct ALSA period-count constant not found')
 
-# Start only after two complete periods are queued. This leaves one full 96-frame
-# reserve period after start and after every PREPARE/XRUN recovery instead of
-# restarting with effectively no scheduling margin.
 old_start = '''        sw.start_threshold = static_cast<snd_pcm_uframes_t>(
             std::max(config.periodFrames, config.bufferFrames / 2U));
 '''
@@ -37,10 +34,8 @@ elif 'config.bufferFrames - config.periodFrames' not in s:
 s = s.replace('48 kHz / 96 x 2', '48 kHz / 96 x 3')
 s = s.replace('48 kHz / 96x2', '48 kHz / 96x3')
 s = s.replace('96 frames x 2 at 48 kHz', '96 frames x 3 at 48 kHz')
-
 cpp.write_text(s, encoding='utf-8')
 
-# Keep the hardware status truthful: 96-frame periods, 3 periods, 288-frame buffer.
 v = view.read_text(encoding='utf-8')
 v = v.replace('a.bufferSizeFrames == 192', 'a.bufferSizeFrames == 288')
 v = v.replace('"48k 96x2"', '"48k 96x3"')
@@ -50,8 +45,6 @@ view.write_text(v, encoding='utf-8')
 # CPU7 = audio RT thread + MediaTek AFE audio IRQ only.
 # CPU6 = raw MIDI RT thread only.
 # CPU0-5 = UI, disk/bank work and all other SILVETON/Android work.
-# The native code keeps its safe fallback affinity; this root-side promotion is
-# authoritative on the dedicated tablet and avoids changing the JNI/source ABI.
 k = root_mode.read_text(encoding='utf-8')
 old_promote = '''            promote SilvAudioRT 80 80
             promote SilvMidiRT 3f 70
@@ -115,9 +108,6 @@ for token in ['a.bufferSizeFrames == 288', '"48k 96x3"']:
     if token not in final_view:
         raise SystemExit(f'XRUN UI contract missing: {token}')
 
-# Final UI pass: practical drag sliders + immediate touch response + cached JNI
-# telemetry/list data. This runs after every visual/status patch so no later script
-# can put the old rotary/tap-only controls back.
 ui_perf = Path(__file__).with_name('codemagic_ui_interaction_performance_fix.py')
 if not ui_perf.is_file():
     raise SystemExit(f'missing UI interaction/performance patch: {ui_perf}')
@@ -126,19 +116,17 @@ exec(compile(ui_perf.read_text(encoding='utf-8'), str(ui_perf), 'exec'), {
     '__file__': str(ui_perf),
 })
 
-# Normalize only source formatting/signature drift introduced by earlier patches.
-# This does not change DSP behavior; it gives the final bank patch a deterministic
-# startVoice anchor while validating that the function still has the expected API.
+# Keep the compatibility namespace so its temporary SamplerTests alias can be
+# restored immediately after bank-v2, before later checks access SamplerTests.cpp.
 compat = Path(__file__).with_name('codemagic_bank_runtime_compat.py')
 if not compat.is_file():
     raise SystemExit(f'missing bank runtime compatibility normalizer: {compat}')
-exec(compile(compat.read_text(encoding='utf-8'), str(compat), 'exec'), {
+compat_ns = {
     '__name__': '__main__',
     '__file__': str(compat),
-})
+}
+exec(compile(compat.read_text(encoding='utf-8'), str(compat), 'exec'), compat_ns)
 
-# Final bank/runtime pass. This owns the completed data model and realtime switch
-# behavior so earlier patches cannot restore positional IDs or ALSA stop/restart.
 bank_v2 = Path(__file__).with_name('codemagic_bank_runtime_v2.py')
 if not bank_v2.is_file():
     raise SystemExit(f'missing final bank runtime v2 patch: {bank_v2}')
@@ -147,14 +135,15 @@ exec(compile(bank_v2.read_text(encoding='utf-8'), str(bank_v2), 'exec'), {
     '__file__': str(bank_v2),
 })
 
-# The final bank runtime intentionally changed SamplerEngine::setState from the
-# old destructive voice reset to a block-boundary graph swap. Existing voices own
-# their immutable old graph and must continue naturally. Align the one legacy
-# regression assertion in testGlobalAdvancedControls with that live-performance
-# contract instead of weakening the engine back to note-cutting behavior.
+restore_tests = compat_ns.get('restore_test_files')
+if not callable(restore_tests):
+    raise SystemExit('bank compatibility restore hook missing')
+restore_tests()
+
+# Align the one legacy regression assertion with seamless state switching.
 sampler_tests = root / 'core/tests/SamplerTests.cpp'
 if not sampler_tests.is_file():
-    raise SystemExit(f'missing sampler regression tests: {sampler_tests}')
+    raise SystemExit(f'missing sampler regression tests after bank-v2 restore: {sampler_tests}')
 tests_text = sampler_tests.read_text(encoding='utf-8')
 fn_start = tests_text.find('void testGlobalAdvancedControls()')
 if fn_start < 0:
@@ -166,14 +155,25 @@ if fn_end < 0:
     raise SystemExit('cannot bound testGlobalAdvancedControls')
 fn_block = tests_text[fn_start:fn_end]
 legacy = 'assert(e.activeVoiceCount()==0U);'
-seamless = 'assert(e.activeVoiceCount()>0U); // seamless state swap must not kill an already sounding voice'
+seamless_a = 'assert(e.activeVoiceCount()>0U); // seamless state swap must not kill an already sounding voice'
+seamless_b = 'assert(e.activeVoiceCount()>0U); // seamless state swap must preserve the held voice'
 if legacy in fn_block:
     if fn_block.count(legacy) != 1:
         raise SystemExit('ambiguous legacy activeVoiceCount assertion in testGlobalAdvancedControls')
-    fn_block = fn_block.replace(legacy, seamless, 1)
+    fn_block = fn_block.replace(legacy, seamless_a, 1)
     tests_text = tests_text[:fn_start] + fn_block + tests_text[fn_end:]
-elif seamless not in fn_block:
+elif seamless_a not in fn_block and seamless_b not in fn_block:
     raise SystemExit('expected seamless-state regression assertion not found')
 sampler_tests.write_text(tests_text, encoding='utf-8')
 
-print('PASS: SM-X130 XRUN stability + CPU isolation + slider UI + final bank runtime v2 + seamless-state regression alignment applied')
+# Final product cleanup: no synthetic TEST EP / Stage Piano is allowed now that
+# the real SILVETON bank SOUND path is complete.
+remove_test_piano = Path(__file__).with_name('codemagic_remove_test_piano.py')
+if not remove_test_piano.is_file():
+    raise SystemExit(f'missing final test-piano removal patch: {remove_test_piano}')
+exec(compile(remove_test_piano.read_text(encoding='utf-8'), str(remove_test_piano), 'exec'), {
+    '__name__': '__main__',
+    '__file__': str(remove_test_piano),
+})
+
+print('PASS: SM-X130 XRUN stability + CPU isolation + slider UI + bank runtime v2 + restored tests + real-bank-only sound applied')

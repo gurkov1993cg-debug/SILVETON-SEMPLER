@@ -5,14 +5,14 @@ import sys
 root = Path(sys.argv[1])
 cpp = root / 'android/app/src/main/cpp/SamplerAudioBridge.cpp'
 view = root / 'android/app/src/main/java/com/silveton/sampler/SilvetonSamplerView.kt'
-for p in (cpp, view):
+audit = root / 'ci/audit_gui_contract.py'
+for p in (cpp, view, audit):
     if not p.is_file():
         raise SystemExit(f'missing required source: {p}')
 
 # The real SILVETON bank/runtime is now the only playable sound source.
-# Keep the old diagnostic class compiled for ABI/source compatibility with the
-# earlier patch chain, but disable it permanently so it can never layer over,
-# replace, or sound instead of a real bank SOUND.
+# Keep the old diagnostic class compiled for compatibility with the earlier patch
+# chain, but disable it permanently so it can never sound or layer over bank audio.
 s = cpp.read_text(encoding='utf-8')
 old = '''        const bool hasPlayableProgram = std::any_of(
             state_->combi.uppers.begin(), state_->combi.uppers.end(),
@@ -74,8 +74,26 @@ v = v.replace(built_in_slot, '', 1)
 for forbidden in ['"STAGE PIANO"', '"BUILT-IN  •  RAW MIDI"', 'text(c,"PIANO"', 'text(c, "TEST EP"']:
     if forbidden in v:
         raise SystemExit(f'obsolete test-piano UI remains: {forbidden}')
-
 view.write_text(v, encoding='utf-8')
+
+# The GUI audit must validate the production sampler UI, not the retired hardware
+# validation piano. Keep all real navigation/status/controller checks.
+a = audit.read_text(encoding='utf-8')
+a = a.replace('    "PIANO control": \'"PIANO"\',\n', '')
+a = a.replace('    "STAGE PIANO set-list slot": \'"STAGE PIANO"\',\n', '')
+
+piano_audit_block = '''if "sampler.testEpNoteOn" not in view or "sampler.testEpNoteOff" not in view:
+    raise SystemExit("MISSING GUI contract: PIANO control is not wired to native note on/off")
+print("PASS - GUI PIANO control is wired to native note on/off")
+
+'''
+a = a.replace(piano_audit_block, '', 1)
+a = a.replace('    "PIANO note on": "fun testEpNoteOn(",\n', '')
+a = a.replace('    "PIANO note off": "fun testEpNoteOff(",\n', '')
+
+if '"PIANO control"' in a or '"STAGE PIANO set-list slot"' in a or 'PIANO control is not wired' in a:
+    raise SystemExit('obsolete PIANO requirement remains in GUI audit')
+audit.write_text(a, encoding='utf-8')
 
 final_cpp = cpp.read_text(encoding='utf-8')
 if 'testInstrument_.setEnabled(false);' not in final_cpp:
@@ -83,4 +101,4 @@ if 'testInstrument_.setEnabled(false);' not in final_cpp:
 if 'testInstrument_.setEnabled(!hasPlayableProgram);' in final_cpp or 'testInstrument_.setEnabled(true);' in final_cpp:
     raise SystemExit('obsolete TEST EP enable path remains')
 
-print('PASS: obsolete TEST EP / Stage Piano retired; real SILVETON bank SOUND is the only playable source')
+print('PASS: obsolete TEST EP / Stage Piano retired from runtime, GUI and audit; real SILVETON bank SOUND is authoritative')

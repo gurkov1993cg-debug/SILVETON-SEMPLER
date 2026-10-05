@@ -19,37 +19,24 @@ exec(compile(porta.read_text(encoding="utf-8"), str(porta), "exec"), {
 })
 
 # Professional control/typography pass plus read-only ALSA/MIDI/root safety audit.
-# Older GUI patches are allowed to reformat a Kotlin method signature. Make the
-# polish patch resolve such methods by function name as a fallback rather than
-# aborting on harmless whitespace/parameter formatting differences.
+# Patch its Python helper structurally, not by an exact old-text anchor: previous
+# revisions may legitimately reformat method_bounds() while keeping semantics.
 polish = Path(__file__).with_name("codemagic_professional_polish_final.py")
 if not polish.is_file():
     raise SystemExit(f"missing final professional UI/realtime audit patch: {polish}")
 polish_source = polish.read_text(encoding="utf-8")
-old_method_bounds = '''def method_bounds(text: str, signature: str):
-    start = text.find(signature)
-    if start < 0:
-        raise SystemExit(f"missing method: {signature}")
-    brace = text.find('{', start)
-    if brace < 0:
-        raise SystemExit(f"missing method body: {signature}")
-    close = match_brace(text, brace)
-    if close < 0:
-        raise SystemExit(f"unbalanced method: {signature}")
-    end = close + 1
-    if end < len(text) and text[end] == '\n':
-        end += 1
-    return start, end
-'''
-new_method_bounds = '''def method_bounds(text: str, signature: str):
+mb0 = polish_source.find("def method_bounds(text: str, signature: str):")
+mb1 = polish_source.find("\ndef replace_method(", mb0)
+if mb0 < 0 or mb1 < 0:
+    raise SystemExit("professional polish method resolver boundaries missing")
+robust_method_bounds = '''def method_bounds(text: str, signature: str):
     start = text.find(signature)
     if start < 0 and "fun " in signature:
         fn = signature.split("fun ", 1)[1].split("(", 1)[0].strip()
         for marker in (f"private fun {fn}(", f"fun {fn}("):
             candidate = text.find(marker)
             if candidate >= 0:
-                line_start = text.rfind("\n", 0, candidate) + 1
-                start = line_start
+                start = text.rfind("\\n", 0, candidate) + 1
                 break
     if start < 0:
         raise SystemExit(f"missing method: {signature}")
@@ -60,13 +47,11 @@ new_method_bounds = '''def method_bounds(text: str, signature: str):
     if close < 0:
         raise SystemExit(f"unbalanced method: {signature}")
     end = close + 1
-    if end < len(text) and text[end] == '\n':
+    if end < len(text) and text[end] == '\\n':
         end += 1
     return start, end
 '''
-if old_method_bounds not in polish_source:
-    raise SystemExit("professional polish method resolver anchor changed")
-polish_source = polish_source.replace(old_method_bounds, new_method_bounds, 1)
+polish_source = polish_source[:mb0] + robust_method_bounds + polish_source[mb1 + 1:]
 exec(compile(polish_source, str(polish), "exec"), {
     "__name__": "__main__", "__file__": str(polish),
 })

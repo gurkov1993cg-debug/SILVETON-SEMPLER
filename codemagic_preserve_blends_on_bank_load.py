@@ -110,4 +110,15 @@ exec(compile(playback.read_text(encoding='utf-8'), str(playback), 'exec'), {
     '__file__': str(playback),
 })
 
-print('PASS: bank load preserves BLENDS/COMBI + LIST, persists user state, and proves real bank playback')
+# Final tablet interaction layer: right-click-style long-press LIST management
+# and large professional parameter pages. This runs after all previous GUI/list
+# rewrites so no later visual patch can erase it.
+pro_ui = Path(__file__).with_name('codemagic_list_context_professional_params.py')
+if not pro_ui.is_file():
+    raise SystemExit(f'missing professional LIST/UI patch: {pro_ui}')
+exec(compile(pro_ui.read_text(encoding='utf-8'), str(pro_ui), 'exec'), {
+    '__name__': '__main__',
+    '__file__': str(pro_ui),
+})
+
+print('PASS: bank playback + persistent BLENDS + long-press LIST management + professional parameter pages')

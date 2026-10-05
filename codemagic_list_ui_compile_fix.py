@@ -9,8 +9,9 @@ for p in (view, controller):
     if not p.is_file():
         raise SystemExit(f"missing LIST UI compile source: {p}")
 
-# Apply the final TUNE-page portamento interaction after all previous GUI/touch
-# rewrites, so it cannot be overwritten by the older 0..5000 ms surface.
+# First normalize the dedicated SILVETON DSP portamento to the approved 0..100
+# user scale. This runs after the older GUI/touch patches so 0..5000 ms cannot
+# reappear later in the generated source.
 porta = Path(__file__).with_name("codemagic_portamento_100_fix.py")
 if not porta.is_file():
     raise SystemExit(f"missing 0..100 portamento patch: {porta}")
@@ -19,23 +20,26 @@ exec(compile(porta.read_text(encoding="utf-8"), str(porta), "exec"), {
     "__file__": str(porta),
 })
 
+# Final conservative pass: real smooth controls, exact numeric entry, bounded
+# typography and a read-only re-audit of Direct ALSA/MIDI/root protections.
+polish = Path(__file__).with_name("codemagic_professional_polish_final.py")
+if not polish.is_file():
+    raise SystemExit(f"missing final professional UI/realtime audit patch: {polish}")
+exec(compile(polish.read_text(encoding="utf-8"), str(polish), "exec"), {
+    "__name__": "__main__",
+    "__file__": str(polish),
+})
+
 v = view.read_text(encoding="utf-8")
 required_view = [
     "private data class ListLongHit(",
     "private val listLongHits = ArrayList<ListLongHit>",
-    "private fun listLongHit(",
-    "private fun listLongHitAt(",
-    "private fun onTouchEventBase(",
-    "override fun onTouchEvent(event: MotionEvent): Boolean",
+    "private fun onTouchEventBase(event: MotionEvent): Boolean",
     "ViewConfiguration.getLongPressTimeout()",
     "performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)",
-    "listLongHit(rr)",
     "showListContextMenu(idx, item)",
     "private fun pasteListClipboard(",
     "private fun showEditorPage(",
-    "GradientDrawable().apply",
-    "WindowManager.LayoutParams.FLAG_DIM_BEHIND",
-    "Button(context).apply",
     "sampler.renameLiveListEntry(index, newName)",
     "sampler.deleteLiveListEntry(index)",
     "sampler.moveLiveListEntry(",
@@ -44,24 +48,32 @@ required_view = [
     "private fun portamentoSecondsFromUi(",
     "private val portamentoDragRect = RectF()",
     "showNumber(\"PORTAMENTO\", value.toFloat(), 0f, 100f, 0)",
-    "drawRangeBar(c, bar, 0f, value.toFloat(), 0f, 100f)",
     "portamentoDragActive = true",
+    "private data class SmoothSliderHit(",
+    "private data class SmoothRangeHit(",
+    "handleSmoothControlTouch(event)",
+    "registerSmoothSlider(",
+    "registerSmoothRange(",
+    "private fun drawValueSlider(",
+    "import android.widget.SeekBar",
+    "SeekBar.OnSeekBarChangeListener",
+    "maxWidth:Float=Float.POSITIVE_INFINITY",
+    "Typeface.create(\"sans-serif-medium\"",
 ]
 for token in required_view:
     if token not in v:
-        raise SystemExit(f"professional LIST/portamento UI token missing: {token}")
+        raise SystemExit(f"final professional sampler UI token missing: {token}")
 
-# The final TUNE page must not expose the old millisecond 0..5000 scale.
+# Refuse the old portamento presentation and fake-knob regression.
 t0 = v.find("    private fun drawTune(c: Canvas, r: RectF, s: SamplerAppController.UpperState)")
 t1 = v.find("\n    private fun drawRange(", t0)
 if t0 < 0 or t1 < 0:
     raise SystemExit("cannot bound final drawTune")
 tune = v[t0:t1]
-for stale in ["5000f", "Portamento ms", "s.portamentoSec * 1000f"]:
+for stale in ["5000f", "Portamento ms", "s.portamentoSec * 1000f", "drawKnob("]:
     if stale in tune:
-        raise SystemExit(f"stale 0..5000 portamento UI remains: {stale}")
+        raise SystemExit(f"stale/amateur TUNE control remains: {stale}")
 
-# The new path must not depend on the obsolete GestureDetector contract.
 if "GestureDetector missing" in v:
     raise SystemExit("obsolete GestureDetector LIST dependency returned")
 
@@ -76,4 +88,4 @@ for token in [
     if token not in c:
         raise SystemExit(f"professional LIST controller token missing: {token}")
 
-print("PASS: current-touch LIST long-press + professional parameter UI + precise 0..100 SILVETON portamento verified")
+print("PASS: final professional UI + smooth exact controls + LIST tools + 0..100 portamento + protected ALSA/MIDI audit verified")

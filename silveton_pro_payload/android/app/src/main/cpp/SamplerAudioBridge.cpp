@@ -1867,13 +1867,8 @@ private:
         if (config.periods == 0U) config.periods = requestedPeriods;
         if (config.bufferFrames == 0U) config.bufferFrames = config.periodFrames * config.periods;
 
-        if (config.rate != requestedRate
-            || config.periodFrames != kPreferredMinimumPeriodFrames
-            || config.periods != requestedPeriods
-            || config.bufferFrames != config.periodFrames * config.periods) {
-            errorOut = -EINVAL;
-            return false;
-        }
+        // No strict check: whatever the card really gives is used (the engine is
+        // prepared with the real rate and block size, so the pitch stays correct).
 
         snd_pcm_sw_params sw{};
         sw.tstamp_mode = SNDRV_PCM_TSTAMP_ENABLE;

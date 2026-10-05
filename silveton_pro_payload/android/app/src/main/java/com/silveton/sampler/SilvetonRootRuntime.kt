@@ -70,6 +70,18 @@ internal object SilvetonRootRuntime {
                     exit 42
                 }
 
+            # SILVETON takes the sound card away from Android while it runs.
+            # The running Android audio services are remembered and are started
+            # again when SILVETON leaves.
+            if [ ! -s "${'$'}STATE/audio_services" ]; then
+                getprop | grep -E '^\[init\.svc\..*audio.*\]: \[running\]' \
+                    | sed 's/^\[init\.svc\.\(.*\)\]: .*/\1/' > "${'$'}STATE/audio_services" 2>/dev/null || true
+            fi
+            while read -r svc; do
+                [ -n "${'$'}svc" ] && stop "${'$'}svc" >/dev/null 2>&1 || true
+            done < "${'$'}STATE/audio_services"
+            sleep 0.3
+
             if [ ! -f "${'$'}STATE/active" ]; then
                 save_node /dev/cpuset/background/cpus cpuset_background
                 save_node /dev/cpuset/system-background/cpus cpuset_system_background
@@ -319,6 +331,12 @@ internal object SilvetonRootRuntime {
                 chown 1000:1005 "${'$'}n" 2>/dev/null || true
                 chmod 0660 "${'$'}n" 2>/dev/null || true
             done
+
+            if [ -r "${'$'}STATE/audio_services" ]; then
+                while read -r svc; do
+                    [ -n "${'$'}svc" ] && start "${'$'}svc" >/dev/null 2>&1 || true
+                done < "${'$'}STATE/audio_services"
+            fi
 
             rm -rf "${'$'}STATE"
             exit 0

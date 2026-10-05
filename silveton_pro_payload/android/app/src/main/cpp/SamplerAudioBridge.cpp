@@ -1867,8 +1867,13 @@ private:
         if (config.periods == 0U) config.periods = requestedPeriods;
         if (config.bufferFrames == 0U) config.bufferFrames = config.periodFrames * config.periods;
 
-        // No strict check: whatever the card really gives is used (the engine is
-        // prepared with the real rate and block size, so the pitch stays correct).
+        if (config.rate != requestedRate
+            || config.periodFrames != kPreferredMinimumPeriodFrames
+            || config.periods != requestedPeriods
+            || config.bufferFrames != config.periodFrames * config.periods) {
+            errorOut = -EINVAL;
+            return false;
+        }
 
         snd_pcm_sw_params sw{};
         sw.tstamp_mode = SNDRV_PCM_TSTAMP_ENABLE;
@@ -2323,7 +2328,7 @@ jobjectArray stringVectorArray(JNIEnv* env, const std::vector<std::string>& valu
 }
 }
 
-extern "C" JNIEXPORT void JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeSamplerInit(JNIEnv*,jobject){ /* keep the live sampler (bank, BLENDS, audio) when the Activity is recreated */ if(!gSampler)gSampler=std::make_unique<AndroidSamplerAudio>(); }
+extern "C" JNIEXPORT void JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeSamplerInit(JNIEnv*,jobject){gSampler=std::make_unique<AndroidSamplerAudio>();}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeAudioOpen(JNIEnv*,jobject){return sampler().open()?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeAudioStart(JNIEnv*,jobject){return sampler().start()?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT void JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeAudioStop(JNIEnv*,jobject){sampler().stop();}

@@ -145,8 +145,6 @@ workflows:
           grep -F 'testLegatoHeldKeyGlissando();' "$SAMPLER_TESTS"
           grep -F 'testUpperAdsrAbsolute();' "$SAMPLER_TESTS"
           grep -F 'nativeSetUpperToneParam' "$BRIDGE"
-          grep -F 'if(!gSampler)gSampler' "$BRIDGE"
-          grep -F 'SilvetonRootRuntime.acquire()' "$RUNTIME"
           grep -F 'publishVoiceWindows(*impl_, vi);' "$ENGINE"
           grep -F 'void readStereo(' "$SINC"
           grep -F 'class SampleStreamPrefetcher' "$PREFETCH_H"

@@ -21,11 +21,8 @@ exec(compile(preserve_blends.read_text(encoding='utf-8'), str(preserve_blends), 
     '__file__': str(preserve_blends),
 })
 
-# Restore the proven runtime model:
-#   enter() = one-time root/performance bootstrap while the Activity is alive.
-#   refreshAudioPermissions() = the only operation repeated before PCM
-#   open/resume/recovery. Re-running the whole bootstrap on every resume can
-#   disturb an already working MediaTek audio state.
+# Root/performance bootstrap stays exactly once while the Activity is alive.
+# Only the narrow ALSA permission refresh is repeated before PCM use/recovery.
 k = root_mode.read_text(encoding='utf-8')
 enter0 = k.find('    fun enter(): Result = synchronized(lock) {')
 if enter0 < 0:
@@ -88,17 +85,36 @@ for forbidden in [
     if forbidden in k:
         raise SystemExit(f'unsafe global/physical protection override detected: {forbidden}')
 
-# Proven SM-X130 PCM configuration.
+# SOUND-FIRST final PCM contract. 96 frames at 96 kHz = 1 ms/period;
+# 2 periods = 2 ms ALSA queue capacity. Keep all XRUN/recovery safeguards.
 s = cpp.read_text(encoding='utf-8')
 for token in [
-    'constexpr unsigned kRate = 48000U;',
-    'constexpr unsigned kPeriods = 3U;',
+    'constexpr unsigned kRate = 96000U;',
+    'constexpr unsigned kPeriods = 2U;',
     'kPreferredMinimumPeriodFrames = 96U;',
     'config.bufferFrames - config.periodFrames',
     'sw.xfer_align = 1U;',
+    'SNDRV_PCM_IOCTL_PREPARE',
+    'SNDRV_PCM_IOCTL_WRITEI_FRAMES',
+    'xrunCount_.fetch_add',
 ]:
     if token not in s:
-        raise SystemExit(f'final PCM stability contract missing: {token}')
+        raise SystemExit(f'final PCM sound-first contract missing: {token}')
+for stale in [
+    'constexpr unsigned kRate = 48000U;',
+    'constexpr unsigned kPeriods = 3U;',
+]:
+    if stale in s:
+        raise SystemExit(f'stale high-latency PCM contract remains: {stale}')
+
+# The root runtime must keep audio above MIDI and background work.
+for token in [
+    'taskset -p 3f',
+    'promote SilvAudioRT 80 85',
+    'promote SilvMidiRT 40 75',
+]:
+    if token not in k:
+        raise SystemExit(f'final sound-priority realtime contract missing: {token}')
 
 # Root owns the mixer route. The ordinary APK must not require controlC0 in the
 # openLocked PCM path.
@@ -164,4 +180,4 @@ for token in [
 if 'library_.replace(loaded.data);' in load_block:
     raise SystemExit('final bank loader still destroys BLENDS')
 
-print('PASS: BLENDS preserved + proven audio lifecycle restored; physical protections untouched')
+print('PASS: BLENDS preserved + SOUND-FIRST 96k/96x2 audio lifecycle + Audio85/MIDI75 priority; physical protections untouched')

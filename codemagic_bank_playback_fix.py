@@ -5,15 +5,26 @@ import sys
 root = Path(sys.argv[1]).resolve()
 bridge = root / 'android/app/src/main/cpp/SamplerAudioBridge.cpp'
 test_candidates = [
-    root / 'core/tests/CoreTests.cpp',
+    root / 'core/tests/SamplerTests.cpp',
     root / 'core/tests/SamplerCoreTests.cpp',
+    root / 'core/tests/CoreTests.cpp',
 ]
-tests = next((p for p in test_candidates if p.is_file()), None)
+
+def find_bank_test_source():
+    for p in test_candidates:
+        if not p.is_file():
+            continue
+        text = p.read_text(encoding='utf-8')
+        if 'testSvBankRuntime' in text:
+            return p
+    return None
+
+tests = find_bank_test_source()
 
 if not bridge.is_file():
     raise SystemExit(f'missing sampler bridge: {bridge}')
 if tests is None:
-    raise SystemExit('missing sampler core test source')
+    raise SystemExit('missing test source containing testSvBankRuntime')
 
 # This patch validates the real bank playback graph only. It deliberately does
 # not touch Direct ALSA, root, SELinux, mixer, thermal or speaker protection.
@@ -134,20 +145,40 @@ else:
 
 bridge.write_text(s, encoding='utf-8')
 
-# Regression: locate testSvBankRuntime structurally. The preceding stable-ID
-# patch rewrites metadata assertions, so they must never be used as an anchor.
+# Regression: choose the actual sampler-test source by content and find the end
+# of testSvBankRuntime() by balanced braces. This survives Codemagic renaming or
+# reordering of neighbouring test functions.
 t = tests.read_text(encoding='utf-8')
 if 'End-to-end bank playback contract' not in t:
     fn0 = t.find('void testSvBankRuntime()')
-    fn1 = t.find('void testSampleRecorderRf64()', fn0)
-    if fn0 < 0 or fn1 < 0:
-        raise SystemExit('testSvBankRuntime function boundaries changed')
+    if fn0 < 0:
+        raise SystemExit('testSvBankRuntime function missing')
+    brace0 = t.find('{', fn0)
+    if brace0 < 0:
+        raise SystemExit('testSvBankRuntime opening brace missing')
+    depth = 0
+    fn1 = -1
+    for pos in range(brace0, len(t)):
+        ch = t[pos]
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                fn1 = pos + 1
+                break
+    if fn1 < 0:
+        raise SystemExit('testSvBankRuntime closing brace missing')
+
     block = t[fn0:fn1]
-    insert_at = block.find('    auto corrupted=file;')
+    corrupted_pos = block.find('corrupted')
+    if corrupted_pos >= 0:
+        insert_at = block.rfind('\n', 0, corrupted_pos) + 1
+    else:
+        # Fallback: immediately before the function's closing brace.
+        insert_at = block.rfind('}')
     if insert_at < 0:
-        insert_at = block.find('    auto corrupted = file;')
-    if insert_at < 0:
-        raise SystemExit('testSvBankRuntime corruption-check anchor changed')
+        raise SystemExit('testSvBankRuntime insertion point missing')
 
     probe_test = '''    // End-to-end bank playback contract: successful bank load must create
     // a real voice and non-zero stereo audio from the SAMPLE stream.
@@ -191,4 +222,4 @@ for token in [
     if token not in final_tests:
         raise SystemExit(f'bank playback regression missing: {token}')
 
-print('PASS: real bank SOUND -> MULTISAMPLE -> ZONE -> SAMPLE -> MIDI -> DSP playback contract enforced')
+print(f'PASS: real bank SOUND -> MULTISAMPLE -> ZONE -> SAMPLE -> MIDI -> DSP playback contract enforced ({tests.name})')

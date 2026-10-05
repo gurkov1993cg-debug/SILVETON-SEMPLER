@@ -115,4 +115,15 @@ for token in ['a.bufferSizeFrames == 288', '"48k 96x3"']:
     if token not in final_view:
         raise SystemExit(f'XRUN UI contract missing: {token}')
 
-print('PASS: SM-X130 XRUN stability + dedicated CPU7 audio / CPU6 MIDI isolation applied')
+# Final UI pass: practical drag sliders + immediate touch response + cached JNI
+# telemetry/list data. This runs after every visual/status patch so no later script
+# can put the old rotary/tap-only controls back.
+ui_perf = Path(__file__).with_name('codemagic_ui_interaction_performance_fix.py')
+if not ui_perf.is_file():
+    raise SystemExit(f'missing UI interaction/performance patch: {ui_perf}')
+exec(compile(ui_perf.read_text(encoding='utf-8'), str(ui_perf), 'exec'), {
+    '__name__': '__main__',
+    '__file__': str(ui_perf),
+})
+
+print('PASS: SM-X130 XRUN stability + dedicated CPU7 audio / CPU6 MIDI isolation + practical slider UI applied')

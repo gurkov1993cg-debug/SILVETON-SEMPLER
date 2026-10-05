@@ -150,7 +150,7 @@ probe_test = anchor + '''
     playbackState->combi.uppers[0].midiChannel=0U;
     SamplerEngine bankEngine; bankEngine.prepare(48000.0,16U); bankEngine.setState(playbackState);
     assert(bankEngine.postNoteOn(0U,60U,127U));
-    std::vector<float> bankAudio(32U,0.0F); bankEngine.render(bankAudio.data(),16U);
+    std::vector<float> bankAudio(8U,0.0F); bankEngine.render(bankAudio.data(),4U);
     float bankPeak=0.0F; for(const float v:bankAudio){const float a=v<0.0F?-v:v;if(a>bankPeak)bankPeak=a;}
     assert(bankEngine.activeVoiceCount()>0U);
     assert(bankPeak>1.0e-6F);

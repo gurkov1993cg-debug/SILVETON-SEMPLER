@@ -126,4 +126,15 @@ exec(compile(ui_perf.read_text(encoding='utf-8'), str(ui_perf), 'exec'), {
     '__file__': str(ui_perf),
 })
 
-print('PASS: SM-X130 XRUN stability + dedicated CPU7 audio / CPU6 MIDI isolation + practical slider UI applied')
+# Final data-model pass: 500 fixed SOUND/COMBI positions plus stable uint32
+# SAMPLE/MULTISAMPLE IDs in SILVETON_BANK.sv v2. Run last so no earlier patch can
+# restore positional resource indexes.
+slot_ids = Path(__file__).with_name('codemagic_fixed_slot_ids.py')
+if not slot_ids.is_file():
+    raise SystemExit(f'missing fixed slot/resource-ID patch: {slot_ids}')
+exec(compile(slot_ids.read_text(encoding='utf-8'), str(slot_ids), 'exec'), {
+    '__name__': '__main__',
+    '__file__': str(slot_ids),
+})
+
+print('PASS: SM-X130 XRUN stability + CPU isolation + slider UI + fixed slot/resource-ID model applied')

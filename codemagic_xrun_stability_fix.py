@@ -4,8 +4,9 @@ import sys
 root = Path(sys.argv[1])
 cpp = root / 'android/app/src/main/cpp/SamplerAudioBridge.cpp'
 view = root / 'android/app/src/main/java/com/silveton/sampler/SilvetonSamplerView.kt'
+root_mode = root / 'android/app/src/main/java/com/silveton/sampler/SilvetonRootRuntime.kt'
 
-for p in (cpp, view):
+for p in (cpp, view, root_mode):
     if not p.is_file():
         raise SystemExit(f'missing required source: {p}')
 
@@ -45,6 +46,53 @@ v = v.replace('a.bufferSizeFrames == 192', 'a.bufferSizeFrames == 288')
 v = v.replace('"48k 96x2"', '"48k 96x3"')
 view.write_text(v, encoding='utf-8')
 
+# Dedicated realtime topology on the rooted SM-X130:
+# CPU7 = audio RT thread + MediaTek AFE audio IRQ only.
+# CPU6 = raw MIDI RT thread only.
+# CPU0-5 = UI, disk/bank work and all other SILVETON/Android work.
+# The native code keeps its safe fallback affinity; this root-side promotion is
+# authoritative on the dedicated tablet and avoids changing the JNI/source ABI.
+k = root_mode.read_text(encoding='utf-8')
+old_promote = '''            promote SilvAudioRT 80 80
+            promote SilvMidiRT 3f 70
+            exit 0
+'''
+new_promote = '''            for t in /proc/${pid}/task/[0-9]*; do
+                [ -r "${'$'}t/comm" ] || continue
+                NAME="${'$'}(cat "${'$'}t/comm" 2>/dev/null)"
+                case "${'$'}NAME" in
+                    SilvAudioRT|SilvMidiRT) continue ;;
+                esac
+                TID="${'$'}{t##*/}"
+                command -v taskset >/dev/null 2>&1 && taskset -p 3f "${'$'}TID" >/dev/null 2>&1 || true
+            done
+            promote SilvAudioRT 80 85
+            promote SilvMidiRT 40 75
+            exit 0
+'''
+if old_promote in k:
+    k = k.replace(old_promote, new_promote, 1)
+elif 'promote SilvAudioRT 80 85' in k and 'promote SilvMidiRT 40 75' in k:
+    pass
+else:
+    raise SystemExit('root realtime promotion block changed')
+
+root_required = [
+    'write_node /dev/cpuset/background/cpus 0-5',
+    'write_node /dev/cpuset/system-background/cpus 0-5',
+    'write_node /dev/cpuset/restricted/cpus 0-5',
+    'write_node /sys/devices/system/cpu/cpufreq/policy6/scaling_governor performance',
+    'write_node /sys/devices/system/cpu/cpufreq/policy7/scaling_governor performance',
+    'echo 80 > "/proc/irq/${\'$\'}AFE/smp_affinity"',
+    'taskset -p 3f',
+    'promote SilvAudioRT 80 85',
+    'promote SilvMidiRT 40 75',
+]
+for token in root_required:
+    if token not in k:
+        raise SystemExit(f'realtime core isolation contract missing: {token}')
+root_mode.write_text(k, encoding='utf-8')
+
 final_cpp = cpp.read_text(encoding='utf-8')
 for token in [
     'constexpr unsigned kRate = 48000U;',
@@ -67,4 +115,4 @@ for token in ['a.bufferSizeFrames == 288', '"48k 96x3"']:
     if token not in final_view:
         raise SystemExit(f'XRUN UI contract missing: {token}')
 
-print('PASS: SM-X130 XRUN stability fix applied (48 kHz / 96x3, 288-frame queue, 2-period start prime)')
+print('PASS: SM-X130 XRUN stability + dedicated CPU7 audio / CPU6 MIDI isolation applied')

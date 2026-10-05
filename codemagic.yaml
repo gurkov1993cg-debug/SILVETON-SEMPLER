@@ -207,9 +207,19 @@ workflows:
 
       - name: Build rooted release APK
         script: |
-          set -euo pipefail
+          set -uo pipefail
           cd "$PROJECT_DIR/android"
-          CI=true "$GRADLE_BIN" --no-daemon --stacktrace clean assembleRelease
+          LOG="$CM_BUILD_DIR/gradle-build.log"
+          set +e
+          CI=true "$GRADLE_BIN" --no-daemon --console=plain clean assembleRelease 2>&1 | tee "$LOG"
+          STATUS=${PIPESTATUS[0]}
+          set -e
+          if [ "$STATUS" -ne 0 ]; then
+            echo "===== EXACT COMPILER ERRORS ====="
+            grep -E '(^e: |^w: | error: |: error:|Compilation error|Unresolved reference|Type mismatch|No value passed|Too many arguments|Cannot infer|Overload resolution ambiguity)' "$LOG" | tail -n 160 || true
+            echo "===== END COMPILER ERRORS ====="
+            exit "$STATUS"
+          fi
 
       - name: Verify and publish one APK
         script: |

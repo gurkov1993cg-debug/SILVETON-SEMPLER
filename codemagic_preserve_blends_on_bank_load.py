@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 from pathlib import Path
 import sys
 
@@ -100,4 +99,15 @@ exec(compile(persist.read_text(encoding='utf-8'), str(persist), 'exec'), {
     '__file__': str(persist),
 })
 
-print('PASS: bank load preserves BLENDS/COMBI + LIST and persistent user state is wired')
+# A bank is not accepted merely because names/catalog entries are visible.
+# Prove the complete mmap-backed SOUND -> SAMPLE -> MIDI -> DSP path before the
+# final audio/root guard runs. This patch never modifies audio/root protections.
+playback = Path(__file__).with_name('codemagic_bank_playback_fix.py')
+if not playback.is_file():
+    raise SystemExit(f'missing bank playback patch: {playback}')
+exec(compile(playback.read_text(encoding='utf-8'), str(playback), 'exec'), {
+    '__name__': '__main__',
+    '__file__': str(playback),
+})
+
+print('PASS: bank load preserves BLENDS/COMBI + LIST, persists user state, and proves real bank playback')

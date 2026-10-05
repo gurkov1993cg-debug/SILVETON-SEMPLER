@@ -38,6 +38,8 @@ workflows:
           test -f "$CM_BUILD_DIR/codemagic_live_note_latency_fix.py"
           test -f "$CM_BUILD_DIR/codemagic_ultra_low_latency_output_fix.py"
           test -f "$CM_BUILD_DIR/codemagic_crackle_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_pro_sound_fix.py"
+          test -d "$CM_BUILD_DIR/silveton_pro_payload"
 
           rm -rf "$CM_BUILD_DIR/_silveton_src"
           mkdir -p "$CM_BUILD_DIR/_silveton_src"
@@ -64,8 +66,10 @@ workflows:
           python3 "$CM_BUILD_DIR/codemagic_48khz_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_live_performance_indicators.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_xrun_stability_fix.py" "$PROJECT_DIR"
-          # Must stay LAST: works on the fully generated tree.
+          # Crackle fix works on the fully generated tree; PRO SOUND follows it and must stay LAST.
           python3 "$CM_BUILD_DIR/codemagic_crackle_fix.py" "$PROJECT_DIR"
+          # PRO SOUND (MONO/LEGATO, ADSR, CUTOFF, quick re-enter) works on the crackle-fixed tree.
+          python3 "$CM_BUILD_DIR/codemagic_pro_sound_fix.py" "$PROJECT_DIR"
 
           BRIDGE="$PROJECT_DIR/android/app/src/main/cpp/SamplerAudioBridge.cpp"
           RUNTIME="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SamplerRuntime.kt"
@@ -133,7 +137,16 @@ workflows:
           grep -F 'private val statusChanged: (String?) -> Unit = {},' "$CONTROLLER"
           grep -F 'SILVETON_CRACKLE_FIX_V1' "$ENGINE"
           grep -F 'softKill(impl, tail);' "$ENGINE"
-          grep -F 'softKill(impl, existing);' "$ENGINE"
+          grep -F 'softKill(impl, existing, ' "$ENGINE"
+          grep -F 'SILVETON_PRO_SOUND_V1' "$ENGINE"
+          grep -F 'struct AmpEnv' "$ENGINE"
+          grep -F 'void playUpperNote(' "$ENGINE"
+          grep -F 'void handleNoteOff(' "$ENGINE"
+          grep -F 'testLegatoHeldKeyGlissando();' "$SAMPLER_TESTS"
+          grep -F 'testUpperAdsrAbsolute();' "$SAMPLER_TESTS"
+          grep -F 'nativeSetUpperToneParam' "$BRIDGE"
+          grep -F 'if(!gSampler)gSampler' "$BRIDGE"
+          grep -F 'SilvetonRootRuntime.acquire()' "$RUNTIME"
           grep -F 'publishVoiceWindows(*impl_, vi);' "$ENGINE"
           grep -F 'void readStereo(' "$SINC"
           grep -F 'class SampleStreamPrefetcher' "$PREFETCH_H"

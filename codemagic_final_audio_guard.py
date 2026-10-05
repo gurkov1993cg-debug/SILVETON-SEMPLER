@@ -11,6 +11,16 @@ for p in (root_mode, runtime, cpp):
     if not p.is_file():
         raise SystemExit(f'missing final audio source: {p}')
 
+# Bank-v2 has already been applied by the XRUN patch chain. Preserve tablet
+# BLENDS/COMBI and LIST objects before the final runtime/audio validation.
+preserve_blends = Path(__file__).with_name('codemagic_preserve_blends_on_bank_load.py')
+if not preserve_blends.is_file():
+    raise SystemExit(f'missing BLENDS preservation patch: {preserve_blends}')
+exec(compile(preserve_blends.read_text(encoding='utf-8'), str(preserve_blends), 'exec'), {
+    '__name__': '__main__',
+    '__file__': str(preserve_blends),
+})
+
 # Restore the proven runtime model:
 #   enter() = one-time root/performance bootstrap while the Activity is alive.
 #   refreshAudioPermissions() = the only operation repeated before PCM
@@ -25,14 +35,12 @@ if uid0 < 0:
     raise SystemExit('enter() uid anchor missing')
 enter_prefix = k[enter0:uid0]
 
-# Remove comments inserted by the two experimental reassert patches.
 for stale in [
     '        // Reassert live sampler grants/tuning even when already active.\n\n',
     '        // active state does not replace live ALSA permission refresh.\n\n',
 ]:
     enter_prefix = enter_prefix.replace(stale, '')
 
-# Normalize to exactly one active short-circuit.
 enter_prefix = enter_prefix.replace('        if (active) return@synchronized Result(true)\n\n', '')
 enter_prefix += '        if (active) return@synchronized Result(true)\n\n'
 k = k[:enter0] + enter_prefix + k[uid0:]
@@ -139,4 +147,21 @@ uid0 = final_root.find('        val uid = Process.myUid()', enter0)
 if final_root[enter0:uid0].count('if (active) return@synchronized Result(true)') != 1:
     raise SystemExit('root bootstrap is not exactly-once while active')
 
-print('PASS: proven audio lifecycle restored — one-time root bootstrap + dedicated ALSA refresh; physical protections untouched')
+final_cpp = cpp.read_text(encoding='utf-8')
+load0 = final_cpp.find('    bool loadSvBank(const std::string& path) {')
+load1 = final_cpp.find('\n    bool loadSet(', load0)
+if load0 < 0 or load1 < 0:
+    raise SystemExit('final loadSvBank boundaries missing')
+load_block = final_cpp[load0:load1]
+for token in [
+    'const auto preserved = library_.snapshot();',
+    'merged.combis = preserved.combis;',
+    'merged.lists = preserved.lists;',
+    'library_.writeCombi(saved.address, rebound)',
+]:
+    if token not in load_block:
+        raise SystemExit(f'final BLENDS preservation contract missing: {token}')
+if 'library_.replace(loaded.data);' in load_block:
+    raise SystemExit('final bank loader still destroys BLENDS')
+
+print('PASS: BLENDS preserved + proven audio lifecycle restored; physical protections untouched')

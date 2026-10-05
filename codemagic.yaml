@@ -34,6 +34,7 @@ workflows:
           test -f "$CM_BUILD_DIR/codemagic_48khz_fix.py"
           test -f "$CM_BUILD_DIR/codemagic_live_performance_indicators.py"
           test -f "$CM_BUILD_DIR/codemagic_xrun_stability_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_remove_test_piano.py"
 
           rm -rf "$CM_BUILD_DIR/_silveton_src"
           mkdir -p "$CM_BUILD_DIR/_silveton_src"
@@ -70,7 +71,9 @@ workflows:
           SINC="$PROJECT_DIR/core/include/silveton/sampler/SincInterpolator.h"
           VIEW="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SilvetonSamplerView.kt"
           CONTROLLER="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SamplerAppController.kt"
+          SAMPLER_TESTS="$PROJECT_DIR/core/tests/SamplerTests.cpp"
 
+          test -f "$SAMPLER_TESTS"
           grep -F 'constexpr unsigned kRate = 48000U;' "$BRIDGE"
           grep -F 'constexpr unsigned kPeriods = 3U;' "$BRIDGE"
           grep -F 'kPreferredMinimumPeriodFrames = 96U;' "$BRIDGE"
@@ -79,7 +82,7 @@ workflows:
           grep -F 'configureRealtimeThread("SilvMidiRT", 0, 5, 70);' "$BRIDGE"
           grep -F 'class BuiltinTestInstrument' "$BRIDGE"
           grep -F 'testInstrument_.render(renderBuffer_.data(), frames, sampleRate());' "$BRIDGE"
-          grep -F 'testInstrument_.setEnabled(!hasPlayableProgram);' "$BRIDGE"
+          grep -F 'testInstrument_.setEnabled(false);' "$BRIDGE"
           grep -F 'testInstrument_.noteOn(data1, data2);' "$BRIDGE"
           grep -F 'const bool midiOk = startDirectMidiLocked();' "$BRIDGE"
           grep -F 'kControlDevice = "/dev/snd/controlC0"' "$BRIDGE"
@@ -110,8 +113,6 @@ workflows:
           grep -F 'RadialGradient(' "$VIEW"
           grep -F 'Color.rgb(252,253,255)' "$VIEW"
           grep -F 'DESIGN_W = 1340f' "$VIEW"
-          grep -F 'STAGE PIANO' "$VIEW"
-          grep -F 'BUILT-IN  •  RAW MIDI' "$VIEW"
           grep -F 'val keyFlash = midiRx' "$VIEW"
           grep -F 'val audioSignal = a.activeVoices > 0' "$VIEW"
           grep -F '"48k 96x3"' "$VIEW"
@@ -141,6 +142,14 @@ workflows:
           fi
           if grep -Fq 'Handler(Looper.getMainLooper())' "$RUNTIME"; then
             echo "ERROR: audio recovery returned to UI looper" >&2
+            exit 1
+          fi
+          if grep -Fq 'testInstrument_.setEnabled(true);' "$BRIDGE" || grep -Fq 'testInstrument_.setEnabled(!hasPlayableProgram);' "$BRIDGE"; then
+            echo "ERROR: obsolete TEST EP enable path remains" >&2
+            exit 1
+          fi
+          if grep -Fq 'STAGE PIANO' "$VIEW" || grep -Fq 'BUILT-IN  •  RAW MIDI' "$VIEW" || grep -Fq 'text(c,"PIANO"' "$VIEW" || grep -Fq 'text(c, "TEST EP"' "$VIEW"; then
+            echo "ERROR: obsolete TEST EP / Stage Piano UI remains" >&2
             exit 1
           fi
 

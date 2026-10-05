@@ -565,6 +565,8 @@ void SampleStreamPrefetcher::runOnce() noexcept {
                     advice_.store(1, std::memory_order_relaxed); // kernel < 5.14: never supported
                 }
             }
+#else
+            (void)populateWorked_; // MADV_POPULATE_READ exists only on Linux/Android
 #endif
             if (rc != 0) {
                 // Asynchronous read-ahead into the page cache (older kernels / macOS tests).

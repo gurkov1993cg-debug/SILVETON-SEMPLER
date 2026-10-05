@@ -37,7 +37,7 @@ old_method_bounds = '''def method_bounds(text: str, signature: str):
     if close < 0:
         raise SystemExit(f"unbalanced method: {signature}")
     end = close + 1
-    if end < len(text) and text[end] == '\\n':
+    if end < len(text) and text[end] == '\n':
         end += 1
     return start, end
 '''
@@ -48,7 +48,7 @@ new_method_bounds = '''def method_bounds(text: str, signature: str):
         for marker in (f"private fun {fn}(", f"fun {fn}("):
             candidate = text.find(marker)
             if candidate >= 0:
-                line_start = text.rfind("\\n", 0, candidate) + 1
+                line_start = text.rfind("\n", 0, candidate) + 1
                 start = line_start
                 break
     if start < 0:
@@ -60,7 +60,7 @@ new_method_bounds = '''def method_bounds(text: str, signature: str):
     if close < 0:
         raise SystemExit(f"unbalanced method: {signature}")
     end = close + 1
-    if end < len(text) and text[end] == '\\n':
+    if end < len(text) and text[end] == '\n':
         end += 1
     return start, end
 '''
@@ -78,6 +78,14 @@ if not upper.is_file():
     raise SystemExit(f"missing final UPPER-row polish patch: {upper}")
 exec(compile(upper.read_text(encoding="utf-8"), str(upper), "exec"), {
     "__name__": "__main__", "__file__": str(upper),
+})
+
+# Normalize Kotlin/API edge cases after all professional UI code has been generated.
+kotlin_fix = Path(__file__).with_name("codemagic_professional_kotlin_compile_fix.py")
+if not kotlin_fix.is_file():
+    raise SystemExit(f"missing professional Kotlin compatibility fix: {kotlin_fix}")
+exec(compile(kotlin_fix.read_text(encoding="utf-8"), str(kotlin_fix), "exec"), {
+    "__name__": "__main__", "__file__": str(kotlin_fix),
 })
 
 v = view.read_text(encoding="utf-8")
@@ -118,6 +126,14 @@ for token in required_view:
     if token not in v:
         raise SystemExit(f"final professional sampler UI token missing: {token}")
 
+for forbidden in [
+    "MotionEvent.INVALID_POINTER_ID",
+    "maxWidth.isFinite()",
+    "paint.breakText(shown,true,room,null)",
+]:
+    if forbidden in v:
+        raise SystemExit(f"final Kotlin compatibility hazard remains: {forbidden}")
+
 # Refuse the old portamento presentation and fake-knob regression.
 t0 = v.find("    private fun drawTune(c: Canvas, r: RectF, s: SamplerAppController.UpperState)")
 t1 = v.find("\n    private fun drawRange(", t0)
@@ -142,4 +158,4 @@ for token in [
     if token not in c:
         raise SystemExit(f"professional LIST controller token missing: {token}")
 
-print("PASS: final professional UI + all live sliders precise + LIST tools + 0..100 portamento + protected ALSA/MIDI audit verified")
+print("PASS: final professional UI + all live sliders precise + Kotlin compatibility + LIST tools + 0..100 portamento + protected ALSA/MIDI audit verified")

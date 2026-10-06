@@ -291,7 +291,7 @@ class SamplerAppController(
     }
 
     fun renameLiveListEntry(index: Int, name: String): Boolean {
-        val item = listItems(0, 0, 0).getOrNull(index) ?: return fail("LIST entry is not available")
+        val item = listItems(0, 0, 0).getOrNull(index)?.takeUnless { isEmptyListItem(it) } ?: return fail("LIST entry is not available")
         val finalName = name.trim()
         if (finalName.isEmpty()) return fail("LIST name cannot be empty")
         if (!nativeResult(engine.nativeSetListEntry(
@@ -301,11 +301,69 @@ class SamplerAppController(
         return persistLiveListEdits()
     }
 
+    // SILVETON_LIST_POSITIONS_V1: fixed LIST positions 1..200 like Korg Performances.
+    // An empty position is an entry with COMBI address 0/0/0; empty positions at the
+    // end are removed, so the stored LIST only grows as far as the last BLEND.
+    fun isEmptyListItem(item: ListItem?): Boolean =
+        item == null || (item.combiBank == 0 && item.combiPage == 0 && item.combiSlot == 0)
+
+    private fun ensureListLength(count: Int): Boolean {
+        var items = listItems(0, 0, 0)
+        if (items.size >= count) return true
+        if (items.isEmpty()) {
+            if (!nativeResult(engine.nativeWriteList(0, 0, 0, "LIVE", intArrayOf(1), arrayOf("-"), intArrayOf(0, 0, 0)))) return false
+            items = listItems(0, 0, 0)
+        }
+        for (i in items.size until count) {
+            if (!nativeResult(engine.nativeInsertListEntry(0, 0, 0, i, i + 1, "-", 0, 0, 0))) return false
+        }
+        return true
+    }
+
+    private fun trimListTail(): Boolean {
+        var items = listItems(0, 0, 0)
+        while (items.isNotEmpty() && isEmptyListItem(items.last())) {
+            if (!nativeResult(engine.nativeRemoveListEntry(0, 0, 0, items.size - 1))) return false
+            items = listItems(0, 0, 0)
+        }
+        return true
+    }
+
+    /** DELETE: the position becomes empty; no other BLEND moves. */
     fun deleteLiveListEntry(index: Int): Boolean {
         val items = listItems(0, 0, 0)
-        if (index !in items.indices) return fail("LIST entry is not available")
-        if (!nativeResult(engine.nativeRemoveListEntry(0, 0, 0, index))) return false
-        if (!renumberLiveList()) return false
+        if (index !in items.indices || isEmptyListItem(items[index])) return fail("LIST position is empty")
+        if (!nativeResult(engine.nativeSetListEntry(0, 0, 0, index, index + 1, "-", 0, 0, 0))) return false
+        if (engine.nativeActiveListEntry(0, 0, 0) == index) engine.nativeSetActiveListEntry(0, 0, 0, -1)
+        if (!trimListTail()) return false
+        return persistLiveListEdits()
+    }
+
+    /** COPY to any LIST position 1..200 (an occupied one is overwritten). */
+    fun copyListEntryTo(from: Int, to: Int): Boolean {
+        val src = listItems(0, 0, 0).getOrNull(from)
+        if (isEmptyListItem(src) || src == null) return fail("LIST position is empty")
+        if (to !in 0 until 200 || to == from) return fail("LIST target position is invalid")
+        if (!ensureListLength(to + 1)) return false
+        if (!nativeResult(engine.nativeSetListEntry(0, 0, 0, to, to + 1, src.name, src.combiBank, src.combiPage, src.combiSlot))) return false
+        if (engine.nativeActiveListEntry(0, 0, 0) == to) engine.nativeSetActiveListEntry(0, 0, 0, -1)
+        return persistLiveListEdits()
+    }
+
+    /** MOVE to any LIST position 1..200: the old position becomes empty. */
+    fun moveListEntryTo(from: Int, to: Int): Boolean {
+        val src = listItems(0, 0, 0).getOrNull(from)
+        if (isEmptyListItem(src) || src == null) return fail("LIST position is empty")
+        if (to !in 0 until 200 || to == from) return fail("LIST target position is invalid")
+        val active = engine.nativeActiveListEntry(0, 0, 0)
+        if (!ensureListLength(to + 1)) return false
+        if (!nativeResult(engine.nativeSetListEntry(0, 0, 0, to, to + 1, src.name, src.combiBank, src.combiPage, src.combiSlot))) return false
+        if (!nativeResult(engine.nativeSetListEntry(0, 0, 0, from, from + 1, "-", 0, 0, 0))) return false
+        when (active) {
+            from -> engine.nativeSetActiveListEntry(0, 0, 0, to)
+            to -> engine.nativeSetActiveListEntry(0, 0, 0, -1)
+        }
+        if (!trimListTail()) return false
         return persistLiveListEdits()
     }
 
@@ -356,12 +414,12 @@ class SamplerAppController(
      * entry and no other BLEND is changed. Returns the written index or -1.
      */
     fun writeCombiToList(position: Int, name: String): Int {
+        if (position !in 0 until 200) { fail("LIST position is invalid"); return -1 }
+        val target = position
+        if (!ensureListLength(target + 1)) { trimListTail(); return -1 }
         val items = listItems(0, 0, 0)
-        if (position < 0) { fail("LIST position is invalid"); return -1 }
-        val target = minOf(position, items.size)
-        if (target >= 200) { fail("LIST is full (200)"); return -1 }
         val finalName = name.trim().ifBlank { combiName() }
-        val old = items.getOrNull(target)
+        val old = items.getOrNull(target)?.takeUnless { isEmptyListItem(it) }
         fun usedElsewhere(slot: Int): Boolean = items.indices.any { k ->
             k != target && items[k].combiBank == 0 && items[k].combiPage == 0 && items[k].combiSlot == slot
         }
@@ -371,15 +429,9 @@ class SamplerAppController(
         } else {
             (1..500).firstOrNull { !engine.nativeCombiSlotOccupied(0, 0, it) } ?: -1
         }
-        if (slot !in 1..500) { fail("No free COMBI position (1..500)"); return -1 }
-        if (!nativeResult(engine.nativeWriteCombi(0, 0, slot, finalName))) return -1
-        val listed = when {
-            old != null -> engine.nativeSetListEntry(0, 0, 0, target, old.number, finalName, 0, 0, slot)
-            items.isEmpty() -> engine.nativeWriteList(0, 0, 0, "LIVE", intArrayOf(1), arrayOf(finalName), intArrayOf(0, 0, slot))
-            else -> engine.nativeInsertListEntry(0, 0, 0, target,
-                (items.maxOfOrNull { it.number } ?: 0) + 1, finalName, 0, 0, slot)
-        }
-        if (!nativeResult(listed)) return -1
+        if (slot !in 1..500) { fail("No free COMBI position (1..500)"); trimListTail(); return -1 }
+        if (!nativeResult(engine.nativeWriteCombi(0, 0, slot, finalName))) { trimListTail(); return -1 }
+        if (!nativeResult(engine.nativeSetListEntry(0, 0, 0, target, target + 1, finalName, 0, 0, slot))) { trimListTail(); return -1 }
         if (!nativeResult(engine.nativeActivateListEntry(0, 0, 0, target))) return -1
         if (!persistLiveListEdits()) return -1
         return target
@@ -562,9 +614,11 @@ class SamplerAppController(
         return CombiFxState(fx(0), fx(7), v[14].toInt())
     }
 
-    fun updateCombiFx(slot: Int, fx: FxState): Boolean = nativeResult(
-        engine.nativeUpdateCombiFx(slot, fx.type, fx.wet, fx.timeMs, fx.feedback, fx.rateHz, fx.depth, fx.tone)
-    )
+    /** FX slot 1 = FX1, 2 = FX2 (SILVETON_FX_V2: the native engine counts them 0 and 1). */
+    fun updateCombiFx(slot: Int, fx: FxState): Boolean {
+        if (slot !in 1..2) return fail("Invalid COMBI FX slot")
+        return nativeResult(engine.nativeUpdateCombiFx(slot - 1, fx.type, fx.wet, fx.timeMs, fx.feedback, fx.rateHz, fx.depth, fx.tone))
+    }
 
     fun updateCombiFxRouting(routing: Int): Boolean = nativeResult(engine.nativeUpdateCombiFxRouting(routing))
 

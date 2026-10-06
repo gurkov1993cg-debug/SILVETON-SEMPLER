@@ -116,7 +116,8 @@ std::shared_ptr<EngineState> makeState(const SamplePtr& sample) {
     st->combi.name="Test Combi";
     st->combi.uppers[0].name="U1"; st->combi.uppers[0].program=prog; st->combi.uppers[0].enabled=true;
     st->combi.uppers[0].midiChannel=0U; st->combi.uppers[0].breathEnabled=false;
-    st->global.limiterEnabled=true; st->global.limiterCeilingDb=-0.3F;
+    // Timing tests run without the 0.5 ms look-ahead limiter; it has its own test.
+    st->global.limiterEnabled=false; st->global.limiterCeilingDb=-0.3F;
     return st;
 }
 
@@ -1230,6 +1231,8 @@ void testSvBankRuntime() {
     std::vector<float> bankAudio(8U,0.0F); bankEngine.render(bankAudio.data(),4U);
     float bankPeak=0.0F; for(const float v:bankAudio){const float a=v<0.0F?-v:v;if(a>bankPeak)bankPeak=a;}
     assert(bankEngine.activeVoiceCount()>0U);
+    for(int b=0;b<16;++b) { bankEngine.render(bankAudio.data(),4U); // limiter look-ahead is 47 samples
+        for(const float v:bankAudio){const float a=v<0.0F?-v:v;if(a>bankPeak)bankPeak=a;} }
     assert(bankPeak>1.0e-6F);
 
     auto corrupted=file; corrupted.back()^=0x01U;
@@ -1275,6 +1278,24 @@ void testSincAntiAliasFinite() {
 }
 
 // ---- crackle fix regression tests -------------------------------------------
+
+// SILVETON_SMOOTH_LIMITER_V1: a loud chord never passes the ceiling and is not
+// clipped: the gain moves smoothly (no sample-to-sample gain jumps).
+void testSmoothLimiter() {
+    auto s=std::make_shared<SampleData>(); s->sampleRate=96000U; s->channels=1U; s->rootKey=60U;
+    s->interleaved.resize(96000U);
+    for(std::size_t i=0;i<s->interleaved.size();++i) s->interleaved[i]=static_cast<float>(0.9*std::sin(2.0*3.14159265358979323846*220.0*static_cast<double>(i)/96000.0));
+    s->totalFrames=96000U; s->loop.enabled=true; s->loop.startFrame=0U; s->loop.endFrame=96000U;
+    auto st=makeState(s); st->global.limiterEnabled=true; st->global.limiterCeilingDb=-0.3F; st->global.masterGainDb=12.0F;
+    auto prog=std::const_pointer_cast<Program>(st->combi.uppers[0].program); prog->layers[0].filter.mode=FilterMode::Bypass;
+    SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
+    for(const unsigned k: {48U,52U,55U,60U}) assert(e.postNoteOn(0U,static_cast<std::uint8_t>(k),127U));
+    std::vector<float> out(96U*2U); const float ceiling=std::pow(10.0F,-0.3F/20.0F); float peak=0.0F;
+    for(int b=0;b<300;++b) { e.render(out.data(),96U); for(float v:out) peak=std::max(peak,std::abs(v)); }
+    assert(peak<=ceiling*1.0001F);
+    assert(peak>ceiling*0.9F);          // loud, not squashed into silence
+    assert(e.meters().limiterGainReductionDb>0.0F);
+}
 
 // A looped sample must play its attack (the frames before the loop start).
 // Before the fix the interpolator returned the loop-start frame for all of them:
@@ -1605,17 +1626,17 @@ void testPortamentoSameTimeEveryInterval() {
     }
 }
 
-// Like the SILVETON keyboard processor: while portamento is ON a POLY Upper
-// becomes MONO (one line, last key wins) and every note glides from the last
-// note - also after the key was released. OFF = POLY again, no glide.
+// SILVETON_PORTA_PAGE_V1 - like the SILVETON portamento page: while portamento
+// is ON a POLY Upper plays one line, a held key glides to the next key and back
+// in TIME; with no key held the next note is struck normally without a glide.
 void testPortamentoPolyFromLastNote() {
     auto st=makeToneState(UpperVoiceMode::Poly);
     st->combi.uppers[0].portamentoSec=0.08F;
     SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
     e.postNoteOn(0U,69U,100U); renderLeft(e,40);               // 69 held
-    e.postNoteOn(0U,81U,100U);                                  // 69 is taken over, 81 glides from it
+    e.postNoteOn(0U,81U,100U);                                  // glides from 69
     auto x=renderLeft(e,150);
-    assert(e.activeVoiceCount()==1U);                           // automatic MONO: one line
+    assert(e.activeVoiceCount()==1U);                           // one line
     assert(std::abs(glideHzAt(x,40.0)-622.25)<622.25*0.03);    // half way 440 -> 880
     assert(std::abs(glideHzAt(x,110.0)-880.0)<880.0*0.006);
     e.postNoteOff(0U,81U,0U);                                   // back to the still held 69 - glides
@@ -1624,20 +1645,19 @@ void testPortamentoPolyFromLastNote() {
     assert(std::abs(glideHzAt(back,110.0)-440.0)<440.0*0.006);
     e.postNoteOff(0U,69U,0U); renderLeft(e,200);
     assert(e.activeVoiceCount()==0U);
-    e.postNoteOn(0U,81U,100U);                                  // detached: still glides from 69
-    auto d=renderLeft(e,150);
-    assert(std::abs(glideHzAt(d,40.0)-622.25)<622.25*0.03);
-    assert(std::abs(glideHzAt(d,110.0)-880.0)<880.0*0.006);
+    e.postNoteOn(0U,81U,100U);                                  // nothing held: no glide
+    auto d=renderLeft(e,60);
+    assert(std::abs(glideHzAt(d,10.0)-880.0)<880.0*0.006);
+    e.postNoteOff(0U,81U,0U); renderLeft(e,200);
     // Portamento OFF: POLY chords again, no glide
     auto off=std::make_shared<EngineState>(*st);
     off->combi.uppers[0].portamentoSec=0.0F;
     e.setState(off);
     e.postNoteOn(0U,69U,100U); e.postNoteOn(0U,76U,100U);
-    auto y=renderLeft(e,40);
+    renderLeft(e,40);
     assert(e.activeVoiceCount()>=2U);
-    (void)y;
     e.postPanic(); renderLeft(e,10);
-    // Panic forgets the last note: the next one does not glide
+    // PANIC forgets the held line: the next note does not glide
     e.setState(st);
     e.postNoteOn(0U,81U,100U); renderLeft(e,20); e.postPanic(); renderLeft(e,10);
     e.postNoteOn(0U,69U,100U);
@@ -1645,7 +1665,7 @@ void testPortamentoPolyFromLastNote() {
     assert(std::abs(glideHzAt(z,10.0)-440.0)<440.0*0.006);
 }
 
-// MONO / LEGATO: detached and legato notes both glide from the last note.
+// MONO / LEGATO with portamento: the same rules.
 void testPortamentoFromLastNoteMono() {
     for(auto mode : {UpperVoiceMode::Mono, UpperVoiceMode::Legato}) {
         auto st=makeToneState(mode);
@@ -1653,10 +1673,9 @@ void testPortamentoFromLastNoteMono() {
         SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
         e.postNoteOn(0U,69U,100U); renderLeft(e,40);
         e.postNoteOff(0U,69U,0U); renderLeft(e,200);            // gone completely
-        e.postNoteOn(0U,81U,100U);                              // detached: glides from 69
+        e.postNoteOn(0U,81U,100U);                              // detached: struck, no glide
         auto x=renderLeft(e,100);
-        assert(std::abs(glideHzAt(x,30.0)-622.25)<622.25*0.03);
-        assert(std::abs(glideHzAt(x,80.0)-880.0)<880.0*0.006);
+        assert(std::abs(glideHzAt(x,10.0)-880.0)<880.0*0.006);
         e.postNoteOn(0U,69U,100U);                              // legato from 81
         auto y=renderLeft(e,100);
         assert(std::abs(glideHzAt(y,30.0)-622.25)<622.25*0.03);
@@ -1682,51 +1701,46 @@ void testPortamentoNewSoundStartsFresh() {
     assert(std::abs(glideHzAt(x,10.0)-880.0)<880.0*0.006);
 }
 
-// Automatic MONO of a POLY Upper: like the processor (new note, then Note Off
-// of the old one) the old note ends with its own release; a MONO Upper cuts it.
-// CC#123 forgets the last note.
+// The held line is ONE continuous sound: a new key is not struck again (no new
+// ATTACK), in POLY, MONO and LEGATO; the sounding note pressed again changes nothing.
 void testPortamentoAutoMonoReleaseTail() {
-    auto st=makeToneState(UpperVoiceMode::Poly);
-    auto prog=std::const_pointer_cast<Program>(st->combi.uppers[0].program);
-    prog->layers[0].ampEnvelope={0.0F,0.01F,1.0F,0.3F};          // 300 ms release
-    st->combi.uppers[0].portamentoSec=0.03F;
-    SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
-    e.postNoteOn(0U,69U,100U); renderLeft(e,40);
-    e.postNoteOn(0U,76U,100U); renderLeft(e,50);
-    assert(e.activeVoiceCount()==2U);                             // old note still in its release
-    renderLeft(e,600);
-    assert(e.activeVoiceCount()==1U);
-    auto mono=std::make_shared<EngineState>(*st);
-    mono->combi.uppers[0].voiceMode=UpperVoiceMode::Mono;
-    SamplerEngine f; f.prepare(96000.0,96U); f.setState(mono);
-    f.postNoteOn(0U,69U,100U); renderLeft(f,40);
-    f.postNoteOn(0U,76U,100U); renderLeft(f,20);
-    assert(f.activeVoiceCount()==1U);                             // MONO: the old one is cut short
-    // CC#123 on the channel: the next note starts clean
-    e.postControlChange(0U,123U,0U); renderLeft(e,10);
-    e.postNoteOn(0U,81U,100U);
-    auto x=renderLeft(e,30);
-    assert(std::abs(glideHzAt(x,10.0)-880.0)<880.0*0.006);
+    for(auto mode : {UpperVoiceMode::Poly, UpperVoiceMode::Mono, UpperVoiceMode::Legato}) {
+        auto st=makeToneState(mode);
+        st->combi.uppers[0].portamentoSec=0.03F;
+        st->combi.uppers[0].toneAttackMs=150.0F;                 // a slow attack would show a new strike
+        SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
+        e.postNoteOn(0U,69U,100U);
+        auto a=renderLeft(e,400);
+        const double full=peakOf(a,a.size()-4800U,a.size());
+        e.postNoteOn(0U,76U,100U);
+        auto b=renderLeft(e,60);
+        assert(peakOf(b,0U,960U)>0.9*full);                     // first 10 ms: still full, no new attack
+        assert(peakOf(b,b.size()-960U,b.size())>0.9*full);
+        assert(e.activeVoiceCount()==1U);
+        e.postNoteOn(0U,76U,100U);                              // the same note again: nothing
+        auto c=renderLeft(e,60);
+        assert(peakOf(c,0U,960U)>0.9*full && e.activeVoiceCount()==1U);
+        assert(std::abs(measureHz(c,1000U,5000U,96000.0)-659.26)<659.26*0.006);
+        // CC#123: the line is forgotten, the next note starts clean
+        e.postControlChange(0U,123U,0U); renderLeft(e,10);
+        e.postNoteOn(0U,81U,100U);
+        auto x=renderLeft(e,30);
+        assert(std::abs(glideHzAt(x,10.0)-880.0)<880.0*0.006);
+    }
 }
 
-// PORTA BALANCE (the processor's number, default 11): 11 = every interval in
-// TIME; a smaller number makes the processor send a smaller CC#5, so the
-// PA600's glide - and ours - gets shorter.
+// PORTA BALANCE does not change the sound: every interval glides in exactly TIME.
 void testPortamentoBalance() {
-    SamplerEngine probe; assert(std::abs(probe.portamentoBalance()-11.0F)<1.0e-6F);
-    for(float bal : {11.0F, 8.0F}) {
+    for(float bal : {11.0F, 5.0F, 30.0F}) {
         auto st=makeToneState(UpperVoiceMode::Legato);
         st->combi.uppers[0].portamentoSec=0.05F;
         SamplerEngine e; e.prepare(96000.0,96U); e.setPortamentoBalance(bal); e.setState(st);
         e.postNoteOn(0U,69U,100U); renderLeft(e,40);
         e.postNoteOn(0U,81U,100U);
         auto x=renderLeft(e,80);
-        const double at30=glideHzAt(x,30.0);
-        if(bal>10.0F) assert(at30<850.0);                          // 11: still gliding at 30 of 50 ms
-        else assert(std::abs(at30-880.0)<880.0*0.006);             // 8: already there (~22 ms)
+        assert(std::abs(glideHzAt(x,25.0)-622.25)<622.25*0.03);   // half way at 25 of 50 ms
         assert(std::abs(glideHzAt(x,70.0)-880.0)<880.0*0.006);
     }
-    SamplerEngine c; c.setPortamentoBalance(100.0F); assert(std::abs(c.portamentoBalance()-40.0F)<1.0e-6F);
 }
 
 // TIME is 1..100 ms: an older SET with a longer time still glides in 100 ms.
@@ -1851,6 +1865,67 @@ void testLiveEditsOnHeldNote() {
     assert(std::abs(tail(h)-own)<0.005F && std::abs(measureHz(h,h.size()-9600,h.size(),96000.0)-440.0)<0.5);
 }
 
+// SILVETON_FX_V2: FX1 and FX2 have their own engines, DELAY repeats on time and
+// its TONE darkens them, the plate REVERB lasts the DECAY time it shows.
+void renderFxNote(const std::shared_ptr<EngineState>& st, int noteBlocks, int blocks, std::vector<float>& left) {
+    SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
+    e.postNoteOn(0U,81U,120U);
+    std::vector<float> out(192);
+    for(int b=0;b<blocks;++b) {
+        if(b==noteBlocks) e.postNoteOff(0U,81U,0U);
+        e.render(out.data(),96U);
+        for(std::size_t i=0;i<96U;++i) left.push_back(out[i*2U]);
+    }
+}
+
+void testFxSlotsDelayReverb() {
+    auto st=makeToneState(UpperVoiceMode::Poly);
+    st->combi.uppers[0].toneReleaseMs=2.0F; st->combi.uppers[0].fxSend1=1.0F; st->combi.uppers[0].fxSend2=1.0F;
+    st->combi.fx1.type=EffectType::Reverb; st->combi.fx1.wet=1.0F; st->combi.fx2=st->combi.fx1;
+    auto one=std::make_shared<EngineState>(*st); one->combi.fx2.type=EffectType::Off;
+    auto none=std::make_shared<EngineState>(*st); none->combi.fx1.type=EffectType::Off; none->combi.fx2.type=EffectType::Off;
+    std::vector<float> a,b,c; renderFxNote(st,100,600,a); renderFxNote(one,100,600,b); renderFxNote(none,100,600,c);
+    double err=0.0, mag=0.0;
+    for(std::size_t i=0;i<a.size();++i) {
+        err=std::max(err,static_cast<double>(std::abs((a[i]-c[i])-2.0F*(b[i]-c[i]))));
+        mag=std::max(mag,static_cast<double>(std::abs(b[i]-c[i])));
+    }
+    assert(mag>0.05 && err<1.0e-4*mag+1.0e-6);                     // two REVERBs do not share one engine
+
+    auto d=makeToneState(UpperVoiceMode::Poly);
+    d->combi.uppers[0].toneReleaseMs=2.0F; d->combi.uppers[0].fxSend1=1.0F;
+    d->combi.fx1.type=EffectType::Delay; d->combi.fx1.wet=1.0F; d->combi.fx1.timeMs=300.0F; d->combi.fx1.feedback=0.5F; d->combi.fx1.tone=1.0F;
+    auto dOff=std::make_shared<EngineState>(*d); dOff->combi.fx1.type=EffectType::Off;
+    auto dDark=std::make_shared<EngineState>(*d); dDark->combi.fx1.tone=0.2F;
+    std::vector<float> w,w0,wd; renderFxNote(d,20,700,w); renderFxNote(dOff,20,700,w0); renderFxNote(dDark,20,700,wd);
+    std::size_t first=0U; for(std::size_t i=0;i<w.size();++i) if(std::abs(w[i]-w0[i])>0.01F) { first=i; break; }
+    assert(first>=28790U && first<=28820U);                        // echo at 300 ms
+    const auto win=[&](const std::vector<float>& x, std::size_t from){ std::vector<float> y; for(std::size_t i=from;i<from+1920U;++i) y.push_back(x[i]-w0[i]); return rms(y); };
+    assert(std::abs(win(w,57600U)/win(w,28800U)-0.5F)<0.03F);     // FEEDBACK 0.5
+    assert(win(wd,28800U)<0.95F*win(w,28800U));                     // TONE darkens the repeats
+
+    for(float fb : {0.3F, 0.6F}) {
+        auto r=makeToneState(UpperVoiceMode::Poly);
+        r->combi.uppers[0].toneReleaseMs=2.0F; r->combi.uppers[0].fxSend1=1.0F;
+        r->combi.fx1.type=EffectType::Reverb; r->combi.fx1.wet=1.0F; r->combi.fx1.feedback=fb; r->combi.fx1.tone=0.5F;
+        auto rOff=std::make_shared<EngineState>(*r); rOff->combi.fx1.type=EffectType::Off;
+        std::vector<float> x,x0; renderFxNote(r,20,7000,x); renderFxNote(rOff,20,7000,x0);
+        std::vector<double> energy(x.size()+1U,0.0);
+        for(std::size_t i=x.size();i-->2400U;) energy[i]=energy[i+1U]+static_cast<double>(x[i]-x0[i])*static_cast<double>(x[i]-x0[i]);
+        std::size_t i5=0U,i35=0U;
+        for(std::size_t i=2400U;i<x.size();++i) {
+            const double db=10.0*std::log10(energy[i]/energy[2400U]+1.0e-30);
+            if(i5==0U && db<=-5.0) i5=i;
+            if(i35==0U && db<=-35.0) { i35=i; break; }
+        }
+        assert(i5>0U && i35>i5);
+        const double t30=2.0*static_cast<double>(i35-i5)/96000.0;
+        const double shown=0.6*std::pow(20.0,static_cast<double>(fb)/0.95);
+        assert(std::abs(t30-shown)<0.15*shown);                    // REVERB lasts the DECAY time it shows
+        for(float v:x) assert(std::isfinite(v) && std::abs(v)<2.0F);
+    }
+}
+
 void testUpperCutoffResonance() {
     auto st=makeToneState(UpperVoiceMode::Poly);
     SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
@@ -1912,7 +1987,7 @@ int main() {
     testSafeStateReplacement();
     testSvBankRuntime();
     testSampleRecorderRf64();
-    testLoopedSampleKeepsAttack();
+    testSmoothLimiter(); testLoopedSampleKeepsAttack();
     testStereoReadMatchesChannelRead();
     testMonoTakeoverIsClickFree();
     testBankReadAheadWindows();
@@ -1934,6 +2009,7 @@ int main() {
     testUpperAdsrAbsolute();
     testUpperCutoffResonance();
     testLiveEditsOnHeldNote();
+    testFxSlotsDelayReverb();
     std::puts("SILVETON sampler tests passed");
     return 0;
 }

@@ -51,6 +51,7 @@ class SilvetonSamplerView(
     private enum class Page { LIST, COMBI, EFFECTS, SETTINGS }
     private enum class UpperTab { TUNE, RANGE, CONTROL, TONE, FX }
     private enum class WriteTarget { LIST, BLEND }
+    private enum class WriteMode { WRITE, COPY, MOVE }
 
     private data class Hit(
         val rect: RectF,
@@ -88,8 +89,6 @@ class SilvetonSamplerView(
 
     private data class ListLongHit(val rect: RectF, val action: (Float, Float) -> Unit)
     private val listLongHits = ArrayList<ListLongHit>(24)
-    private data class ListClipboard(val item: SamplerAppController.ListItem, val cut: Boolean)
-    private var listClipboard: ListClipboard? = null
     private var listLongPressX = 0f
     private var listLongPressY = 0f
     private var listLongPressArmed = false
@@ -149,6 +148,8 @@ class SilvetonSamplerView(
 
     // Korg-style WRITE screen (SILVETON_KORG_WRITE_V1).
     private var writeOpen = false
+    private var writeMode = WriteMode.WRITE
+    private var writeSource = -1
     private var writeTarget = WriteTarget.LIST
     private var writeName = ""
     private var writePage = 0
@@ -583,14 +584,14 @@ class SilvetonSamplerView(
         val big = RectF(112f, 14f, 672f, 96f)
         lcd(c, big)
         val slotText = editingCombiSlot?.let { "%03d".format(it) } ?: "---"
-        val activeItem = cachedListItems.getOrNull(cachedActiveListEntry)
+        val activeItem = realListItem(cachedActiveListEntry)
         val line1 = when (page) {
             Page.COMBI -> "КОМБИ $slotText" + if (loadedFromList >= 0) " · ЛИСТ %03d".format(loadedFromList + 1) else ""
             Page.LIST -> "ЛИСТ · СТРАНИЦА ${listPage + 1}"
             Page.EFFECTS -> "ЕФЕКТИ · КОМБИ $slotText"
             Page.SETTINGS -> "НАСТРОЙКИ · ГЛОБАЛНИ"
         }
-        val line2 = if (page == Page.LIST && activeItem != null) "%03d %s".format(activeItem.number, activeItem.name) else cachedCombiName
+        val line2 = if (page == Page.LIST && activeItem != null) "%03d %s".format(cachedActiveListEntry + 1, activeItem.name) else cachedCombiName
         val flash = flashText?.takeIf { now < flashUntilMs }
         text(c, flash ?: line1, big.left + 18f, big.top + 22f, 12f, if (flash != null) C_LCD_OK else C_LCD_DIM,
             face = faceMono, spacing = 0.25f, maxWidth = big.width() - 36f)
@@ -611,9 +612,8 @@ class SilvetonSamplerView(
         cell(2, 0, "ГЛАСОВЕ", a.activeVoices.toString(), if (audioSignal) C_LCD else C_LCD_VALUE)
         cell(0, 1, "XRUN", a.xrunCount.toString(), if (a.xrunCount > 0) C_LCD_BAD else C_LCD_VALUE)
         cell(1, 1, "ЛАТЕНЦИЯ", if (a.estimatedLatencyMs >= 0.0) "%.1f ms".format(a.estimatedLatencyMs) else "—", C_LCD_VALUE)
-        cell(2, 1, "PORTA BAL", sampler.portaBalance().toString(), C_LCD_VALUE)
-        hit(RectF(st.left + 10f + 2f * colW, st.top + 44f, st.right, st.bottom), { _, _ -> editPortaBalance() },
-            { sampler.setPortaBalance(11); invalidate() })
+        val porta = upperStates[selectedUpper]?.portamentoSec ?: 0f
+        cell(2, 1, "PORTA U${selectedUpper + 1}", if (porta <= 0f) "OFF" else "${round(porta * 1000f).toInt()} ms", C_LCD_VALUE)
 
         val blendsR = RectF(1026f, 14f, 1206f, 50f)
         lightKey(c, blendsR, "BLENDS")
@@ -1048,9 +1048,9 @@ class SilvetonSamplerView(
         fill(c, info, 10f, Color.argb(40, 0, 0, 0))
         if (fx != null) {
             text(c, "FX1", info.left + 24f, info.top + 44f, 14f, C_KNOB_LABEL, face = faceBold, spacing = 0.2f)
-            text(c, effectName(fx.fx1.type), info.left + 80f, info.top + 46f, 24f, C_AMBER, face = faceMono)
+            text(c, effectName(fx.fx1.type) + if (fx.fx1.type != 0) "  WET ${round(fx.fx1.wet * 100f).toInt()}%" else "", info.left + 80f, info.top + 46f, 24f, C_AMBER, face = faceMono, maxWidth = info.width() - 340f)
             text(c, "FX2", info.left + 24f, info.top + 94f, 14f, C_KNOB_LABEL, face = faceBold, spacing = 0.2f)
-            text(c, effectName(fx.fx2.type), info.left + 80f, info.top + 96f, 24f, C_AMBER, face = faceMono)
+            text(c, effectName(fx.fx2.type) + if (fx.fx2.type != 0) "  WET ${round(fx.fx2.wet * 100f).toInt()}%" else "", info.left + 80f, info.top + 96f, 24f, C_AMBER, face = faceMono, maxWidth = info.width() - 340f)
             text(c, if (fx.routing == 0) "ПАРАЛЕЛНО" else "FX1 → FX2", info.left + 24f, info.top + 136f, 13f, C_KNOB_LABEL, spacing = 0.1f)
         }
         val open = RectF(info.right - 220f, info.centerY() - 22f, info.right - 24f, info.centerY() + 22f)
@@ -1064,7 +1064,7 @@ class SilvetonSamplerView(
     private fun drawList(c: Canvas) {
         if (!listCacheLoaded) refreshListCache()
         val entries = cachedListItems
-        val active = cachedActiveListEntry
+        val active = cachedActiveListEntry.takeIf { realListItem(it) != null } ?: -1
         if (active != listFollowedActive) {
             // Follow a newly loaded entry once; the page keys stay free afterwards.
             listFollowedActive = active
@@ -1075,7 +1075,8 @@ class SilvetonSamplerView(
         val keyW = (1214f - 19f * 6f) / 20f
         for (i in 0 until 20) {
             val pr = RectF(112f + i * (keyW + 6f), 108f, 112f + i * (keyW + 6f) + keyW, 156f)
-            pageKey(c, pr, (i + 1).toString(), i == listPage, i * 10 < entries.size, active >= 0 && active / 10 == i)
+            val hasData = (i * 10 until i * 10 + 10).any { realListItem(it) != null }
+            pageKey(c, pr, (i + 1).toString(), i == listPage, hasData, active >= 0 && active / 10 == i)
             hit(pr, { _, _ -> listPage = i })
         }
 
@@ -1089,7 +1090,7 @@ class SilvetonSamplerView(
             val row = j / 2
             val rr = RectF(112f + col * (colW + 10f), gridTop + row * (rowH + 10f),
                 112f + col * (colW + 10f) + colW, gridTop + row * (rowH + 10f) + rowH)
-            val item = entries.getOrNull(idx)
+            val item = realListItem(idx)
             listCard(c, rr, item, idx, idx == active)
             if (item != null) {
                 hit(rr, { _, _ ->
@@ -1107,7 +1108,7 @@ class SilvetonSamplerView(
             }
         }
 
-        val activeItem = entries.getOrNull(active)
+        val activeItem = realListItem(active)
         val editR = RectF(112f, 742f, 300f, 786f)
         lightKey(c, editR, "EDIT COMBI", enabled = activeItem != null)
         if (activeItem != null) {
@@ -1122,10 +1123,15 @@ class SilvetonSamplerView(
                 }
             })
         }
-        text(c, "Докосни = зареди  ·  Задръж = меню: RENAME · COPY · CUT · MOVE · PASTE · DELETE",
+        text(c, "Докосни = зареди  ·  Задръж = меню: EDIT · RENAME · COPY · MOVE · DELETE",
             316f, 769f, 12f, C_INK_SOFT, maxWidth = 830f)
-        text(c, "${entries.size} / 200", 1326f, 769f, 13f, C_INK_SOFT, right = true, face = faceMonoBold)
+        val used = entries.count { !sampler.isEmptyListItem(it) }
+        text(c, "$used / 200", 1326f, 769f, 13f, C_INK_SOFT, right = true, face = faceMonoBold)
     }
+
+    // SILVETON_LIST_POSITIONS_V1: a LIST position with a BLEND (null = empty position).
+    private fun realListItem(index: Int): SamplerAppController.ListItem? =
+        cachedListItems.getOrNull(index)?.takeUnless { sampler.isEmptyListItem(it) }
 
     private fun listCard(c: Canvas, r: RectF, item: SamplerAppController.ListItem?, idx: Int, selected: Boolean) {
         if (selected) fill(c, RectF(r.left - 3f, r.top - 3f, r.right + 3f, r.bottom + 3f), 15f, C_ORANGE)
@@ -1135,7 +1141,7 @@ class SilvetonSamplerView(
         led(c, r.left + 22f, r.centerY(), selected, 5f, light = true)
         val box = RectF(r.left + 40f, r.centerY() - 22f, r.left + 124f, r.centerY() + 22f)
         lcd(c, box, 8f)
-        text(c, "%03d".format(item?.number ?: (idx + 1)), box.centerX(), box.centerY() + 8f, 22f,
+        text(c, "%03d".format(idx + 1), box.centerX(), box.centerY() + 8f, 22f,
             if (item != null) C_LCD else C_LCD_DIM, center = true, face = faceMono)
         if (item != null) {
             text(c, item.name, r.left + 142f, r.centerY() + 3f, 24f, C_INK, face = faceBold, maxWidth = r.width() - 160f)
@@ -1162,51 +1168,24 @@ class SilvetonSamplerView(
     }
 
     private fun showListContextMenu(index: Int, item: SamplerAppController.ListItem) {
-        val actions = ArrayList<String>()
-        actions.add("EDIT COMBI")
-        actions.add("RENAME")
-        actions.add("COPY")
-        actions.add("CUT")
-        actions.add("MOVE")
-        if (listClipboard != null) {
-            actions.add("PASTE BEFORE")
-            actions.add("PASTE AFTER")
-        }
-        actions.add("DELETE")
+        val actions = arrayOf("EDIT COMBI", "RENAME", "COPY", "MOVE", "DELETE")
         AlertDialog.Builder(context)
-            .setTitle("%03d   %s".format(item.number, item.name))
-            .setItems(actions.toTypedArray()) { dialog, which ->
+            .setTitle("%03d   %s".format(index + 1, item.name))
+            .setItems(actions) { dialog, which ->
                 when (actions[which]) {
                     "EDIT COMBI" -> editListCombi(item, index)
                     "RENAME" -> showTextPage("RENAME BLEND", item.name) { newName ->
                         if (sampler.renameLiveListEntry(index, newName)) { refreshListCache(); invalidate() }
                     }
-                    "COPY" -> listClipboard = ListClipboard(item, false)
-                    "CUT" -> listClipboard = ListClipboard(item, true)
-                    "MOVE" -> {
-                        val count = sampler.listItems(0, 0, 0).size.coerceAtLeast(1)
-                        showNumber("MOVE BLEND — POSITION", (index + 1).toFloat(), 1f, count.toFloat(), 0, live = false) { value ->
-                            val to = value.toInt().coerceIn(1, count) - 1
-                            if (sampler.moveLiveListEntry(index, to)) {
-                                if (loadedFromList == index) loadedFromList = to
-                                refreshListCache()
-                                listPage = (to / 10).coerceIn(0, 19)
-                                invalidate()
-                            }
-                        }
-                    }
-                    "PASTE BEFORE" -> pasteListClipboard(index, false)
-                    "PASTE AFTER" -> pasteListClipboard(index, true)
+                    "COPY" -> openPositionPicker(WriteMode.COPY, index)
+                    "MOVE" -> openPositionPicker(WriteMode.MOVE, index)
                     "DELETE" -> AlertDialog.Builder(context)
-                        .setTitle("DELETE BLEND")
-                        .setMessage("Remove '${item.name}' from LIST? The COMBI itself will not be deleted.")
+                        .setTitle("DELETE  ЛИСТ %03d".format(index + 1))
+                        .setMessage("„${item.name}“ излиза от ЛИСТА и мястото остава празно. Другите позиции не мърдат, самата бленда не се трие.")
                         .setPositiveButton("DELETE") { _, _ ->
                             if (sampler.deleteLiveListEntry(index)) {
                                 if (loadedFromList == index) loadedFromList = -1
-                                else if (loadedFromList > index) loadedFromList--
                                 refreshListCache()
-                                val size = cachedListItems.size
-                                listPage = if (size == 0) 0 else min(listPage, (size - 1) / 10)
                                 invalidate()
                             }
                         }
@@ -1219,37 +1198,11 @@ class SilvetonSamplerView(
             .show()
     }
 
-    private fun pasteListClipboard(targetIndex: Int, after: Boolean) {
-        val clip = listClipboard ?: return
-        val current = sampler.listItems(0, 0, 0)
-        if (current.isEmpty()) return
-        if (clip.cut) {
-            val source = current.indexOf(clip.item)
-            if (source < 0) { listClipboard = null; return }
-            var destination = targetIndex + if (after) 1 else 0
-            if (source < destination) destination -= 1
-            destination = destination.coerceIn(0, current.size - 1)
-            if (sampler.moveLiveListEntry(source, destination)) {
-                listClipboard = null
-                loadedFromList = -1
-                refreshListCache()
-                listPage = (destination / 10).coerceIn(0, 19)
-                invalidate()
-            }
-        } else {
-            val insertion = (targetIndex + if (after) 1 else 0).coerceIn(0, current.size)
-            if (sampler.copyLiveListEntry(clip.item, insertion)) {
-                if (loadedFromList >= insertion) loadedFromList++
-                refreshListCache()
-                listPage = (insertion / 10).coerceIn(0, 19)
-                invalidate()
-            }
-        }
-    }
-
-    // ------------------------------------------------------------------ WRITE (Korg style)
+    // ------------------------------------------------------------------ WRITE / COPY / MOVE (Korg style)
 
     private fun openWrite(target: WriteTarget, append: Boolean) {
+        writeMode = WriteMode.WRITE
+        writeSource = -1
         writeList = sampler.listItems(0, 0, 0)
         writeBlends = sampler.combiCatalog().toMap()
         writeName = sampler.combiName()
@@ -1258,12 +1211,36 @@ class SilvetonSamplerView(
         invalidate()
     }
 
+    /** COPY / MOVE a LIST position to any position 1..200 chosen on the same screen. */
+    private fun openPositionPicker(mode: WriteMode, source: Int) {
+        writeMode = mode
+        writeSource = source
+        writeTarget = WriteTarget.LIST
+        writeList = sampler.listItems(0, 0, 0)
+        writeBlends = sampler.combiCatalog().toMap()
+        writeName = writeListName(source) ?: ""
+        writeSelected = firstFreeListPosition(after = source)
+        writePage = if (writeSelected >= 0) writeSelected / 10 else source / 10
+        writeOpen = true
+        invalidate()
+    }
+
+    private fun writeListName(pos: Int): String? = writeList.getOrNull(pos)?.takeUnless { sampler.isEmptyListItem(it) }?.name
+
+    private fun firstFreeListPosition(after: Int = -1): Int {
+        for (k in 0 until 200) {
+            val pos = (after + 1 + k) % 200
+            if (pos != writeSource && writeListName(pos) == null) return pos
+        }
+        return -1
+    }
+
     private fun selectWriteTarget(target: WriteTarget, append: Boolean) {
         writeTarget = target
         writeSelected = when (target) {
             WriteTarget.LIST ->
-                if (!append && loadedFromList in writeList.indices) loadedFromList
-                else if (writeList.size < 200) writeList.size else -1
+                if (!append && writeListName(loadedFromList) != null) loadedFromList
+                else (0 until 200).firstOrNull { writeListName(it) == null } ?: -1
             WriteTarget.BLEND -> {
                 val own = editingCombiSlot
                 if (!append && own != null && own in 1..500) own - 1
@@ -1274,40 +1251,44 @@ class SilvetonSamplerView(
     }
 
     private fun writeOccupiedName(pos: Int): String? = when (writeTarget) {
-        WriteTarget.LIST -> writeList.getOrNull(pos)?.name
+        WriteTarget.LIST -> writeListName(pos)
         WriteTarget.BLEND -> writeBlends[pos + 1]
-    }
-
-    private fun writeNumber(pos: Int): Int = when (writeTarget) {
-        WriteTarget.LIST -> writeList.getOrNull(pos)?.number ?: (pos + 1)
-        WriteTarget.BLEND -> pos + 1
     }
 
     private fun drawWriteScreen(c: Canvas) {
         fill(c, RectF(0f, 0f, DESIGN_W, DESIGN_H), 0f, Color.argb(170, 0, 0, 0))
-        // Modal background: swallows touches outside the WRITE panel.
+        // Modal background: swallows touches outside the panel.
         hit(RectF(0f, 0f, DESIGN_W, DESIGN_H), { _, _ -> })
         val p = RectF(150f, 30f, 1290f, 770f)
         board(c, p)
-        text(c, "WRITE", p.left + 30f, p.top + 50f, 28f, C_AMBER, face = faceMonoBold, spacing = 0.1f)
-        text(c, "Избери място. Заетите позиции могат да се презапишат.", p.left + 32f, p.top + 76f, 13f, C_KNOB_LABEL)
+        val picking = writeMode != WriteMode.WRITE
+        val title = when (writeMode) { WriteMode.WRITE -> "WRITE"; WriteMode.COPY -> "COPY"; WriteMode.MOVE -> "MOVE" }
+        text(c, title, p.left + 30f, p.top + 50f, 28f, C_AMBER, face = faceMonoBold, spacing = 0.1f)
+        text(c, if (picking) "Избери къде да отиде. Заета позиция може да се презапише, другите не мърдат."
+            else "Избери място. Заетите позиции могат да се презапишат.",
+            p.left + 32f, p.top + 76f, 13f, C_KNOB_LABEL, maxWidth = p.width() - 360f)
 
-        val tl = RectF(p.right - 300f, p.top + 22f, p.right - 160f, p.top + 64f)
-        val tb = RectF(p.right - 150f, p.top + 22f, p.right - 30f, p.top + 64f)
-        segKey(c, tl, "ЛИСТ", writeTarget == WriteTarget.LIST)
-        segKey(c, tb, "BLENDS", writeTarget == WriteTarget.BLEND)
-        hit(tl, { _, _ -> if (writeTarget != WriteTarget.LIST) selectWriteTarget(WriteTarget.LIST, false) })
-        hit(tb, { _, _ -> if (writeTarget != WriteTarget.BLEND) selectWriteTarget(WriteTarget.BLEND, false) })
+        if (!picking) {
+            val tl = RectF(p.right - 300f, p.top + 22f, p.right - 160f, p.top + 64f)
+            val tb = RectF(p.right - 150f, p.top + 22f, p.right - 30f, p.top + 64f)
+            segKey(c, tl, "ЛИСТ", writeTarget == WriteTarget.LIST)
+            segKey(c, tb, "BLENDS", writeTarget == WriteTarget.BLEND)
+            hit(tl, { _, _ -> if (writeTarget != WriteTarget.LIST) selectWriteTarget(WriteTarget.LIST, false) })
+            hit(tb, { _, _ -> if (writeTarget != WriteTarget.BLEND) selectWriteTarget(WriteTarget.BLEND, false) })
+        }
 
-        text(c, "ИМЕ", p.left + 30f, p.top + 127f, 12f, C_SECTION_TITLE, spacing = 0.25f)
+        text(c, if (picking) "ОТ" else "ИМЕ", p.left + 30f, p.top + 127f, 12f, C_SECTION_TITLE, spacing = 0.25f)
         val nameR = RectF(p.left + 90f, p.top + 92f, p.right - 180f, p.top + 148f)
         lcd(c, nameR)
-        text(c, writeName, nameR.left + 16f, nameR.centerY() + 10f, 28f, C_LCD, face = faceMono, maxWidth = nameR.width() - 32f)
-        val renR = RectF(p.right - 166f, p.top + 98f, p.right - 30f, p.top + 142f)
-        lightKey(c, renR, "RENAME")
-        val rename = { showTextPage("RENAME", writeName) { writeName = it } }
-        hit(nameR, { _, _ -> rename() })
-        hit(renR, { _, _ -> rename() })
+        val nameText = if (picking) "%03d  %s".format(writeSource + 1, writeName) else writeName
+        text(c, nameText, nameR.left + 16f, nameR.centerY() + 10f, 28f, C_LCD, face = faceMono, maxWidth = nameR.width() - 32f)
+        if (!picking) {
+            val renR = RectF(p.right - 166f, p.top + 98f, p.right - 30f, p.top + 142f)
+            lightKey(c, renR, "RENAME")
+            val rename = { showTextPage("RENAME", writeName) { writeName = it } }
+            hit(nameR, { _, _ -> rename() })
+            hit(renR, { _, _ -> rename() })
+        }
 
         val listTarget = writeTarget == WriteTarget.LIST
         val pages = if (listTarget) 20 else 50
@@ -1340,19 +1321,19 @@ class SilvetonSamplerView(
             val row = j / 2
             val cell = RectF(kx0 + col * (cellW + gap), gridTop + row * (cellH + gap),
                 kx0 + col * (cellW + gap) + cellW, gridTop + row * (cellH + gap) + cellH)
-            val name = writeOccupiedName(pos)
-            val usable = if (listTarget) pos <= writeList.size && pos < 200 else pos < 500
-            writeCell(c, cell, writeNumber(pos), name, usable, pos == writeSelected)
+            val isSource = picking && pos == writeSource
+            val usable = !isSource && (if (listTarget) pos < 200 else pos < 500)
+            writeCell(c, cell, pos + 1, writeOccupiedName(pos), usable, pos == writeSelected, isSource)
             if (usable) hit(cell, { _, _ -> writeSelected = pos })
         }
 
         val label = if (listTarget) "ЛИСТ" else "BLEND"
         val selName = if (writeSelected >= 0) writeOccupiedName(writeSelected) else null
+        val action = when (writeMode) { WriteMode.WRITE -> "ЗАПИС"; WriteMode.COPY -> "КОПИРАНЕ"; WriteMode.MOVE -> "МЕСТЕНЕ" }
         val info = when {
-            writeSelected < 0 && listTarget && writeList.size >= 200 -> "ЛИСТЪТ Е ПЪЛЕН – избери позиция за презапис"
             writeSelected < 0 -> "Избери позиция"
-            selName != null -> "ПРЕЗАПИС:  $label %03d  „%s“".format(writeNumber(writeSelected), selName)
-            else -> "ЗАПИС:  $label %03d  (свободна)".format(writeNumber(writeSelected))
+            selName != null -> "$action, ПРЕЗАПИС:  $label %03d  „%s“".format(writeSelected + 1, selName)
+            else -> "$action:  $label %03d  (свободна)".format(writeSelected + 1)
         }
         text(c, info, p.left + 30f, p.bottom - 38f, 17f, if (selName != null) C_AMBER else C_LCD_OK, face = faceBold, maxWidth = 760f)
 
@@ -1360,19 +1341,23 @@ class SilvetonSamplerView(
         val write = RectF(p.right - 178f, p.bottom - 70f, p.right - 30f, p.bottom - 22f)
         lightKey(c, cancel, "CANCEL", size = 14f)
         hit(cancel, { _, _ -> writeOpen = false })
-        accentKey(c, write, "WRITE", writeSelected >= 0)
+        accentKey(c, write, title, writeSelected >= 0)
         if (writeSelected >= 0) hit(write, { _, _ -> confirmWrite() })
     }
 
-    private fun writeCell(c: Canvas, r: RectF, number: Int, name: String?, usable: Boolean, selected: Boolean) {
+    private fun writeCell(c: Canvas, r: RectF, number: Int, name: String?, usable: Boolean, selected: Boolean, source: Boolean = false) {
         if (selected) fill(c, RectF(r.left - 3f, r.top - 3f, r.right + 3f, r.bottom + 3f), 12f, C_ORANGE)
-        fill(c, r, 10f, when { !usable -> Color.rgb(58, 61, 66); selected -> Color.WHITE; else -> C_STRIP })
+        fill(c, r, 10f, when { source -> Color.rgb(96, 84, 64); !usable -> Color.rgb(58, 61, 66); selected -> Color.WHITE; else -> C_STRIP })
         if (usable && isDown(r)) fill(c, r, 10f, Color.argb(30, 0, 0, 0))
         val box = RectF(r.left + 10f, r.centerY() - 18f, r.left + 80f, r.centerY() + 18f)
         lcd(c, box, 7f)
-        text(c, "%03d".format(number), box.centerX(), box.centerY() + 7f, 19f, if (usable) C_LCD else C_LCD_DIM, center = true, face = faceMono)
+        text(c, "%03d".format(number), box.centerX(), box.centerY() + 7f, 19f, if (usable || source) C_LCD else C_LCD_DIM, center = true, face = faceMono)
         val textX = r.left + 94f
         when {
+            source -> {
+                text(c, name ?: "", textX, r.centerY() + 7f, 19f, Color.WHITE, face = faceBold, maxWidth = r.width() - 94f - 110f)
+                text(c, "ИЗТОЧНИК", r.right - 14f, r.centerY() + 5f, 11f, C_AMBER, right = true, face = faceBold, spacing = 0.15f)
+            }
             !usable -> text(c, "—", textX, r.centerY() + 7f, 18f, Color.rgb(120, 124, 130))
             name != null -> {
                 text(c, name, textX, r.centerY() + 7f, 19f, C_INK, face = faceBold, maxWidth = r.width() - 94f - 96f)
@@ -1389,36 +1374,34 @@ class SilvetonSamplerView(
         val pos = writeSelected
         if (pos < 0) return
         val name = writeName.trim().ifBlank { sampler.combiName() }
-        if (writeTarget == WriteTarget.LIST) {
-            val old = writeList.getOrNull(pos)
-            if (old == null) { doWriteList(pos, name); return }
-            AlertDialog.Builder(context)
-                .setTitle("ПРЕЗАПИС  ЛИСТ %03d".format(old.number))
-                .setMessage("„${old.name}“ ще бъде заменен с „$name“.")
-                .setPositiveButton("ПРЕЗАПИШИ") { _, _ -> doWriteList(pos, name) }
-                .setNegativeButton("CANCEL", null)
-                .show()
-        } else {
-            val slot = pos + 1
-            val old = writeBlends[slot]
-            if (old == null) { doWriteBlend(slot, name); return }
-            val users = writeList.filter { it.combiBank == 0 && it.combiPage == 0 && it.combiSlot == slot }
-                .map { "%03d".format(it.number) }
-            val extra = if (users.isEmpty()) "" else "\nИзползва се и в ЛИСТ: " + users.joinToString(", ")
-            AlertDialog.Builder(context)
-                .setTitle("ПРЕЗАПИС  BLEND %03d".format(slot))
-                .setMessage("„$old“ ще бъде заменен с „$name“.$extra")
-                .setPositiveButton("ПРЕЗАПИШИ") { _, _ -> doWriteBlend(slot, name) }
-                .setNegativeButton("CANCEL", null)
-                .show()
+        val runIt: () -> Unit = when (writeMode) {
+            WriteMode.COPY -> { { doCopyOrMove(false, writeSource, pos) } }
+            WriteMode.MOVE -> { { doCopyOrMove(true, writeSource, pos) } }
+            WriteMode.WRITE -> if (writeTarget == WriteTarget.LIST) { { doWriteList(pos, name) } } else { { doWriteBlend(pos + 1, name) } }
         }
+        val old = writeOccupiedName(pos)
+        if (old == null) { runIt(); return }
+        val incoming = if (writeMode == WriteMode.WRITE) name else writeName
+        val label = if (writeTarget == WriteTarget.LIST) "ЛИСТ" else "BLEND"
+        var extra = ""
+        if (writeTarget == WriteTarget.BLEND) {
+            val users = writeList.filter { it.combiBank == 0 && it.combiPage == 0 && it.combiSlot == pos + 1 }
+                .map { "%03d".format(writeList.indexOf(it) + 1) }
+            if (users.isNotEmpty()) extra = "\nИзползва се и в ЛИСТ: " + users.joinToString(", ")
+        }
+        AlertDialog.Builder(context)
+            .setTitle("ПРЕЗАПИС  $label %03d".format(pos + 1))
+            .setMessage("„$old“ ще бъде заменен с „$incoming“.$extra")
+            .setPositiveButton("ПРЕЗАПИШИ") { _, _ -> runIt() }
+            .setNegativeButton("CANCEL", null)
+            .show()
     }
 
     private fun doWriteList(pos: Int, name: String) {
         val index = sampler.writeCombiToList(pos, name)
         if (index < 0) { invalidate(); return }
         refreshListCache()
-        val item = cachedListItems.getOrNull(index)
+        val item = realListItem(index)
         if (item != null && item.combiBank == 0 && item.combiPage == 0) editingCombiSlot = item.combiSlot
         loadedFromList = index
         listFollowedActive = cachedActiveListEntry
@@ -1428,7 +1411,7 @@ class SilvetonSamplerView(
         refreshFx()
         writeOpen = false
         page = Page.LIST
-        flash("ЗАПИСАНО: ЛИСТ %03d".format(item?.number ?: (index + 1)))
+        flash("ЗАПИСАНО: ЛИСТ %03d".format(index + 1))
     }
 
     private fun doWriteBlend(slot: Int, name: String) {
@@ -1441,6 +1424,19 @@ class SilvetonSamplerView(
         refreshListCache()
         writeOpen = false
         flash("ЗАПИСАНО: BLEND %03d".format(slot))
+    }
+
+    private fun doCopyOrMove(move: Boolean, from: Int, to: Int) {
+        val ok = if (move) sampler.moveListEntryTo(from, to) else sampler.copyListEntryTo(from, to)
+        if (!ok) { invalidate(); return }
+        if (move && loadedFromList == from) loadedFromList = to
+        else if (loadedFromList == to) loadedFromList = -1
+        refreshListCache()
+        listFollowedActive = cachedActiveListEntry.takeIf { realListItem(it) != null } ?: -1
+        listPage = (to / 10).coerceIn(0, 19)
+        writeOpen = false
+        page = Page.LIST
+        flash((if (move) "ПРЕМЕСТЕНО: ЛИСТ %03d" else "КОПИРАНО: ЛИСТ %03d").format(to + 1))
     }
 
     private fun flash(message: String) {
@@ -1462,6 +1458,12 @@ class SilvetonSamplerView(
             { if (sampler.updateCombiFxRouting(0)) refreshFx() })
     }
 
+    // SILVETON_FX_V2: every effect shows only the knobs its sound really uses.
+    //   DELAY: WET, TIME, FEEDBACK, TONE   CHORUS: WET, RATE, DEPTH   REVERB: WET, DECAY, TONE
+    private fun reverbSeconds(feedback: Float): Float = 0.6f * Math.pow(20.0, (feedback.coerceIn(0f, 0.95f) / 0.95f).toDouble()).toFloat()
+    private fun reverbFeedbackFor(seconds: Float): Float =
+        (0.95f * (kotlin.math.ln(seconds.coerceIn(0.6f, 12f) / 0.6f) / kotlin.math.ln(20f))).coerceIn(0f, 0.95f)
+
     private fun drawFxBoard(c: Canvas, r: RectF, slot: Int, fx: SamplerAppController.FxState) {
         board(c, r)
         text(c, "FX$slot", r.left + 22f, r.top + 45f, 26f, C_AMBER, face = faceMonoBold)
@@ -1476,21 +1478,36 @@ class SilvetonSamplerView(
         }
         val sec = RectF(r.left + 16f, r.top + 74f, r.right - 16f, r.bottom - 16f)
         section(c, sec, "ПАРАМЕТРИ · " + effectName(fx.type))
-        val names = arrayOf("WET", "TIME", "FEEDBACK", "RATE", "DEPTH", "TONE")
+
+        // index into WET, TIME, FEEDBACK, RATE, DEPTH, TONE
+        val shownParams = when (fx.type) {
+            1 -> intArrayOf(0, 1, 2, 5)
+            2 -> intArrayOf(0, 3, 4)
+            3 -> intArrayOf(0, 2, 5)
+            else -> intArrayOf()
+        }
+        if (shownParams.isEmpty()) {
+            text(c, "FX$slot е изключен. Избери DELAY, CHORUS или REVERB отгоре.", sec.centerX(), sec.top + 160f, 16f,
+                C_KNOB_LABEL, center = true, maxWidth = sec.width() - 40f)
+        }
+        val reverb = fx.type == 3
+        val names = arrayOf("WET", "TIME", if (reverb) "DECAY" else "FEEDBACK", "RATE", "DEPTH", "TONE")
         val values = floatArrayOf(fx.wet, fx.timeMs, fx.feedback, fx.rateHz, fx.depth, fx.tone)
         val mins = floatArrayOf(0f, 1f, 0f, 0.05f, 0f, 0f)
         val maxs = floatArrayOf(1f, 2500f, 0.95f, 8f, 1f, 1f)
         val defs = floatArrayOf(0f, 320f, 0.25f, 0.8f, 0.35f, 0.5f)
-        val steps = floatArrayOf(0.01f, 1f, 0.01f, 0.01f, 0.01f, 0.01f)
-        val travels = floatArrayOf(250f, 500f, 250f, 300f, 250f, 250f)
-        for (i in 0 until 6) {
-            val col = i % 3
-            val row = i / 3
-            val cx = sec.left + sec.width() * (col + 0.5f) / 3f
-            val cy = sec.top + 122f + row * 236f
+        val steps = floatArrayOf(0.01f, 1f, 0.005f, 0.01f, 0.01f, 0.01f)
+        val travels = floatArrayOf(250f, 500f, 300f, 300f, 250f, 250f)
+        shownParams.forEachIndexed { k, i ->
+            val cx = sec.left + sec.width() * (k + 0.5f) / shownParams.size
+            val cy = sec.top + 150f
             val v = values[i]
-            val pct = i != 1 && i != 3
-            val shown = when (i) { 1 -> "${v.toInt()} ms"; 3 -> "%.2f Hz".format(v); else -> "${round(v * 100f).toInt()} %" }
+            val shown = when {
+                i == 1 -> "${v.toInt()} ms"
+                i == 3 -> "%.2f Hz".format(v)
+                i == 2 && reverb -> "%.1f s".format(reverbSeconds(v))
+                else -> "${round(v * 100f).toInt()} %"
+            }
             val apply = { nv: Float ->
                 val nf = when (i) {
                     0 -> fx.copy(wet = nv); 1 -> fx.copy(timeMs = nv); 2 -> fx.copy(feedback = nv)
@@ -1498,14 +1515,40 @@ class SilvetonSamplerView(
                 }
                 if (sampler.updateCombiFx(slot, nf)) refreshFx()
             }
-            knobControl(c, cx, cy, 38f, v, mins[i], maxs[i], steps[i], travels[i], false, shown, names[i],
-                hitW = sec.width() / 3f - 10f,
+            knobControl(c, cx, cy, 40f, v, mins[i], maxs[i], steps[i], travels[i], false, shown, names[i],
+                hitW = min(200f, sec.width() / shownParams.size - 10f),
                 onChange = { nv -> apply(nv) },
                 exact = {
-                    if (pct) showNumber("FX$slot ${names[i]} %", v * 100f, mins[i] * 100f, maxs[i] * 100f, 0) { apply((it / 100f).coerceIn(mins[i], maxs[i])) }
-                    else showNumber("FX$slot ${names[i]}", v, mins[i], maxs[i], if (i == 1) 0 else 2) { apply(it) }
+                    when {
+                        i == 2 && reverb -> showNumber("FX$slot DECAY s", reverbSeconds(v), 0.6f, 12f, 1,
+                            restore = { apply(v) }) { apply(reverbFeedbackFor(it)) }
+                        i == 1 -> showNumber("FX$slot TIME ms", v, mins[i], maxs[i], 0) { apply(it) }
+                        i == 3 -> showNumber("FX$slot RATE Hz", v, mins[i], maxs[i], 2) { apply(it) }
+                        else -> showNumber("FX$slot ${names[i]} %", v * 100f, mins[i] * 100f, maxs[i] * 100f, 0,
+                            restore = { apply(v) }) { apply((it / 100f).coerceIn(mins[i], maxs[i])) }
+                    }
                 },
                 reset = { apply(defs[i]) })
+        }
+
+        if (shownParams.isNotEmpty()) {
+            // Which UPPERs send to this effect: an effect is only heard through the FX SEND of an UPPER.
+            val sends = (0 until 7).mapNotNull { u ->
+                val s = upperStates[u] ?: return@mapNotNull null
+                val send = if (slot == 1) s.fxSend1 else s.fxSend2
+                if (send > 0.004f && s.soundName != "EMPTY" && s.enabled) "U${u + 1} ${round(send * 100f).toInt()}%" else null
+            }
+            val y = sec.top + 300f
+            text(c, "ПРАЩАТ КЪМ FX$slot", sec.left + 16f, y, 11f, C_SECTION_TITLE, spacing = 0.25f)
+            if (sends.isEmpty()) {
+                text(c, "Никой UPPER не праща тук – вдигни FX$slot SEND", sec.left + 16f, y + 30f, 15f, C_AMBER, face = faceBold, maxWidth = sec.width() - 32f)
+                text(c, "(КОМБИ, долу FX, FX$slot SEND на всеки UPPER)", sec.left + 16f, y + 54f, 13f, C_KNOB_LABEL, maxWidth = sec.width() - 32f)
+            } else {
+                text(c, sends.joinToString("   "), sec.left + 16f, y + 30f, 15f, C_LCD_OK, face = faceMonoBold, maxWidth = sec.width() - 32f)
+            }
+            if (fx.wet <= 0.004f) {
+                text(c, "WET е 0 % – вдигни WET, за да се чува.", sec.left + 16f, y + 90f, 15f, C_AMBER, face = faceBold, maxWidth = sec.width() - 32f)
+            }
         }
     }
 
@@ -1516,7 +1559,7 @@ class SilvetonSamplerView(
         val b = RectF(112f, 108f, 1326f, 786f)
         board(c, b)
         val labels = arrayOf("MASTER TUNE", "TRANSPOSE", "MASTER GAIN", "EQ LOW", "EQ MID", "EQ HIGH", "LIMITER", "CEILING",
-            "VELOCITY CURVE", "BREATH CC", "EXPRESSION CC", "DAMPER CC", "PITCH BEND", "AFTERTOUCH", "PORTA BALANCE")
+            "VELOCITY CURVE", "BREATH CC", "EXPRESSION CC", "DAMPER CC", "PITCH BEND", "AFTERTOUCH")
         val cols = 5
         val gap = 10f
         val cw = (b.width() - 32f - gap * (cols - 1)) / cols
@@ -1531,16 +1574,6 @@ class SilvetonSamplerView(
             val cx = rr.centerX()
             val cy = rr.top + 98f
             when (i) {
-                14 -> {
-                    // PORTA BALANCE like the SILVETON keyboard processor (3..40, default 11)
-                    val bal = sampler.portaBalance().toFloat()
-                    knobControl(c, cx, cy, 34f, bal, 3f, 40f, 1f, 296f, false, bal.toInt().toString(), "",
-                        hitW = cw - 10f,
-                        onChange = { nv -> sampler.setPortaBalance(nv.toInt(), save = false) },
-                        onFinal = { nv -> sampler.setPortaBalance(nv.toInt(), save = true) },
-                        exact = { editPortaBalance() },
-                        reset = { sampler.setPortaBalance(11); invalidate() })
-                }
                 6, 12, 13 -> {
                     val on = when (i) { 6 -> g.limiterEnabled; 12 -> g.pitchBendEnabled; else -> g.aftertouchEnabled }
                     val key = RectF(cx - 80f, rr.top + 56f, cx + 80f, rr.top + 146f)
@@ -1563,13 +1596,6 @@ class SilvetonSamplerView(
     private fun globalStep(i: Int): Float = when (i) { 1, 8, 9, 10, 11 -> 1f; else -> 0.1f }
     private fun globalTravel(i: Int): Float = when (i) {
         0 -> 400f; 1 -> 480f; 2 -> 390f; 3, 4, 5 -> 360f; 7 -> 240f; 8 -> 160f; else -> 508f
-    }
-
-    private fun editPortaBalance() {
-        showNumber("PORTA BALANCE", sampler.portaBalance().toFloat(), 3f, 40f, 0) {
-            sampler.setPortaBalance(round(it).toInt())
-            invalidate()
-        }
     }
 
     private fun editGlobal(i: Int, g: SamplerAppController.GlobalUiState) {

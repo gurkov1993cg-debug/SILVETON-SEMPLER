@@ -405,33 +405,54 @@ struct Biquad {
     }
 };
 
+// SILVETON_FX_V2: DELAY with TIME changes that glide instead of clicking and a
+// TONE low-pass in the repeats (1 = bright, 0 = dark).
 struct DelayFx {
     static constexpr std::size_t kMaxFrames = 192000U * 3U;
     std::array<float, kMaxFrames> left{};
     std::array<float, kMaxFrames> right{};
     std::size_t write{0U};
     double sampleRate{48000.0};
+    double currentDelay{-1.0};
+    double timeSmooth{0.0};
+    float toneL{0.0F}, toneR{0.0F};
 
     void reset(double sr) noexcept {
         sampleRate = sr;
         std::fill(left.begin(), left.end(), 0.0F);
         std::fill(right.begin(), right.end(), 0.0F);
         write = 0U;
+        currentDelay = -1.0;
+        timeSmooth = 1.0 - std::exp(-1.0 / (0.060 * std::max(1.0, sr)));
+        toneL = toneR = 0.0F;
+    }
+
+    float tap(const std::array<float, kMaxFrames>& b, double delayFrames) const noexcept {
+        double rp = static_cast<double>(write) - delayFrames;
+        while (rp < 0.0) rp += static_cast<double>(kMaxFrames);
+        const auto i0 = static_cast<std::size_t>(rp) % kMaxFrames;
+        const auto i1 = (i0 + 1U) % kMaxFrames;
+        const float frac = static_cast<float>(rp - std::floor(rp));
+        return b[i0] + (b[i1] - b[i0]) * frac;
     }
 
     void process(float inL, float inR, const EffectSlot& p, float& wetL, float& wetR) noexcept {
         const double ms = std::clamp(static_cast<double>(p.timeMs), 1.0, 2500.0);
-        const std::size_t delayFrames = std::min<std::size_t>(kMaxFrames - 1U,
-            static_cast<std::size_t>(std::max(1.0, std::round(sampleRate * ms / 1000.0))));
-        const std::size_t read = (write + kMaxFrames - delayFrames) % kMaxFrames;
-        const float dl = left[read];
-        const float dr = right[read];
+        const double target = std::clamp(sampleRate * ms / 1000.0, 1.0, static_cast<double>(kMaxFrames - 2U));
+        if (currentDelay < 0.0) currentDelay = target;
+        else currentDelay += (target - currentDelay) * timeSmooth;
+        const float dl = tap(left, currentDelay);
+        const float dr = tap(right, currentDelay);
+        const float t = std::clamp(p.tone, 0.0F, 1.0F);
+        const float a = 0.08F + 0.92F * t * t;
+        toneL += (dl - toneL) * a;
+        toneR += (dr - toneR) * a;
         const float fb = std::clamp(p.feedback, 0.0F, 0.95F);
-        left[write] = inL + dl * fb;
-        right[write] = inR + dr * fb;
+        left[write] = inL + toneL * fb;
+        right[write] = inR + toneR * fb;
         write = (write + 1U) % kMaxFrames;
-        wetL = dl;
-        wetR = dr;
+        wetL = toneL;
+        wetR = toneR;
     }
 };
 
@@ -475,50 +496,146 @@ struct ChorusFx {
     }
 };
 
-struct ReverbFx {
-    // Compact Schroeder network. Fixed arrays: no allocations in audio callback.
-    std::array<float, 4096U> c1L{}, c1R{};
-    std::array<float, 4608U> c2L{}, c2R{};
-    std::array<float, 5120U> c3L{}, c3R{};
-    std::array<float, 5632U> c4L{}, c4R{};
-    std::array<std::size_t, 4U> pos{{0U,0U,0U,0U}};
-    float dampL1{0.0F}, dampR1{0.0F}, dampL2{0.0F}, dampR2{0.0F};
+// SILVETON_FX_V2: studio plate REVERB (J. Dattorro, "Effect Design Part 1", 1997):
+// four input diffusers and a modulated figure-eight tank, stereo output taps.
+// DECAY (the FEEDBACK value 0..0.95) = reverb time 0.6..12 s, TONE = brightness.
+// Fixed arrays sized for up to 192 kHz: no allocation in the audio thread.
+float reverbSecondsFor(float feedback) noexcept {
+    const float v = std::clamp(feedback, 0.0F, 0.95F) / 0.95F;
+    return 0.6F * std::pow(20.0F, v);
+}
 
-    void reset(double) noexcept {
-        c1L.fill(0.0F); c1R.fill(0.0F); c2L.fill(0.0F); c2R.fill(0.0F);
-        c3L.fill(0.0F); c3R.fill(0.0F); c4L.fill(0.0F); c4R.fill(0.0F);
-        pos = {{0U,0U,0U,0U}};
-        dampL1 = dampR1 = dampL2 = dampR2 = 0.0F;
+template <std::size_t N>
+struct FxLine {
+    std::array<float, N> buf{};
+    std::size_t w{0U};
+    void clear() noexcept { buf.fill(0.0F); w = 0U; }
+    // Sample pushed d samples ago (d = 1 is the newest), d < N.
+    [[nodiscard]] float at(std::size_t d) const noexcept { return buf[(w + N - d) % N]; }
+    [[nodiscard]] float atFrac(double d) const noexcept {
+        const auto di = static_cast<std::size_t>(d);
+        const float frac = static_cast<float>(d - static_cast<double>(di));
+        const float a = at(di);
+        const float b = at(di + 1U);
+        return a + (b - a) * frac;
+    }
+    void push(float v) noexcept { buf[w] = v; w = (w + 1U) % N; }
+};
+
+struct ReverbFx {
+    static constexpr double kBaseRate = 29761.0;
+    FxLine<2048U> pre{};
+    FxLine<1024U> in1{}, in2{};
+    FxLine<2560U> in3{};
+    FxLine<2048U> in4{};
+    FxLine<4608U> modL{};
+    FxLine<28800U> delL1{};
+    FxLine<11776U> apL{};
+    FxLine<24064U> delL2{};
+    FxLine<6016U> modR{};
+    FxLine<27264U> delR1{};
+    FxLine<17152U> apR{};
+    FxLine<20480U> delR2{};
+    std::size_t lPre{1U}, l1{1U}, l2{1U}, l3{1U}, l4{1U};
+    std::size_t lDelL1{1U}, lApL{1U}, lDelL2{1U}, lDelR1{1U}, lApR{1U}, lDelR2{1U};
+    double lModL{1.0}, lModR{1.0}, excursion{1.0};
+    std::array<std::size_t, 14U> tapsAt{};
+    double scale{1.0};
+    double lfoPhase{0.0}, lfoStep{0.0};
+    float bandwidthState{0.0F}, dampL{0.0F}, dampR{0.0F};
+    float feedL{0.0F}, feedR{0.0F};
+
+    std::size_t sc(double base, std::size_t cap) const noexcept {
+        return std::clamp<std::size_t>(static_cast<std::size_t>(std::lround(base * scale)), 1U, cap - 3U);
     }
 
-    template<std::size_t N>
-    static float comb(std::array<float,N>& b, std::size_t& p, float x, float feedback, float tone, float& damp) noexcept {
-        const float y = b[p];
-        damp += (y - damp) * std::clamp(tone, 0.05F, 0.95F);
-        b[p] = x + damp * feedback;
-        p = (p + 1U) % N;
-        return y;
+    void reset(double sr) noexcept {
+        scale = std::clamp(std::max(1.0, sr) / kBaseRate, 0.5, 192000.0 / kBaseRate);
+        pre.clear(); in1.clear(); in2.clear(); in3.clear(); in4.clear();
+        modL.clear(); delL1.clear(); apL.clear(); delL2.clear();
+        modR.clear(); delR1.clear(); apR.clear(); delR2.clear();
+        lPre = sc(0.010 * kBaseRate, 2048U);
+        l1 = sc(142.0, 1024U); l2 = sc(107.0, 1024U); l3 = sc(379.0, 2560U); l4 = sc(277.0, 2048U);
+        excursion = 16.0 * scale;
+        lModL = 672.0 * scale;
+        lModR = 908.0 * scale;
+        lDelL1 = sc(4453.0, 28800U); lApL = sc(1800.0, 11776U); lDelL2 = sc(3720.0, 24064U);
+        lDelR1 = sc(4217.0, 27264U); lApR = sc(2656.0, 17152U); lDelR2 = sc(3163.0, 20480U);
+        const std::array<double, 14U> taps{{266.0, 2974.0, 1913.0, 1996.0, 1990.0, 187.0, 1066.0,
+                                            353.0, 3627.0, 1228.0, 2673.0, 2111.0, 335.0, 121.0}};
+        for (std::size_t i = 0; i < taps.size(); ++i) {
+            tapsAt[i] = std::max<std::size_t>(1U, static_cast<std::size_t>(std::lround(taps[i] * scale)));
+        }
+        lfoPhase = 0.0;
+        lfoStep = 2.0 * kPi * 0.9 / std::max(1.0, sr);
+        bandwidthState = dampL = dampR = feedL = feedR = 0.0F;
+    }
+
+    template <std::size_t N>
+    static float allpass(FxLine<N>& line, std::size_t len, float x, float g) noexcept {
+        const float d = line.at(len);
+        const float v = x - g * d;
+        line.push(v);
+        return d + g * v;
+    }
+
+    template <std::size_t N>
+    static float allpassMod(FxLine<N>& line, double len, float x, float g) noexcept {
+        const float d = line.atFrac(len);
+        const float v = x - g * d;
+        line.push(v);
+        return d + g * v;
+    }
+
+    template <std::size_t N>
+    static float delay(FxLine<N>& line, std::size_t len, float x) noexcept {
+        const float d = line.at(len);
+        line.push(x);
+        return d;
     }
 
     void process(float inL, float inR, const EffectSlot& p, float& wetL, float& wetR) noexcept {
-        const float fb = std::clamp(0.55F + p.feedback * 0.35F, 0.4F, 0.92F);
-        const float tone = 0.02F + std::clamp(p.tone, 0.0F, 1.0F) * 0.25F;
-        const float mono = (inL + inR) * 0.35F;
-        const float aL = comb(c1L, pos[0], mono, fb, tone, dampL1);
-        const float aR = comb(c1R, pos[0], mono, fb * 0.997F, tone, dampR1);
-        const float bL = comb(c2L, pos[1], mono, fb * 0.989F, tone, dampL2);
-        const float bR = comb(c2R, pos[1], mono, fb * 0.983F, tone, dampR2);
-        // The remaining two taps are written/read manually so their positions are independent.
-        float cL = c3L[pos[2]], cR = c3R[pos[2]];
-        c3L[pos[2]] = mono + cL * (fb * 0.971F);
-        c3R[pos[2]] = mono + cR * (fb * 0.967F);
-        pos[2] = (pos[2] + 1U) % c3L.size();
-        float dL = c4L[pos[3]], dR = c4R[pos[3]];
-        c4L[pos[3]] = mono + dL * (fb * 0.959F);
-        c4R[pos[3]] = mono + dR * (fb * 0.953F);
-        pos[3] = (pos[3] + 1U) % c4L.size();
-        wetL = 0.25F * (aL + bL + cL + dL);
-        wetR = 0.25F * (aR + bR + cR + dR);
+        const float seconds = reverbSecondsFor(p.feedback);
+        // Tank gain per trip for this reverb time (measured T30, any sample rate).
+        const float decay = std::clamp(std::pow(10.0F, -0.571F / seconds), 0.0F, 0.95F);
+        const float tone = std::clamp(p.tone, 0.0F, 1.0F);
+        const float damping = 0.0005F + (1.0F - tone) * 0.70F;
+
+        float x = delay(pre, lPre, (inL + inR) * 0.5F);
+        bandwidthState += (x - bandwidthState) * 0.9995F;
+        x = allpass(in1, l1, bandwidthState, 0.75F);
+        x = allpass(in2, l2, x, 0.75F);
+        x = allpass(in3, l3, x, 0.625F);
+        x = allpass(in4, l4, x, 0.625F);
+
+        lfoPhase += lfoStep;
+        if (lfoPhase > 2.0 * kPi) lfoPhase -= 2.0 * kPi;
+        const double modA = excursion * (0.5 + 0.5 * std::sin(lfoPhase));
+        const double modB = excursion * (0.5 + 0.5 * std::cos(lfoPhase));
+
+        // left half of the tank (fed by the right half)
+        float a = x + decay * feedR;
+        a = allpassMod(modL, lModL + modA, a, -0.70F);
+        a = delay(delL1, lDelL1, a);
+        dampL = a * (1.0F - damping) + dampL * damping;
+        a = allpass(apL, lApL, dampL * decay, 0.50F);
+        const float outLeftHalf = delay(delL2, lDelL2, a);
+
+        // right half of the tank (fed by the left half)
+        float b = x + decay * feedL;
+        b = allpassMod(modR, lModR + modB, b, -0.70F);
+        b = delay(delR1, lDelR1, b);
+        dampR = b * (1.0F - damping) + dampR * damping;
+        b = allpass(apR, lApR, dampR * decay, 0.50F);
+        const float outRightHalf = delay(delR2, lDelR2, b);
+
+        feedL = outLeftHalf;
+        feedR = outRightHalf;
+
+        wetL = 1.2F * (delR1.at(tapsAt[0]) + delR1.at(tapsAt[1]) - apR.at(tapsAt[2]) + delR2.at(tapsAt[3])
+                       - delL1.at(tapsAt[4]) - apL.at(tapsAt[5]) - delL2.at(tapsAt[6]));
+        wetR = 1.2F * (delL1.at(tapsAt[7]) + delL1.at(tapsAt[8]) - apL.at(tapsAt[9]) + delL2.at(tapsAt[10])
+                       - delR1.at(tapsAt[11]) - apR.at(tapsAt[12]) - delR2.at(tapsAt[13]));
     }
 };
 
@@ -548,6 +665,49 @@ void RealtimeEventQueue::clear() noexcept {
     read_.store(write_.load(std::memory_order_acquire), std::memory_order_release);
 }
 
+// SILVETON_SMOOTH_LIMITER_V1: look-ahead brickwall limiter.
+// The signal is delayed by kLook-1 samples (0.49 ms at 96 kHz). The gain is the
+// lowest gain needed in the next kLook samples, released slowly, then smoothed by
+// a kLook-sample average, so it starts to fall before a peak arrives and never
+// cuts the waveform: the peak is at most the ceiling, without clipping distortion.
+struct SmoothLimiter {
+    static constexpr std::size_t kLook = 48U;
+    std::array<float, kLook> needGain{};
+    std::array<float, kLook> released{};
+    std::array<float, kLook> delayL{};
+    std::array<float, kLook> delayR{};
+    std::size_t pos{0U};
+    float releaseGain{1.0F};
+    double sum{static_cast<double>(kLook)};
+    float releaseCoef{0.0F};
+
+    void reset(double sr) noexcept {
+        needGain.fill(1.0F); released.fill(1.0F); delayL.fill(0.0F); delayR.fill(0.0F);
+        pos = 0U; releaseGain = 1.0F; sum = static_cast<double>(kLook);
+        releaseCoef = static_cast<float>(1.0 - std::exp(-1.0 / (0.080 * std::max(1.0, sr))));
+    }
+
+    // Returns the gain that was applied (for the meter).
+    float process(float& l, float& r, float ceiling) noexcept {
+        const float peak = std::max(std::abs(l), std::abs(r));
+        needGain[pos] = (peak > ceiling && peak > 0.0F) ? ceiling / peak : 1.0F;
+        float m = 1.0F;
+        for (std::size_t k = 0; k < kLook; ++k) m = std::min(m, needGain[k]);
+        releaseGain = (m < releaseGain) ? m : releaseGain + (m - releaseGain) * releaseCoef;
+        sum += static_cast<double>(releaseGain) - static_cast<double>(released[pos]);
+        released[pos] = releaseGain;
+        float g = static_cast<float>(sum / static_cast<double>(kLook));
+        // Rounding guard: never above the gain this delayed sample needs.
+        const std::size_t outPos = (pos + 1U) % kLook;   // the sample kLook-1 steps back
+        g = std::min(g, needGain[outPos]);
+        const float dl = delayL[outPos], dr = delayR[outPos];
+        delayL[pos] = l; delayR[pos] = r;
+        pos = outPos;
+        l = dl * g; r = dr * g;
+        return g;
+    }
+};
+
 struct SamplerEngine::Impl {
     struct ChannelState {
         float expression{1.0F};
@@ -574,6 +734,7 @@ struct SamplerEngine::Impl {
         const SampleZone* zone{nullptr};
         const UpperPart* upper{nullptr};
         double position{0.0};
+        bool loopWrapped{false}; // SILVETON_STUDIO_INTERP_V1: passed the loop end at least once
         double ratio{1.0};
         double targetRatio{1.0};
         double glideLogStep{0.0};
@@ -622,16 +783,13 @@ struct SamplerEngine::Impl {
         std::uint8_t count{0U};
     };
     std::array<MonoKeys, kUpperCount> mono{};
-    // PORTAMENTO like the SILVETON keyboard processor: the key each Upper last
-    // started (-1 = none, the next note does not glide) and the Sound it belongs to.
-    std::array<int, kUpperCount> portaLastKey{{-1, -1, -1, -1, -1, -1, -1}};
-    std::array<const Program*, kUpperCount> portaProgram{};
     std::array<bool, kUpperCount> monoWas{};
     std::atomic<float> portaBalance{11.0F};
     std::uint64_t voiceAge{0U};
     float peakL{0.0F};
     float peakR{0.0F};
     float limiterGrDb{0.0F};
+    SmoothLimiter limiter{};
     std::array<float, kUpperCount> upperPeakL{};
     std::array<float, kUpperCount> upperPeakR{};
     std::array<std::uint16_t, kUpperCount> upperRouteMask{};
@@ -643,9 +801,10 @@ struct SamplerEngine::Impl {
     static constexpr std::uint32_t kRenderChunk = 256U;
     std::array<std::array<float, kRenderChunk>, kUpperCount> chunkL{};
     std::array<std::array<float, kRenderChunk>, kUpperCount> chunkR{};
-    DelayFx delay{};
-    ChorusFx chorus{};
-    ReverbFx reverb{};
+    // One effect engine per FX slot, so FX1 and FX2 of the same type do not share state.
+    std::array<DelayFx, 2U> delay{};
+    std::array<ChorusFx, 2U> chorus{};
+    std::array<ReverbFx, 2U> reverb{};
 
     // Read-ahead windows for SampleStreamPrefetcher (one seqlock per slot).
     struct WindowSlot {
@@ -675,20 +834,19 @@ struct SamplerEngine::Impl {
         sampleRate = sr;
         voiceAge = 0U;
         peakL = peakR = limiterGrDb = 0.0F;
+        limiter.reset(sr);
         upperPeakL.fill(0.0F);
         upperPeakR.fill(0.0F);
         upperRouteMask.fill(0U);
         for (auto& c : channels) c = ChannelState{};
         for (auto& m : mono) m = MonoKeys{};
-        portaLastKey.fill(-1);
-        portaProgram.fill(nullptr);
         monoWas.fill(false);
         for (auto& v : voices) v = Voice{};
         lowEq.reset(); midEq.reset(); highEq.reset();
         for (auto& q : upperLowEq) q.reset();
         for (auto& q : upperMidEq) q.reset();
         for (auto& q : upperHighEq) q.reset();
-        delay.reset(sr); chorus.reset(sr); reverb.reset(sr);
+        for (std::size_t k = 0; k < 2U; ++k) { delay[k].reset(sr); chorus[k].reset(sr); reverb[k].reset(sr); }
         clearWindows();
     }
 };
@@ -700,7 +858,7 @@ UpperToneValues effectiveUpperTone(const UpperPart& upper) noexcept {
 }
 
 SamplerEngine::SamplerEngine()
-    : impl_(std::make_unique<Impl>()), state_(std::make_shared<EngineState>()), interpolator_(InterpolationQuality::LiveCubic4) {
+    : impl_(std::make_unique<Impl>()), state_(std::make_shared<EngineState>()), interpolator_(InterpolationQuality::Studio) { // SILVETON_STUDIO_INTERP_V1
     prepare(48000.0, 512U);
 }
 SamplerEngine::~SamplerEngine() = default;
@@ -884,6 +1042,7 @@ void startVoice(SamplerEngine::Impl& impl,
     v.zone = &zone;
     v.upper = &upper;
     v.position = zone.reverse && zone.sample != nullptr ? static_cast<double>(zone.sample->frameCount() - 1U) : 0.0;
+    v.loopWrapped = false;
 
     v.ratio = noteRatio(impl, upper, layer, zone, key, global);
     v.targetRatio = v.ratio;
@@ -1017,7 +1176,6 @@ void panic(SamplerEngine::Impl& impl) noexcept {
     }
     for (auto& c : impl.channels) c = SamplerEngine::Impl::ChannelState{};
     for (auto& m : impl.mono) m = SamplerEngine::Impl::MonoKeys{};
-    impl.portaLastKey.fill(-1);
 }
 
 constexpr float kLegatoCrossfadeSec = 0.030F; // equal-power, only between two different recordings
@@ -1033,58 +1191,20 @@ void monoPush(SamplerEngine::Impl::MonoKeys& m, std::uint8_t key, std::uint8_t v
     m.key[m.count] = key; m.vel[m.count] = vel; ++m.count;
 }
 
-// SILVETON_PORTA_PROCESSOR_V2 - PORTAMENTO exactly like the SILVETON keyboard
-// processor (SILVETON LIVE MIDI):
-//  * TIME portamento: every interval takes exactly the same time (TIME 1..100 ms),
-//    the pitch moves evenly in semitones.
-//  * Automatic MONO: while portamento is ON an Upper plays one line (last key
-//    wins, releasing it goes back to a key that is still held) - a POLY Upper
-//    becomes MONO, MONO / LEGATO stay as they are.
-//  * It glides from the last note of that Upper, also when the key was already
-//    released (from the pitch that is sounding if a note still sounds).
-//  * It starts fresh when the Upper gets another Sound or portamento was OFF.
+// SILVETON_PORTA_PAGE_V1 - PORTAMENTO exactly like the SILVETON portamento page
+// (Silveton-Portamento-Keys): while portamento is ON an Upper plays one line
+// (last key wins, letting it go returns to a key that is still held).
+//  * While a key is held the line is ONE continuous sound: a new key, or going
+//    back to a held key, is not struck again - the pitch glides from the pitch
+//    sounding right now (also part-way through a glide) to the new key in
+//    exactly TIME (1..100 ms), evenly in semitones, the same time for every interval.
+//  * With no key held the next note is struck normally and does not glide.
+//  * The note that already sounds, pressed again, changes nothing.
+// (PORTA BALANCE only chose the CC#5 number sent to a PA600; it never changes the sound.)
 constexpr float kPortamentoMaxSec = 0.100F;
 
 float portamentoSecFor(const UpperPart& upper) noexcept {
     return std::clamp(upper.portamentoSec, 0.0F, kPortamentoMaxSec);
-}
-
-// The processor's KorgGlideModel (manual model, a = 0): CC#5 points every 4
-// steps 4..124 with b(cc) = 0.2 * 2^(cc / BAL) ms per semitone, linear between
-// points, linear from cc 0 (instant) to the first point, flat after the last.
-double korgGlideTimeMs(int cc, double interval, double balance) noexcept {
-    if (cc <= 0) return 0.0;
-    const auto pointMs = [&](int pcc) { return std::max(0.0, 0.2 * std::pow(2.0, pcc / balance) * interval); };
-    if (cc <= 4) return pointMs(4) * static_cast<double>(cc) / 4.0;
-    if (cc >= 124) return pointMs(124);
-    const int lo = (cc / 4) * 4;
-    if (lo == cc) return pointMs(cc);
-    const double f = static_cast<double>(cc - lo) / 4.0;
-    return pointMs(lo) + (pointMs(lo + 4) - pointMs(lo)) * f;
-}
-
-// The processor's ccFor(): the CC#5 that makes THIS interval last timeMs.
-int korgCcFor(double interval, double timeMs, double balance) noexcept {
-    if (timeMs <= 0.0 || interval <= 0.0) return 0;
-    int lo = 0, hi = 127;
-    if (korgGlideTimeMs(hi, interval, balance) <= timeMs) return 127;
-    while (hi - lo > 1) {
-        const int mid = (lo + hi) / 2;
-        if (korgGlideTimeMs(mid, interval, balance) < timeMs) lo = mid; else hi = mid;
-    }
-    const double dlo = std::abs(korgGlideTimeMs(lo, interval, balance) - timeMs);
-    const double dhi = std::abs(korgGlideTimeMs(hi, interval, balance) - timeMs);
-    return dlo <= dhi ? lo : hi;
-}
-
-// Glide time exactly as the processor + PA600 make it: the processor picks the
-// CC#5 with PORTA BALANCE, the PA600's own portamento (its model at 11) then
-// plays that CC#5 for this interval. BALANCE 11 = the same time for every interval.
-float processorGlideSec(float timeSec, int interval, float balance) noexcept {
-    if (timeSec <= 0.0F || interval <= 0) return 0.0F;
-    const double bal = std::clamp(static_cast<double>(balance), 3.0, 40.0);
-    const int cc = korgCcFor(static_cast<double>(interval), static_cast<double>(timeSec) * 1000.0, bal);
-    return static_cast<float>(korgGlideTimeMs(cc, static_cast<double>(interval), 11.0) / 1000.0);
 }
 
 UpperVoiceMode effectiveVoiceMode(const UpperPart& upper) noexcept {
@@ -1102,23 +1222,6 @@ UpperVoiceMode voiceModeNow(SamplerEngine::Impl& impl, int ui, const UpperPart& 
         was = mono;
     }
     return mode;
-}
-
-// Pitch (in keys) the Upper glides from: the pitch a MONO/LEGATO Upper is
-// sounding right now (also part-way through a glide), otherwise the last key.
-double portamentoFromKey(const SamplerEngine::Impl& impl, int ui, bool mono) noexcept {
-    if (impl.portaLastKey[static_cast<std::size_t>(ui)] < 0) return -1.0; // first note: no glide
-    if (mono) {
-        const SamplerEngine::Impl::Voice* newest = nullptr;
-        for (const auto& v : impl.voices) {
-            if (!v.active || v.fading || v.upperIndex != ui || v.ratio <= 0.0 || v.targetRatio <= 0.0) continue;
-            if (newest == nullptr || v.age > newest->age) newest = &v;
-        }
-        if (newest != nullptr) {
-            return static_cast<double>(newest->key) + 12.0 * std::log2(newest->ratio / newest->targetRatio);
-        }
-    }
-    return static_cast<double>(impl.portaLastKey[static_cast<std::size_t>(ui)]);
 }
 
 void startPortamentoGlide(const SamplerEngine::Impl& impl, SamplerEngine::Impl::Voice& v, double fromKey, float seconds) noexcept {
@@ -1163,16 +1266,9 @@ void playUpperNote(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
     const bool upperLegato = mode == UpperVoiceMode::Legato;
     bool hadHeldVoice = false;
     float previousAmp = 0.0F;
-    const float portaSec = portamentoSecFor(upper);
-    auto& portaLast = impl.portaLastKey[static_cast<std::size_t>(ui)];
-    auto& portaProgram = impl.portaProgram[static_cast<std::size_t>(ui)];
-    if (portaSec <= 0.0F || portaProgram != upper.program.get()) portaLast = -1; // OFF or another Sound: start fresh
-    portaProgram = upper.program.get();
-    const double glideFromKey = portaSec > 0.0F ? portamentoFromKey(impl, ui, upperMono) : -1.0;
-    // Like the processor: the glide time comes from the interval to the last note.
-    const float glideSec = (glideFromKey >= 0.0 && portaLast >= 0)
-        ? processorGlideSec(portaSec, std::abs(static_cast<int>(key) - portaLast), impl.portaBalance.load(std::memory_order_relaxed))
-        : 0.0F;
+    // Portamento ON is played by playPortamentoNote(); here the Upper does not glide.
+    const double glideFromKey = -1.0;
+    const float glideSec = 0.0F;
     if (upperMono) {
         for (auto& existing : impl.voices) {
             if (!existing.active || existing.fading || existing.upperIndex != ui) continue;
@@ -1239,7 +1335,74 @@ void playUpperNote(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
         }
     }
     if (upperMono) for (auto& existing : impl.voices) if (existing.upperIndex == ui) existing.legatoKeep = false;
-    if (portaSec > 0.0F) portaLast = static_cast<int>(key);
+}
+
+// SILVETON_PORTA_PAGE_V1: one note of an Upper whose portamento is ON.
+// keyWasHeld = another key of this Upper was held before this note;
+// previousKey = that key (used only if its recording already ended).
+void playPortamentoNote(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineState>& stateOwner, int ui,
+                        const UpperPart& upper, std::uint8_t channel, std::uint8_t key, std::uint8_t velocity,
+                        bool keyWasHeld, int previousKey) noexcept {
+    if (upper.program == nullptr) return;
+    const auto& global = stateOwner->global;
+    const auto& program = *upper.program;
+    const float glideSec = portamentoSecFor(upper);
+    SamplerEngine::Impl::Voice* sounding = nullptr;   // the voice of the held line
+    for (auto& v : impl.voices) {
+        if (!v.active || v.fading || v.upperIndex != ui || !v.keyHeld || v.delayFramesRemaining > 0U) continue;
+        if (sounding == nullptr || v.age > sounding->age) sounding = &v;
+    }
+    if (!keyWasHeld || sounding == nullptr) {
+        // Nothing held: struck normally, no glide (a held line whose recording
+        // already ended starts again and glides from the previous key).
+        const double fromKey = (keyWasHeld && previousKey >= 0) ? static_cast<double>(previousKey) : -1.0;
+        for (const auto& layer : program.layers) {
+            if (!layer.matches(key, velocity)) continue;
+            for (const auto& zone : layer.multisample->zones) {
+                if (!zone.matches(key, velocity) || !zone.sample->valid()) continue;
+                auto* v = chooseVoice(impl);
+                startVoice(impl, *v, upper, layer, zone, ui, channel, key, velocity, global, stateOwner);
+                v->mono = true;
+                startPortamentoGlide(impl, *v, fromKey, glideSec);
+            }
+        }
+        return;
+    }
+    // A key is held: one continuous sound glides to the new key in exactly TIME.
+    const double fromPitch = static_cast<double>(sounding->key) + 12.0 * std::log2(sounding->ratio / sounding->targetRatio);
+    const float previousAmp = sounding->ampEnv.value;
+    for (auto& v : impl.voices) if (v.upperIndex == ui) v.legatoKeep = false;
+    for (const auto& layer : program.layers) {
+        if (!layer.matches(key, velocity)) continue;
+        for (const auto& zone : layer.multisample->zones) {
+            if (!zone.matches(key, velocity) || !zone.sample->valid()) continue;
+            SamplerEngine::Impl::Voice* keep = nullptr;
+            for (auto& v : impl.voices) {
+                if (v.active && !v.fading && v.upperIndex == ui && v.keyHeld && v.delayFramesRemaining == 0U &&
+                    !v.legatoKeep && v.layer == &layer && v.zone == &zone) { keep = &v; break; }
+            }
+            if (keep != nullptr) {
+                // the same recording keeps sounding and only moves its pitch
+                legatoTo(impl, *keep, upper, layer, zone, key, global, glideSec);
+                keep->legatoKeep = true;
+                continue;
+            }
+            // another recording takes over without a new strike and glides from the pitch that sounded
+            auto* v = chooseVoice(impl);
+            startVoice(impl, *v, upper, layer, zone, ui, channel, key, velocity, global, stateOwner);
+            v->mono = true;
+            startPortamentoGlide(impl, *v, fromPitch, glideSec);
+            v->ampEnv.value = previousAmp;
+            v->ampEnv.stage = AmpEnv::Stage::Decay;
+            v->fadeGain = 0.0F;
+            v->fadeStep = 1.0F / static_cast<float>(std::max(1.0, static_cast<double>(kLegatoCrossfadeSec) * impl.sampleRate));
+            v->legatoKeep = true;
+        }
+    }
+    for (auto& v : impl.voices) {
+        if (v.active && !v.fading && v.upperIndex == ui && v.keyHeld && !v.legatoKeep) softKill(impl, v, kLegatoCrossfadeSec);
+    }
+    for (auto& v : impl.voices) if (v.upperIndex == ui) v.legatoKeep = false;
 }
 
 void handleNoteOff(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineState>& stateOwner,
@@ -1258,7 +1421,11 @@ void handleNoteOff(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
         if (!wasTop) continue; // a lower held key was let go: the sound goes on
         if (mk.count > 0U && upper.program != nullptr) {
             // back to the key that is still held
-            playUpperNote(impl, stateOwner, ui, upper, channel, mk.key[mk.count - 1U], mk.vel[mk.count - 1U]);
+            if (portamentoSecFor(upper) > 0.0F) {
+                playPortamentoNote(impl, stateOwner, ui, upper, channel, mk.key[mk.count - 1U], mk.vel[mk.count - 1U], true, static_cast<int>(key));
+            } else {
+                playUpperNote(impl, stateOwner, ui, upper, channel, mk.key[mk.count - 1U], mk.vel[mk.count - 1U]);
+            }
         } else {
             releaseUpperVoices(impl, ui, channel);
         }
@@ -1282,7 +1449,19 @@ void processEvent(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineS
                 if (upper.midiChannel != (e.channel & 0x0FU)) continue;
                 if (anySolo && !upper.solo) continue;
                 if (!upper.matches(e.data1, e.data2)) continue;
-                if (voiceModeNow(impl, ui, upper) != UpperVoiceMode::Poly) monoPush(impl.mono[static_cast<std::size_t>(ui)], e.data1, e.data2);
+                if (voiceModeNow(impl, ui, upper) != UpperVoiceMode::Poly) {
+                    auto& mk = impl.mono[static_cast<std::size_t>(ui)];
+                    const bool keyWasHeld = mk.count > 0U;
+                    const int previousKey = keyWasHeld ? static_cast<int>(mk.key[mk.count - 1U]) : -1;
+                    monoPush(mk, e.data1, e.data2);
+                    if (portamentoSecFor(upper) > 0.0F) {
+                        // SILVETON_PORTA_PAGE_V1: the note that already sounds changes nothing
+                        if (previousKey != static_cast<int>(e.data1)) {
+                            playPortamentoNote(impl, stateOwner, ui, upper, e.channel, e.data1, e.data2, keyWasHeld, previousKey);
+                        }
+                        continue;
+                    }
+                }
                 playUpperNote(impl, stateOwner, ui, upper, e.channel, e.data1, e.data2);
             }
             break;
@@ -1297,7 +1476,6 @@ void processEvent(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineS
                 for (int ui = 0; ui < kUpperCount; ++ui) {
                     if (state.combi.uppers[static_cast<std::size_t>(ui)].midiChannel == (e.channel & 0x0FU)) {
                         impl.mono[static_cast<std::size_t>(ui)] = SamplerEngine::Impl::MonoKeys{};
-                        impl.portaLastKey[static_cast<std::size_t>(ui)] = -1; // like the processor: CC120/123 forget the last note
                     }
                 }
                 break;
@@ -1625,7 +1803,12 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
             }
 
             float sL = 0.0F, sR = 0.0F;
-            readWithLoopCrossfade(interpolator_, sample, v.position, ratio, looping, sL, sR);
+            // After the first pass through the loop, the frames just before the loop
+            // start are the loop END (that is what was heard), not the attack: read
+            // one loop length later so the interpolator takes the loop-end history.
+            double readPos = v.position;
+            if (v.loopWrapped && looping && loopLen > 0.0 && readPos < loopStart + 64.0) readPos += loopLen;
+            readWithLoopCrossfade(interpolator_, sample, readPos, ratio, looping, sL, sR);
 
             if (filterActive) {
                 float cutoff = staticFilterCutoff;
@@ -1667,7 +1850,7 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
 
             if (reverse) v.position -= ratio; else v.position += ratio;
             if (!reverse && looping && v.position >= loopEnd) {
-                if (loopLen > 0.0) v.position = loopStart + std::fmod(v.position - loopStart, loopLen);
+                if (loopLen > 0.0) { v.position = loopStart + std::fmod(v.position - loopStart, loopLen); v.loopWrapped = true; }
             }
             if (reverse && v.position < 0.0) { v.ampEnv.forceOff(); v.active = false; break; }
             else if (!looping && v.position >= sampleEnd) { v.ampEnv.forceOff(); v.active = false; break; }
@@ -1712,20 +1895,20 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
         }
 
         float fx1L = 0.0F, fx1R = 0.0F, fx2L = 0.0F, fx2R = 0.0F;
-        const auto processFx = [&](const EffectSlot& fx, float inL, float inR, float& wetL, float& wetR) noexcept {
+        const auto processFx = [&](std::size_t slot, const EffectSlot& fx, float inL, float inR, float& wetL, float& wetR) noexcept {
             switch (fx.type) {
                 case EffectType::Off: wetL = wetR = 0.0F; break;
-                case EffectType::Delay: impl_->delay.process(inL, inR, fx, wetL, wetR); break;
-                case EffectType::Chorus: impl_->chorus.process(inL, inR, fx, wetL, wetR); break;
-                case EffectType::Reverb: impl_->reverb.process(inL, inR, fx, wetL, wetR); break;
+                case EffectType::Delay: impl_->delay[slot].process(inL, inR, fx, wetL, wetR); break;
+                case EffectType::Chorus: impl_->chorus[slot].process(inL, inR, fx, wetL, wetR); break;
+                case EffectType::Reverb: impl_->reverb[slot].process(inL, inR, fx, wetL, wetR); break;
             }
         };
-        processFx(current->combi.fx1, send1L, send1R, fx1L, fx1R);
+        processFx(0U, current->combi.fx1, send1L, send1R, fx1L, fx1R);
         if (current->combi.fxRouting == EffectRouting::Fx1IntoFx2) {
             const float chainGain = clamp01(current->combi.fx1.wet);
-            processFx(current->combi.fx2, send2L + fx1L * chainGain, send2R + fx1R * chainGain, fx2L, fx2R);
+            processFx(1U, current->combi.fx2, send2L + fx1L * chainGain, send2R + fx1R * chainGain, fx2L, fx2R);
         } else {
-            processFx(current->combi.fx2, send2L, send2R, fx2L, fx2R);
+            processFx(1U, current->combi.fx2, send2L, send2R, fx2L, fx2R);
         }
         float l = dryL + fx1L * clamp01(current->combi.fx1.wet) + fx2L * clamp01(current->combi.fx2.wet);
         float r = dryR + fx1R * clamp01(current->combi.fx1.wet) + fx2R * clamp01(current->combi.fx2.wet);
@@ -1736,12 +1919,8 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
         l *= masterGain; r *= masterGain;
 
         if (current->global.limiterEnabled) {
-            const float absPeak = std::max(std::abs(l), std::abs(r));
-            if (absPeak > limiterCeiling && absPeak > 0.0F) {
-                const float gain = limiterCeiling / absPeak;
-                maxGr = std::max(maxGr, -gainToDb(gain));
-                l *= gain; r *= gain;
-            }
+            const float gain = impl_->limiter.process(l, r, limiterCeiling);
+            if (gain < 1.0F) maxGr = std::max(maxGr, -gainToDb(gain));
         }
         if (!std::isfinite(l)) l = 0.0F;
         if (!std::isfinite(r)) r = 0.0F;

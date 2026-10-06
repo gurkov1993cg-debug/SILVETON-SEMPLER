@@ -144,6 +144,7 @@ class NativeSamplerEngine {
     external fun nativeMoveList(fromBank: Int, fromPage: Int, fromSlot: Int, toBank: Int, toPage: Int, toSlot: Int, overwrite: Boolean): Boolean
     external fun nativeActivateListEntry(listBank: Int, listPage: Int, listSlot: Int, index: Int): Boolean
     external fun nativeActiveListEntry(listBank: Int, listPage: Int, listSlot: Int): Int
+    external fun nativeSetActiveListEntry(listBank: Int, listPage: Int, listSlot: Int, index: Int): Boolean
     external fun nativeListEntryNumbers(listBank: Int, listPage: Int, listSlot: Int): IntArray
     external fun nativeListEntryNames(listBank: Int, listPage: Int, listSlot: Int): Array<String>
     external fun nativeListEntryCombiAddresses(listBank: Int, listPage: Int, listSlot: Int): IntArray

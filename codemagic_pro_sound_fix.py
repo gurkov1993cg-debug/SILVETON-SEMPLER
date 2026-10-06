@@ -38,6 +38,14 @@
 11. Effects: FX1 / FX2 knobs now reach FX1 / FX2 (they were one slot off), FX1 and FX2 have
    their own engines, DELAY with working TONE and click-free TIME, a new studio plate REVERB
    (DECAY 0.6..12 s, TONE), and every effect shows only the knobs it really uses.
+12. Studio interpolation (live default): Kaiser-windowed sinc chosen by playback ratio
+   (24..64 points, 12 kernels per octave). 0..20 kHz flat, every image/alias that could
+   land in 0..20 kHz rejected by 110 dB or more; after the first loop pass the frames
+   before the loop start are taken from the loop end. The old 4-point cubic stays available.
+13. Smooth look-ahead limiter on MASTER (0.49 ms): the gain falls before a peak and
+   comes back in 80 ms, so loud playing is never clipped.
+14. TPDF dither before the 16-bit output: quiet tails fade smoothly, digital silence
+   stays silent.
 
 The files are complete replacements. Each one is checked against the exact generated
 file it was made from; if anything differs the build stops instead of mixing versions.
@@ -76,6 +84,14 @@ EXPECTED = [
  [
   "core/include/silveton/sampler/SamplerTypes.h",
   "c33b56f1d12c0d239d865f9bff574853df206689fe5fa163d6eab1a9cc3b39cf"
+ ],
+ [
+  "core/include/silveton/sampler/SincInterpolator.h",
+  "558a9d614599cc653f61ac9776ab38292befd651fa79e896304c697a7af3d719"
+ ],
+ [
+  "core/src/sampler/SincInterpolator.cpp",
+  "d0ec1d739fe2a342925a471c92340c6277e534e82ddb9a94e7856d1067173d9a"
  ],
  [
   "core/src/sampler/SamplerEngine.cpp",

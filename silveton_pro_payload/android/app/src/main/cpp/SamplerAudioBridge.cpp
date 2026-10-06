@@ -1159,13 +1159,18 @@ public:
         return true;
     }
 
+    // SILVETON_LIST_POSITIONS_V1: COMBI address 0/0/0 marks an empty LIST position,
+    // so a BLEND can sit at any position 1..200 like a Korg Performance.
+    static bool emptyListAddress(const SlotAddress& a) noexcept { return a.bank == 0U && a.page == 0U && a.slot == 0U; }
+
     bool setListEntry(const SlotAddress& listAddress, int index, int number, const std::string& name, const SlotAddress& combiAddress) {
         if (index < 0) { setTextError("LIST entry index is invalid"); return false; }
-        const auto combi = library_.combi(combiAddress);
-        if (!combi.has_value()) { setTextError("LIST target COMBI slot is empty"); return false; }
+        const bool empty = emptyListAddress(combiAddress);
+        const auto combi = empty ? std::optional<Combi>{} : library_.combi(combiAddress);
+        if (!empty && !combi.has_value()) { setTextError("LIST target COMBI slot is empty"); return false; }
         ListEntry entry{};
         entry.number = static_cast<std::uint16_t>(std::clamp(number, 0, 65535));
-        entry.name = name.empty() ? combi->name : name;
+        entry.name = empty ? std::string("-") : (name.empty() ? combi->name : name);
         entry.combiBank = combiAddress.bank; entry.combiPage = combiAddress.page; entry.combiSlot = combiAddress.slot;
         if (!library_.setListEntry(listAddress, static_cast<std::size_t>(index), entry)) { setTextError("LIST entry update failed"); return false; }
         setTextError({}); return true;
@@ -1173,11 +1178,12 @@ public:
 
     bool insertListEntry(const SlotAddress& listAddress, int index, int number, const std::string& name, const SlotAddress& combiAddress) {
         if (index < 0) { setTextError("LIST entry index is invalid"); return false; }
-        const auto combi = library_.combi(combiAddress);
-        if (!combi.has_value()) { setTextError("LIST target COMBI slot is empty"); return false; }
+        const bool empty = emptyListAddress(combiAddress);
+        const auto combi = empty ? std::optional<Combi>{} : library_.combi(combiAddress);
+        if (!empty && !combi.has_value()) { setTextError("LIST target COMBI slot is empty"); return false; }
         ListEntry entry{};
         entry.number = static_cast<std::uint16_t>(std::clamp(number, 0, 65535));
-        entry.name = name.empty() ? combi->name : name;
+        entry.name = empty ? std::string("-") : (name.empty() ? combi->name : name);
         entry.combiBank = combiAddress.bank; entry.combiPage = combiAddress.page; entry.combiSlot = combiAddress.slot;
         if (!library_.insertListEntry(listAddress, static_cast<std::size_t>(index), entry)) { setTextError("LIST entry insert failed"); return false; }
         if (activeListAddress_.has_value() && *activeListAddress_ == listAddress && activeListEntry_ >= index) ++activeListEntry_;
@@ -1219,6 +1225,18 @@ public:
         activeListAddress_ = listAddress;
         activeListEntry_ = index;
         setTextError({}); return true;
+    }
+
+    // Marks which LIST position the loaded sound belongs to, without reloading it.
+    bool setActiveListEntry(const SlotAddress& listAddress, int index) {
+        const auto list = library_.list(listAddress);
+        if (index < 0 || !list.has_value() || static_cast<std::size_t>(index) >= list->entries.size()) {
+            if (activeListAddress_.has_value() && *activeListAddress_ == listAddress) activeListEntry_ = -1;
+            return true;
+        }
+        activeListAddress_ = listAddress;
+        activeListEntry_ = index;
+        return true;
     }
 
     int activeListEntry(const SlotAddress& listAddress) const noexcept {
@@ -2259,9 +2277,14 @@ private:
             testInstrument_.render(renderBuffer_.data(), frames, sampleRate());
 
             const std::size_t samples = static_cast<std::size_t>(frames) * kChannels;
+            // SILVETON_TPDF_DITHER_V1: triangular dither of +-1 step before the
+            // 16-bit rounding, so quiet tails fade smoothly into a very low
+            // noise floor instead of turning grainy. Digital silence stays silent.
             for (std::size_t i = 0U; i < samples; ++i) {
                 const float clipped = std::clamp(renderBuffer_[i], -1.0F, 1.0F);
-                const long quantized = std::lrint(static_cast<double>(clipped) * 32767.0);
+                double scaled = static_cast<double>(clipped) * 32767.0;
+                if (clipped != 0.0F) scaled += ditherNext() - ditherNext();
+                const long quantized = std::lrint(scaled);
                 pcmBuffer_[i] = static_cast<std::int16_t>(
                     std::clamp<long>(quantized, -32768L, 32767L));
             }
@@ -2401,6 +2424,14 @@ private:
     std::vector<RawMidiPort> rawMidiPorts_{};
     std::vector<float> renderBuffer_{};
     std::vector<std::int16_t> pcmBuffer_{};
+    std::uint32_t ditherState_{0x9E3779B9U};
+    // Uniform 0..1 from a xorshift generator (audio thread only, no locks).
+    double ditherNext() noexcept {
+        std::uint32_t x = ditherState_;
+        x ^= x << 13U; x ^= x >> 17U; x ^= x << 5U;
+        ditherState_ = x;
+        return static_cast<double>(x) * (1.0 / 4294967296.0);
+    }
     std::atomic<bool> threadRun_{false};
     std::atomic<bool> midiThreadRun_{false};
     std::atomic<bool> started_{false};
@@ -2623,6 +2654,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEng
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeRemoveListEntry(JNIEnv*,jobject,jint lb,jint lp,jint ls,jint index){return sampler().removeListEntry(makeAddress(lb,lp,ls),index)?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeMoveListEntry(JNIEnv*,jobject,jint lb,jint lp,jint ls,jint fromIndex,jint toIndex){return sampler().moveListEntry(makeAddress(lb,lp,ls),fromIndex,toIndex)?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeMoveList(JNIEnv*,jobject,jint fb,jint fp,jint fs,jint tb,jint tp,jint ts,jboolean overwrite){return sampler().moveList(makeAddress(fb,fp,fs),makeAddress(tb,tp,ts),overwrite==JNI_TRUE)?JNI_TRUE:JNI_FALSE;}
+extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeSetActiveListEntry(JNIEnv*,jobject,jint lb,jint lp,jint ls,jint index){return sampler().setActiveListEntry(makeAddress(lb,lp,ls),index)?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeActivateListEntry(JNIEnv*,jobject,jint lb,jint lp,jint ls,jint index){return sampler().activateListEntry(makeAddress(lb,lp,ls),index)?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jint JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeActiveListEntry(JNIEnv*,jobject,jint lb,jint lp,jint ls){return static_cast<jint>(sampler().activeListEntry(makeAddress(lb,lp,ls)));}
 extern "C" JNIEXPORT jintArray JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeListEntryNumbers(JNIEnv* env,jobject,jint lb,jint lp,jint ls){return intVectorArray(env,sampler().listEntryNumbers(makeAddress(lb,lp,ls)));}

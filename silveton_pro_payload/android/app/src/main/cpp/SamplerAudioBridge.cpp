@@ -236,6 +236,9 @@ public:
     // Headset Volume 12 stay set. Runs before every PCM open and, while audio
     // runs, from the recovery thread (never the realtime audio thread) so Android
     // cannot move the output to the tablet speakers. Only differing values are written.
+    // PORTA BALANCE of the SILVETON keyboard processor (3..40, default 11).
+    void setPortamentoBalance(float balance) noexcept { engine_.setPortamentoBalance(balance); }
+
     bool enforceHeadphoneRoute(bool onlyWhileRunning) {
         if (onlyWhileRunning && !started_.load(std::memory_order_acquire)) return true;
         std::lock_guard<std::mutex> lock(routeMutex_);
@@ -2482,6 +2485,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_silveton_sampler_NativeSamplerEngine_
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeAudioRecover(JNIEnv*,jobject){return sampler().recover()?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeAudioNeedsRecovery(JNIEnv*,jobject){return sampler().needsRecovery()?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeEnforceOutputRoute(JNIEnv*,jobject){return sampler().enforceHeadphoneRoute(true)?JNI_TRUE:JNI_FALSE;}
+extern "C" JNIEXPORT void JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeSetPortaBalance(JNIEnv*,jobject,jint balance){sampler().setPortamentoBalance(static_cast<float>(balance));}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeLoadAudio(JNIEnv* env,jobject,jstring path){return sampler().loadAudioFile(jstringToUtf8(env,path))?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeLoadKmp(JNIEnv* env,jobject,jstring path){return sampler().loadKmp(jstringToUtf8(env,path))?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jintArray JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeImportKmpToLibrary(JNIEnv* env,jobject,jstring path){return intVectorArray(env,sampler().importKmpToLibrary(jstringToUtf8(env,path)));}

@@ -105,9 +105,23 @@ class SamplerAppController(
     private var defaultBankAttempted = false
     private val bankLoading = AtomicBoolean(false)
 
+    // PORTA BALANCE, like the SILVETON keyboard processor: one number for the
+    // whole sampler, kept between sessions (3..40, default 11).
+    private val portaPrefs = appContext.getSharedPreferences("silveton_sampler", android.content.Context.MODE_PRIVATE)
+    private var portaBalanceValue = portaPrefs.getInt("porta_balance", 11).coerceIn(3, 40)
+
+    fun portaBalance(): Int = portaBalanceValue
+
+    fun setPortaBalance(value: Int, save: Boolean = true) {
+        portaBalanceValue = value.coerceIn(3, 40)
+        engine.nativeSetPortaBalance(portaBalanceValue)
+        if (save) portaPrefs.edit().putInt("porta_balance", portaBalanceValue).apply()
+    }
+
     /** Start low-latency output first, then accept MIDI. */
     fun start(): Boolean {
         if (closed.get()) return false
+        engine.nativeSetPortaBalance(portaBalanceValue)
         if (started.get()) return true
         midi.start()
         val audioOk = runtime.start()

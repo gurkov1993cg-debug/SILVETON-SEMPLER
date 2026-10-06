@@ -16,6 +16,8 @@ class NativeSamplerEngine {
     external fun nativeAudioNeedsRecovery(): Boolean
     /** Keeps SILVETON on the headphone jack only (no-op while audio is stopped). */
     external fun nativeEnforceOutputRoute(): Boolean
+    /** PORTA BALANCE of the SILVETON keyboard processor (3..40, default 11). */
+    external fun nativeSetPortaBalance(balance: Int)
     external fun nativeLoadAudio(path: String): Boolean
     external fun nativeLoadKmp(path: String): Boolean
     external fun nativeImportKmpToLibrary(path: String): IntArray

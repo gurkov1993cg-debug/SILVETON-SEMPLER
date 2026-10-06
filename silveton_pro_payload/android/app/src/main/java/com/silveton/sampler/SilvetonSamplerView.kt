@@ -1275,7 +1275,7 @@ class SilvetonSamplerView(
         panel(c,r,C_PANEL,14f.dp)
         text(c,"●  Н А С Т Р О Й К И",r.left+18f.dp,r.top+30f.dp,13f.dp,C_TEXT_DIM)
         val g=globalState ?: sampler.globalUiState()?.also{globalState=it} ?: return
-        val labels=arrayOf("MASTER TUNE","TRANSPOSE","MASTER GAIN","EQ LOW","EQ MID","EQ HIGH","LIMITER","CEILING","VELOCITY CURVE","BREATH CC","EXPRESSION CC","DAMPER CC","PITCH BEND","AFTERTOUCH")
+        val labels=arrayOf("MASTER TUNE","TRANSPOSE","MASTER GAIN","EQ LOW","EQ MID","EQ HIGH","LIMITER","CEILING","VELOCITY CURVE","BREATH CC","EXPRESSION CC","DAMPER CC","PITCH BEND","AFTERTOUCH","PORTA BALANCE")
         val cols=4; val gap=10f.dp; val top=r.top+55f.dp
         val cw=(r.width()-36f.dp-gap*(cols-1))/cols
         val rows=(labels.size+cols-1)/cols
@@ -1284,7 +1284,18 @@ class SilvetonSamplerView(
             val col=i%cols; val row=i/cols
             val rr=RectF(r.left+18f.dp+col*(cw+gap),top+row*(ch+gap),r.left+18f.dp+col*(cw+gap)+cw,top+row*(ch+gap)+ch)
             panel(c,rr,C_SUBPANEL,9f.dp)
-            if(i==6 || i==12 || i==13){
+            if(i==14){
+                // PORTA BALANCE like the SILVETON keyboard processor (3..40, default 11)
+                val b=sampler.portaBalance().toFloat()
+                drawParamSlider(c,rr,b,3f,40f,labels[i],b.toInt().toString())
+                hit(rr,{_,_-> showNumber("Porta Balance",sampler.portaBalance().toFloat(),3f,40f,0){ sampler.setPortaBalance(kotlin.math.round(it).toInt()); invalidate() } },
+                    { sampler.setPortaBalance(11); invalidate() },
+                    {x,_,final->
+                        val raw=kotlin.math.round(sliderValueFromX(x,rr,3f,40f)).toInt()
+                        if(raw!=sampler.portaBalance() || final) sampler.setPortaBalance(raw, save=final)
+                        invalidate()
+                    })
+            } else if(i==6 || i==12 || i==13){
                 val on=when(i){6->g.limiterEnabled;12->g.pitchBendEnabled;else->g.aftertouchEnabled}
                 text(c,labels[i],rr.centerX(),rr.top+23f.dp,9f.dp,C_TEXT_MUTED,alignCenter=true)
                 val tr=RectF(rr.left+22f.dp,rr.centerY()-18f.dp,rr.right-22f.dp,rr.centerY()+18f.dp)

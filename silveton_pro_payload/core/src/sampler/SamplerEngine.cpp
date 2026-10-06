@@ -303,9 +303,43 @@ struct StateVariableFilter {
         return x;
     }
 
+    // SILVETON_RENDER_SPEED_V1: the coefficients (two tan() per sample before)
+    // are computed only when cutoff / resonance really change. Same formulas,
+    // same result.
+    float cCut{-1.0F}, cRes{-1.0F};
+    double cSr{0.0};
+    float cK{0.0F}, cA1{0.0F}, cA2{0.0F}, cA3{0.0F};
+
+    float processCached(float x, float& ic1eq, float& ic2eq, FilterMode mode) const noexcept {
+        const float v3 = x - ic2eq;
+        const float v1 = cA1 * ic1eq + cA2 * v3;
+        const float v2 = ic2eq + cA2 * ic1eq + cA3 * v3;
+        ic1eq = 2.0F * v1 - ic1eq;
+        ic2eq = 2.0F * v2 - ic2eq;
+        switch (mode) {
+            case FilterMode::LowPass: return v2;
+            case FilterMode::HighPass: return x - cK * v1 - v2;
+            case FilterMode::BandPass: return v1;
+            case FilterMode::Bypass: return x;
+        }
+        return x;
+    }
+
     void process(float& l, float& r, FilterMode mode, float cutoffHz, float resonance, double sr) noexcept {
-        l = processOne(l, ic1eqL, ic2eqL, mode, cutoffHz, resonance, sr);
-        r = processOne(r, ic1eqR, ic2eqR, mode, cutoffHz, resonance, sr);
+        if (mode == FilterMode::Bypass) return;
+        if (cutoffHz != cCut || resonance != cRes || sr != cSr) {
+            cCut = cutoffHz; cRes = resonance; cSr = sr;
+            const float nyquistSafe = static_cast<float>(std::max(100.0, sr * 0.45));
+            const float cutoff = std::clamp(cutoffHz, 20.0F, nyquistSafe);
+            const float g = std::tan(static_cast<float>(kPi) * cutoff / static_cast<float>(sr));
+            const float q = 0.5F + std::clamp(resonance, 0.0F, 1.0F) * 11.5F;
+            cK = 1.0F / q;
+            cA1 = 1.0F / (1.0F + g * (g + cK));
+            cA2 = g * cA1;
+            cA3 = g * cA2;
+        }
+        l = processCached(l, ic1eqL, ic2eqL, mode);
+        r = processCached(r, ic1eqR, ic2eqR, mode);
     }
 };
 
@@ -584,6 +618,8 @@ struct SamplerEngine::Impl {
     // started (-1 = none, the next note does not glide) and the Sound it belongs to.
     std::array<int, kUpperCount> portaLastKey{{-1, -1, -1, -1, -1, -1, -1}};
     std::array<const Program*, kUpperCount> portaProgram{};
+    std::array<bool, kUpperCount> monoWas{};
+    std::atomic<float> portaBalance{11.0F};
     std::uint64_t voiceAge{0U};
     float peakL{0.0F};
     float peakR{0.0F};
@@ -595,6 +631,10 @@ struct SamplerEngine::Impl {
     std::array<Biquad, kUpperCount> upperLowEq{};
     std::array<Biquad, kUpperCount> upperMidEq{};
     std::array<Biquad, kUpperCount> upperHighEq{};
+    // Per-Upper mix of one chunk (voices are rendered voice by voice).
+    static constexpr std::uint32_t kRenderChunk = 256U;
+    std::array<std::array<float, kRenderChunk>, kUpperCount> chunkL{};
+    std::array<std::array<float, kRenderChunk>, kUpperCount> chunkR{};
     DelayFx delay{};
     ChorusFx chorus{};
     ReverbFx reverb{};
@@ -634,6 +674,7 @@ struct SamplerEngine::Impl {
         for (auto& m : mono) m = MonoKeys{};
         portaLastKey.fill(-1);
         portaProgram.fill(nullptr);
+        monoWas.fill(false);
         for (auto& v : voices) v = Voice{};
         lowEq.reset(); midEq.reset(); highEq.reset();
         for (auto& q : upperLowEq) q.reset();
@@ -660,6 +701,14 @@ void SamplerEngine::prepare(double sampleRate, std::uint32_t maximumBlockFrames)
     const double sr = std::clamp(sampleRate, 8000.0, 384000.0);
     impl_->maxBlock = std::max<std::uint32_t>(16U, maximumBlockFrames);
     impl_->reset(sr);
+}
+
+void SamplerEngine::setPortamentoBalance(float balance) noexcept {
+    impl_->portaBalance.store(std::isfinite(balance) ? std::clamp(balance, 3.0F, 40.0F) : 11.0F, std::memory_order_relaxed);
+}
+
+float SamplerEngine::portamentoBalance() const noexcept {
+    return impl_->portaBalance.load(std::memory_order_relaxed);
 }
 
 void SamplerEngine::reset() noexcept {
@@ -935,22 +984,81 @@ void monoPush(SamplerEngine::Impl::MonoKeys& m, std::uint8_t key, std::uint8_t v
     m.key[m.count] = key; m.vel[m.count] = vel; ++m.count;
 }
 
-// SILVETON_PORTA_PROCESSOR_V1 / SILVETON_PORTA_FINGERED_V1 - PORTAMENTO like
-// KORG KRONOS (Fingered, Constant Time): it glides ONLY when the new key is
-// pressed while another key of that Upper is still held (legato playing); a
-// detached note starts clean on its own pitch. Every interval takes exactly the
-// same time (TIME 1..100 ms), the pitch moves evenly in semitones. MONO/LEGATO
-// glide from the pitch that is sounding, POLY from the last key played. It
-// starts fresh when the Upper gets another Sound or portamento was OFF.
+// SILVETON_PORTA_PROCESSOR_V2 - PORTAMENTO exactly like the SILVETON keyboard
+// processor (SILVETON LIVE MIDI):
+//  * TIME portamento: every interval takes exactly the same time (TIME 1..100 ms),
+//    the pitch moves evenly in semitones.
+//  * Automatic MONO: while portamento is ON an Upper plays one line (last key
+//    wins, releasing it goes back to a key that is still held) - a POLY Upper
+//    becomes MONO, MONO / LEGATO stay as they are.
+//  * It glides from the last note of that Upper, also when the key was already
+//    released (from the pitch that is sounding if a note still sounds).
+//  * It starts fresh when the Upper gets another Sound or portamento was OFF.
 constexpr float kPortamentoMaxSec = 0.100F;
 
 float portamentoSecFor(const UpperPart& upper) noexcept {
     return std::clamp(upper.portamentoSec, 0.0F, kPortamentoMaxSec);
 }
 
+// The processor's KorgGlideModel (manual model, a = 0): CC#5 points every 4
+// steps 4..124 with b(cc) = 0.2 * 2^(cc / BAL) ms per semitone, linear between
+// points, linear from cc 0 (instant) to the first point, flat after the last.
+double korgGlideTimeMs(int cc, double interval, double balance) noexcept {
+    if (cc <= 0) return 0.0;
+    const auto pointMs = [&](int pcc) { return std::max(0.0, 0.2 * std::pow(2.0, pcc / balance) * interval); };
+    if (cc <= 4) return pointMs(4) * static_cast<double>(cc) / 4.0;
+    if (cc >= 124) return pointMs(124);
+    const int lo = (cc / 4) * 4;
+    if (lo == cc) return pointMs(cc);
+    const double f = static_cast<double>(cc - lo) / 4.0;
+    return pointMs(lo) + (pointMs(lo + 4) - pointMs(lo)) * f;
+}
+
+// The processor's ccFor(): the CC#5 that makes THIS interval last timeMs.
+int korgCcFor(double interval, double timeMs, double balance) noexcept {
+    if (timeMs <= 0.0 || interval <= 0.0) return 0;
+    int lo = 0, hi = 127;
+    if (korgGlideTimeMs(hi, interval, balance) <= timeMs) return 127;
+    while (hi - lo > 1) {
+        const int mid = (lo + hi) / 2;
+        if (korgGlideTimeMs(mid, interval, balance) < timeMs) lo = mid; else hi = mid;
+    }
+    const double dlo = std::abs(korgGlideTimeMs(lo, interval, balance) - timeMs);
+    const double dhi = std::abs(korgGlideTimeMs(hi, interval, balance) - timeMs);
+    return dlo <= dhi ? lo : hi;
+}
+
+// Glide time exactly as the processor + PA600 make it: the processor picks the
+// CC#5 with PORTA BALANCE, the PA600's own portamento (its model at 11) then
+// plays that CC#5 for this interval. BALANCE 11 = the same time for every interval.
+float processorGlideSec(float timeSec, int interval, float balance) noexcept {
+    if (timeSec <= 0.0F || interval <= 0) return 0.0F;
+    const double bal = std::clamp(static_cast<double>(balance), 3.0, 40.0);
+    const int cc = korgCcFor(static_cast<double>(interval), static_cast<double>(timeSec) * 1000.0, bal);
+    return static_cast<float>(korgGlideTimeMs(cc, static_cast<double>(interval), 11.0) / 1000.0);
+}
+
+UpperVoiceMode effectiveVoiceMode(const UpperPart& upper) noexcept {
+    if (upper.voiceMode == UpperVoiceMode::Poly && portamentoSecFor(upper) > 0.0F) return UpperVoiceMode::Mono;
+    return upper.voiceMode;
+}
+
+// Mode at this event; a key memory never survives a switch between POLY and MONO.
+UpperVoiceMode voiceModeNow(SamplerEngine::Impl& impl, int ui, const UpperPart& upper) noexcept {
+    const UpperVoiceMode mode = effectiveVoiceMode(upper);
+    const bool mono = mode != UpperVoiceMode::Poly;
+    auto& was = impl.monoWas[static_cast<std::size_t>(ui)];
+    if (mono != was) {
+        impl.mono[static_cast<std::size_t>(ui)] = SamplerEngine::Impl::MonoKeys{};
+        was = mono;
+    }
+    return mode;
+}
+
 // Pitch (in keys) the Upper glides from: the pitch a MONO/LEGATO Upper is
 // sounding right now (also part-way through a glide), otherwise the last key.
 double portamentoFromKey(const SamplerEngine::Impl& impl, int ui, bool mono) noexcept {
+    if (impl.portaLastKey[static_cast<std::size_t>(ui)] < 0) return -1.0; // first note: no glide
     if (mono) {
         const SamplerEngine::Impl::Voice* newest = nullptr;
         for (const auto& v : impl.voices) {
@@ -979,11 +1087,12 @@ void startPortamentoGlide(const SamplerEngine::Impl& impl, SamplerEngine::Impl::
 
 // Same sound keeps playing; only its pitch moves to the new key (true glissando).
 void legatoTo(SamplerEngine::Impl& impl, SamplerEngine::Impl::Voice& v, const UpperPart& upper,
-              const ProgramLayer& layer, const SampleZone& zone, std::uint8_t key, const GlobalState& global) noexcept {
+              const ProgramLayer& layer, const SampleZone& zone, std::uint8_t key, const GlobalState& global,
+              float glideSec) noexcept {
     const double target = noteRatio(impl, upper, layer, zone, key, global);
     v.key = key;
     v.targetRatio = target;
-    const float portamentoSec = portamentoSecFor(upper);
+    const float portamentoSec = glideSec;
     if (portamentoSec > 0.0F && v.ratio > 0.0 && target > 0.0) {
         const auto frames = static_cast<std::uint32_t>(std::max(1.0, static_cast<double>(portamentoSec) * impl.sampleRate));
         v.glideFramesRemaining = frames;
@@ -996,12 +1105,12 @@ void legatoTo(SamplerEngine::Impl& impl, SamplerEngine::Impl::Voice& v, const Up
 }
 
 void playUpperNote(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineState>& stateOwner, int ui,
-                   const UpperPart& upper, std::uint8_t channel, std::uint8_t key, std::uint8_t velocity,
-                   bool legatoPlayed) noexcept {
+                   const UpperPart& upper, std::uint8_t channel, std::uint8_t key, std::uint8_t velocity) noexcept {
     const auto& global = stateOwner->global;
     const auto& program = *upper.program;
-    const bool upperMono = upper.voiceMode != UpperVoiceMode::Poly;
-    const bool upperLegato = upper.voiceMode == UpperVoiceMode::Legato;
+    const UpperVoiceMode mode = effectiveVoiceMode(upper);
+    const bool upperMono = mode != UpperVoiceMode::Poly;
+    const bool upperLegato = mode == UpperVoiceMode::Legato;
     bool hadHeldVoice = false;
     float previousAmp = 0.0F;
     const float portaSec = portamentoSecFor(upper);
@@ -1009,8 +1118,11 @@ void playUpperNote(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
     auto& portaProgram = impl.portaProgram[static_cast<std::size_t>(ui)];
     if (portaSec <= 0.0F || portaProgram != upper.program.get()) portaLast = -1; // OFF or another Sound: start fresh
     portaProgram = upper.program.get();
-    // Fingered: only legato playing glides.
-    const double glideFromKey = (portaSec > 0.0F && legatoPlayed) ? portamentoFromKey(impl, ui, upperMono) : -1.0;
+    const double glideFromKey = portaSec > 0.0F ? portamentoFromKey(impl, ui, upperMono) : -1.0;
+    // Like the processor: the glide time comes from the interval to the last note.
+    const float glideSec = (glideFromKey >= 0.0 && portaLast >= 0)
+        ? processorGlideSec(portaSec, std::abs(static_cast<int>(key) - portaLast), impl.portaBalance.load(std::memory_order_relaxed))
+        : 0.0F;
     if (upperMono) {
         for (auto& existing : impl.voices) {
             if (!existing.active || existing.fading || existing.upperIndex != ui) continue;
@@ -1028,7 +1140,7 @@ void playUpperNote(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
                         if (existing.active && !existing.fading && existing.upperIndex == ui && existing.keyHeld &&
                             existing.delayFramesRemaining == 0U && !existing.legatoKeep &&
                             existing.layer == &layer && existing.zone == &zone) {
-                            legatoTo(impl, existing, upper, layer, zone, key, global);
+                            legatoTo(impl, existing, upper, layer, zone, key, global, glideSec);
                             existing.legatoKeep = true;
                             break;
                         }
@@ -1036,10 +1148,19 @@ void playUpperNote(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
                 }
             }
         }
-        // 2) every other sounding voice of this Upper leaves with a short fade
+        // 2) every other sounding voice of this Upper leaves with a short fade.
+        //    Automatic MONO of a POLY Upper (portamento ON) works like the
+        //    processor: the new note first, then a normal Note Off for the old one,
+        //    so the old note ends with its own release (the damper pedal holds it).
+        const bool autoMono = upper.voiceMode == UpperVoiceMode::Poly;
+        const bool sustainDown = impl.channels[channel & 0x0FU].sustain;
         for (auto& existing : impl.voices) {
             if (existing.active && !existing.fading && existing.upperIndex == ui && !existing.legatoKeep) {
-                softKill(impl, existing, (upperLegato && hadHeldVoice) ? kLegatoCrossfadeSec : kTakeoverFadeSec);
+                if (autoMono) {
+                    if (existing.ampEnv.stage != AmpEnv::Stage::Release && !existing.sustained) releaseOne(impl, existing, sustainDown);
+                } else {
+                    softKill(impl, existing, (upperLegato && hadHeldVoice) ? kLegatoCrossfadeSec : kTakeoverFadeSec);
+                }
             }
         }
     }
@@ -1058,7 +1179,7 @@ void playUpperNote(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
             auto* v = chooseVoice(impl);
             startVoice(impl, *v, upper, layer, zone, ui, channel, key, velocity, global, stateOwner);
             v->mono = upperMono;
-            startPortamentoGlide(impl, *v, glideFromKey, portaSec);
+            startPortamentoGlide(impl, *v, glideFromKey, glideSec);
             if (upperLegato && hadHeldVoice) {
                 v->ampEnv.value = previousAmp;
                 v->ampEnv.stage = AmpEnv::Stage::Decay;
@@ -1076,7 +1197,7 @@ void handleNoteOff(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
     std::uint16_t handled = 0U;
     for (int ui = 0; ui < kUpperCount; ++ui) {
         const auto& upper = stateOwner->combi.uppers[static_cast<std::size_t>(ui)];
-        if (upper.midiChannel != (channel & 0x0FU) || upper.voiceMode == UpperVoiceMode::Poly) continue;
+        if (upper.midiChannel != (channel & 0x0FU) || voiceModeNow(impl, ui, upper) == UpperVoiceMode::Poly) continue;
         auto& mk = impl.mono[static_cast<std::size_t>(ui)];
         std::size_t index = mk.count;
         for (std::size_t i = 0; i < mk.count; ++i) if (mk.key[i] == key) { index = i; break; }
@@ -1087,7 +1208,7 @@ void handleNoteOff(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
         if (!wasTop) continue; // a lower held key was let go: the sound goes on
         if (mk.count > 0U && upper.program != nullptr) {
             // back to the key that is still held
-            playUpperNote(impl, stateOwner, ui, upper, channel, mk.key[mk.count - 1U], mk.vel[mk.count - 1U], true);
+            playUpperNote(impl, stateOwner, ui, upper, channel, mk.key[mk.count - 1U], mk.vel[mk.count - 1U]);
         } else {
             releaseUpperVoices(impl, ui, channel);
         }
@@ -1111,17 +1232,8 @@ void processEvent(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineS
                 if (upper.midiChannel != (e.channel & 0x0FU)) continue;
                 if (anySolo && !upper.solo) continue;
                 if (!upper.matches(e.data1, e.data2)) continue;
-                bool legatoPlayed = false; // another key of this Upper is still held
-                if (upper.voiceMode != UpperVoiceMode::Poly) {
-                    auto& mk = impl.mono[static_cast<std::size_t>(ui)];
-                    monoPush(mk, e.data1, e.data2);
-                    legatoPlayed = mk.count >= 2U;
-                } else {
-                    for (const auto& v : impl.voices) {
-                        if (v.active && !v.fading && v.upperIndex == ui && v.keyHeld && v.key != e.data1) { legatoPlayed = true; break; }
-                    }
-                }
-                playUpperNote(impl, stateOwner, ui, upper, e.channel, e.data1, e.data2, legatoPlayed);
+                if (voiceModeNow(impl, ui, upper) != UpperVoiceMode::Poly) monoPush(impl.mono[static_cast<std::size_t>(ui)], e.data1, e.data2);
+                playUpperNote(impl, stateOwner, ui, upper, e.channel, e.data1, e.data2);
             }
             break;
         }
@@ -1133,8 +1245,10 @@ void processEvent(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineS
             if (e.data1 == 120U || e.data1 == 123U) {
                 for (auto& v : impl.voices) if (v.active && v.channel == e.channel) { v.ampEnv.forceOff(); v.active = false; }
                 for (int ui = 0; ui < kUpperCount; ++ui) {
-                    if (state.combi.uppers[static_cast<std::size_t>(ui)].midiChannel == (e.channel & 0x0FU))
+                    if (state.combi.uppers[static_cast<std::size_t>(ui)].midiChannel == (e.channel & 0x0FU)) {
                         impl.mono[static_cast<std::size_t>(ui)] = SamplerEngine::Impl::MonoKeys{};
+                        impl.portaLastKey[static_cast<std::size_t>(ui)] = -1; // like the processor: CC120/123 forget the last note
+                    }
                 }
                 break;
             }
@@ -1305,65 +1419,127 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
     const float masterGain = dbToGain(current->global.masterGainDb);
     const float limiterCeiling = dbToGain(current->global.limiterCeilingDb);
 
-    for (std::uint32_t i = 0U; i < frames; ++i) {
-        std::array<float, kUpperCount> upperL{};
-        std::array<float, kUpperCount> upperR{};
+    // SILVETON_RENDER_SPEED_V1: every voice renders its whole chunk at once and
+    // everything that cannot change inside a block (controllers, pitch bend,
+    // LFO scaling, filter base, pan, level) is computed once per voice per chunk
+    // instead of once per sample. Per sample the work and its order are the same,
+    // so the sound is the same.
+    constexpr std::uint32_t kChunk = Impl::kRenderChunk;
+    for (std::uint32_t chunkStart = 0U; chunkStart < frames; chunkStart += kChunk) {
+      const std::uint32_t n = std::min(kChunk, frames - chunkStart);
+      for (auto& buf : impl_->chunkL) std::fill_n(buf.begin(), n, 0.0F);
+      for (auto& buf : impl_->chunkR) std::fill_n(buf.begin(), n, 0.0F);
 
-        for (auto& v : impl_->voices) {
-            if (!v.active || v.sample == nullptr || v.layer == nullptr || v.zone == nullptr || v.upper == nullptr) continue;
+      for (auto& v : impl_->voices) {
+        if (!v.active || v.sample == nullptr || v.layer == nullptr || v.zone == nullptr || v.upper == nullptr) continue;
+        const auto& sample = *v.sample;
+        const bool looping = sample.loop.enabled && !v.zone->oneShot && !v.zone->reverse;
+        const auto& ch = impl_->channels[v.channel & 0x0FU];
+        const auto ui = static_cast<std::size_t>(std::clamp(v.upperIndex, 0, kUpperCount - 1));
+        const std::uint16_t routeMask = v.routeMask;
+        const auto routeActive = [routeMask](ModDestination d) noexcept {
+            return (routeMask & static_cast<std::uint16_t>(1U << static_cast<unsigned>(d))) != 0U;
+        };
+        auto& outL = impl_->chunkL[ui];
+        auto& outR = impl_->chunkR[ui];
+
+        const bool filterActive = v.layer->filter.mode != FilterMode::Bypass;
+        const bool lfoDepthRouted = routeActive(ModDestination::LfoDepth);
+        const bool lfo1Needed = lfoDepthRouted || v.layer->lfo1.pitchCents != 0.0F ||
+            v.layer->lfo1.filterOctaves != 0.0F || v.layer->lfo1.ampDepth != 0.0F ||
+            (filterActive && v.layer->filter.lfoAmount != 0.0F);
+        const bool lfo2Needed = lfoDepthRouted || v.layer->lfo2.pitchCents != 0.0F ||
+            v.layer->lfo2.filterOctaves != 0.0F || v.layer->lfo2.ampDepth != 0.0F;
+
+        LfoParams lfo1Params = v.layer->lfo1;
+        LfoParams lfo2Params = v.layer->lfo2;
+        if (lfo1Needed || lfo2Needed) {
+            const float lfoRateScale = std::clamp(v.upper->lfoRateScale, 0.0F, 16.0F);
+            const float controllerLfoDepth = lfoDepthRouted
+                ? controllerAmount(*v.upper, ch, ModDestination::LfoDepth) : 0.0F;
+            const float lfoDepthScale = std::clamp(
+                v.upper->lfoDepthScale * std::max(0.0F, 1.0F + controllerLfoDepth), 0.0F, 8.0F);
+            if (lfo1Needed) {
+                lfo1Params.frequencyHz *= lfoRateScale;
+                lfo1Params.pitchCents *= lfoDepthScale;
+                lfo1Params.filterOctaves *= lfoDepthScale;
+                lfo1Params.ampDepth *= lfoDepthScale;
+            }
+            if (lfo2Needed) {
+                lfo2Params.frequencyHz *= lfoRateScale;
+                lfo2Params.pitchCents *= lfoDepthScale;
+                lfo2Params.filterOctaves *= lfoDepthScale;
+                lfo2Params.ampDepth *= lfoDepthScale;
+            }
+        }
+
+        const bool pitchEnvNeeded = v.layer->pitchEnvelopeCents != 0.0F;
+        const bool filterEnvNeeded = filterActive && v.layer->filter.envelopeAmount != 0.0F;
+        const bool lfoPitch = (lfo1Needed && lfo1Params.pitchCents != 0.0F) || (lfo2Needed && lfo2Params.pitchCents != 0.0F);
+        const bool dynamicPitchActive = ch.pitchBend != 0 || routeActive(ModDestination::PitchSemitones) ||
+            pitchEnvNeeded || lfoPitch;
+        const float bendNorm = static_cast<float>(ch.pitchBend) / 8192.0F;
+        const float bendSemis = bendNorm * static_cast<float>(v.upper->pitchBendRange);
+        const float controllerPitchSemis = routeActive(ModDestination::PitchSemitones)
+            ? controllerAmount(*v.upper, ch, ModDestination::PitchSemitones) : 0.0F;
+        const bool pitchPerSample = pitchEnvNeeded || lfoPitch;
+        // Bend / controller only: the same factor for the whole block.
+        const double staticPitchMul = (dynamicPitchActive && !pitchPerSample)
+            ? std::pow(2.0, (static_cast<double>(bendSemis + controllerPitchSemis) + 0.0) / 12.0)
+            : 1.0;
+
+        float filterBaseCutoff = 0.0F, filterStaticOct = 0.0F, filterResonance = 0.0F;
+        const bool filterOctPerSample = filterEnvNeeded || lfo1Needed || lfo2Needed;
+        if (filterActive) {
+            const float controllerCutoff = routeActive(ModDestination::FilterCutoffOctaves)
+                ? controllerAmount(*v.upper, ch, ModDestination::FilterCutoffOctaves) : 0.0F;
+            filterBaseCutoff = v.layer->filter.cutoffHz * std::pow(
+                2.0F, std::clamp(v.upper->filterCutoffOctaves + controllerCutoff, -10.0F, 10.0F));
+            const float keyDelta = (static_cast<float>(v.key) - 60.0F) / 12.0F;
+            const float velocityNorm = static_cast<float>(v.velocity) * kInv127;
+            filterStaticOct = keyDelta * v.layer->filter.keyTrack + velocityNorm * v.layer->filter.velocityAmount;
+            const float controllerResonance = routeActive(ModDestination::FilterResonance)
+                ? controllerAmount(*v.upper, ch, ModDestination::FilterResonance) : 0.0F;
+            filterResonance = std::clamp(
+                v.layer->filter.resonance + v.upper->filterResonanceOffset + controllerResonance, 0.0F, 1.0F);
+        }
+        const float staticFilterCutoff = (filterActive && !filterOctPerSample)
+            ? (filterStaticOct != 0.0F ? filterBaseCutoff * std::pow(2.0F, filterStaticOct) : filterBaseCutoff)
+            : 0.0F;
+
+        const bool ampLfo = (lfo1Needed && lfo1Params.ampDepth != 0.0F) || (lfo2Needed && lfo2Params.ampDepth != 0.0F);
+        const bool anyChannelGain = v.upper->expressionEnabled || v.upper->breathEnabled || v.upper->aftertouchEnabled;
+        const float controllerLevelDb = routeActive(ModDestination::LevelDb)
+            ? controllerAmount(*v.upper, ch, ModDestination::LevelDb) : 0.0F;
+        const float levelGain = controllerLevelDb != 0.0F ? dbToGain(std::clamp(controllerLevelDb, -96.0F, 24.0F)) : 1.0F;
+        float panLeft = v.leftGain;
+        float panRight = v.rightGain;
+        if (routeActive(ModDestination::Pan)) {
+            const float controllerPan = controllerAmount(*v.upper, ch, ModDestination::Pan);
+            const float dynamicPan = std::clamp(v.basePan + controllerPan, -1.0F, 1.0F);
+            const float panAngle = (dynamicPan + 1.0F) * static_cast<float>(kPi * 0.25);
+            panLeft = std::cos(panAngle);
+            panRight = std::sin(panAngle);
+        }
+        const bool reverse = v.zone->reverse;
+        const double loopEnd = static_cast<double>(sample.loop.endFrame);
+        const double loopStart = static_cast<double>(sample.loop.startFrame);
+        const double loopLen = static_cast<double>(sample.loop.endFrame - sample.loop.startFrame);
+        const double sampleEnd = static_cast<double>(sample.frameCount());
+
+        for (std::uint32_t i = 0U; i < n; ++i) {
             if (v.delayFramesRemaining > 0U) {
                 --v.delayFramesRemaining;
                 continue;
             }
-            const auto& sample = *v.sample;
-            const bool looping = sample.loop.enabled && !v.zone->oneShot && !v.zone->reverse;
-
-            const auto& ch = impl_->channels[v.channel & 0x0FU];
-            const auto ui = static_cast<std::size_t>(std::clamp(v.upperIndex, 0, kUpperCount - 1));
-            const std::uint16_t routeMask = v.routeMask;
-            const auto routeActive = [routeMask](ModDestination d) noexcept {
-                return (routeMask & static_cast<std::uint16_t>(1U << static_cast<unsigned>(d))) != 0U;
-            };
-
-            const bool filterActive = v.layer->filter.mode != FilterMode::Bypass;
-            const bool lfoDepthRouted = routeActive(ModDestination::LfoDepth);
-            const bool lfo1Needed = lfoDepthRouted || v.layer->lfo1.pitchCents != 0.0F ||
-                v.layer->lfo1.filterOctaves != 0.0F || v.layer->lfo1.ampDepth != 0.0F ||
-                (filterActive && v.layer->filter.lfoAmount != 0.0F);
-            const bool lfo2Needed = lfoDepthRouted || v.layer->lfo2.pitchCents != 0.0F ||
-                v.layer->lfo2.filterOctaves != 0.0F || v.layer->lfo2.ampDepth != 0.0F;
-
-            LfoParams lfo1Params = v.layer->lfo1;
-            LfoParams lfo2Params = v.layer->lfo2;
             float lfo1 = 0.0F, lfo2 = 0.0F;
-            if (lfo1Needed || lfo2Needed) {
-                const float lfoRateScale = std::clamp(v.upper->lfoRateScale, 0.0F, 16.0F);
-                const float controllerLfoDepth = lfoDepthRouted
-                    ? controllerAmount(*v.upper, ch, ModDestination::LfoDepth) : 0.0F;
-                const float lfoDepthScale = std::clamp(
-                    v.upper->lfoDepthScale * std::max(0.0F, 1.0F + controllerLfoDepth), 0.0F, 8.0F);
-                if (lfo1Needed) {
-                    lfo1Params.frequencyHz *= lfoRateScale;
-                    lfo1Params.pitchCents *= lfoDepthScale;
-                    lfo1Params.filterOctaves *= lfoDepthScale;
-                    lfo1Params.ampDepth *= lfoDepthScale;
-                    lfo1 = v.lfo1.process(lfo1Params, impl_->sampleRate);
-                }
-                if (lfo2Needed) {
-                    lfo2Params.frequencyHz *= lfoRateScale;
-                    lfo2Params.pitchCents *= lfoDepthScale;
-                    lfo2Params.filterOctaves *= lfoDepthScale;
-                    lfo2Params.ampDepth *= lfoDepthScale;
-                    lfo2 = v.lfo2.process(lfo2Params, impl_->sampleRate);
-                }
-            }
+            if (lfo1Needed) lfo1 = v.lfo1.process(lfo1Params, impl_->sampleRate);
+            if (lfo2Needed) lfo2 = v.lfo2.process(lfo2Params, impl_->sampleRate);
 
-            const bool pitchEnvNeeded = v.layer->pitchEnvelopeCents != 0.0F;
-            const bool filterEnvNeeded = filterActive && v.layer->filter.envelopeAmount != 0.0F;
             const float pitchEnv = pitchEnvNeeded ? v.pitchEnv.process(impl_->sampleRate) : 0.0F;
             const float ampEnv = v.ampEnv.process();
             const float filterEnv = filterEnvNeeded ? v.filterEnv.process(impl_->sampleRate) : 0.0F;
-            if (!v.ampEnv.active()) { v.active = false; continue; }
+            if (!v.ampEnv.active()) { v.active = false; break; }
 
             if (v.glideFramesRemaining > 0U) {
                 v.ratio *= v.glideMul;
@@ -1372,86 +1548,71 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
             }
 
             double ratio = v.ratio;
-            const bool dynamicPitchActive = ch.pitchBend != 0 || routeActive(ModDestination::PitchSemitones) ||
-                pitchEnvNeeded || (lfo1Needed && lfo1Params.pitchCents != 0.0F) ||
-                (lfo2Needed && lfo2Params.pitchCents != 0.0F);
             if (dynamicPitchActive) {
-                const float bendNorm = static_cast<float>(ch.pitchBend) / 8192.0F;
-                const float bendSemis = bendNorm * static_cast<float>(v.upper->pitchBendRange);
-                const float controllerPitchSemis = routeActive(ModDestination::PitchSemitones)
-                    ? controllerAmount(*v.upper, ch, ModDestination::PitchSemitones) : 0.0F;
-                const float lfoPitchCents = lfo1 * lfo1Params.pitchCents + lfo2 * lfo2Params.pitchCents;
-                const float envPitchCents = pitchEnv * v.layer->pitchEnvelopeCents;
-                const double dynamicPitch = static_cast<double>(bendSemis + controllerPitchSemis) +
-                    static_cast<double>(lfoPitchCents + envPitchCents) / 100.0;
-                ratio *= std::pow(2.0, dynamicPitch / 12.0);
+                if (pitchPerSample) {
+                    const float lfoPitchCents = lfo1 * lfo1Params.pitchCents + lfo2 * lfo2Params.pitchCents;
+                    const float envPitchCents = pitchEnv * v.layer->pitchEnvelopeCents;
+                    const double dynamicPitch = static_cast<double>(bendSemis + controllerPitchSemis) +
+                        static_cast<double>(lfoPitchCents + envPitchCents) / 100.0;
+                    ratio *= std::pow(2.0, dynamicPitch / 12.0);
+                } else {
+                    ratio *= staticPitchMul;
+                }
             }
 
             float sL = 0.0F, sR = 0.0F;
             readWithLoopCrossfade(interpolator_, sample, v.position, ratio, looping, sL, sR);
 
             if (filterActive) {
-                const float controllerCutoff = routeActive(ModDestination::FilterCutoffOctaves)
-                    ? controllerAmount(*v.upper, ch, ModDestination::FilterCutoffOctaves) : 0.0F;
-                float cutoff = v.layer->filter.cutoffHz * std::pow(
-                    2.0F, std::clamp(v.upper->filterCutoffOctaves + controllerCutoff, -10.0F, 10.0F));
-                const float keyDelta = (static_cast<float>(v.key) - 60.0F) / 12.0F;
-                const float velocityNorm = static_cast<float>(v.velocity) * kInv127;
-                const float filterOct = keyDelta * v.layer->filter.keyTrack +
-                                        velocityNorm * v.layer->filter.velocityAmount +
-                                        filterEnv * v.layer->filter.envelopeAmount +
-                                        lfo1 * v.layer->filter.lfoAmount +
-                                        lfo1 * lfo1Params.filterOctaves +
-                                        lfo2 * lfo2Params.filterOctaves;
-                if (filterOct != 0.0F) cutoff *= std::pow(2.0F, filterOct);
-                const float controllerResonance = routeActive(ModDestination::FilterResonance)
-                    ? controllerAmount(*v.upper, ch, ModDestination::FilterResonance) : 0.0F;
-                const float resonance = std::clamp(
-                    v.layer->filter.resonance + v.upper->filterResonanceOffset + controllerResonance, 0.0F, 1.0F);
-                v.filter.process(sL, sR, v.layer->filter.mode, cutoff, resonance, impl_->sampleRate);
+                float cutoff = staticFilterCutoff;
+                if (filterOctPerSample) {
+                    cutoff = filterBaseCutoff;
+                    const float filterOct = filterStaticOct +
+                                            filterEnv * v.layer->filter.envelopeAmount +
+                                            lfo1 * v.layer->filter.lfoAmount +
+                                            lfo1 * lfo1Params.filterOctaves +
+                                            lfo2 * lfo2Params.filterOctaves;
+                    if (filterOct != 0.0F) cutoff *= std::pow(2.0F, filterOct);
+                }
+                v.filter.process(sL, sR, v.layer->filter.mode, cutoff, filterResonance, impl_->sampleRate);
             }
 
             if (v.toneOn) v.toneLp.process(sL, sR);
 
             float modGain = ampEnv;
-            if ((lfo1Needed && lfo1Params.ampDepth != 0.0F) || (lfo2Needed && lfo2Params.ampDepth != 0.0F)) {
-                modGain *= std::max(0.0F, 1.0F + lfo1 * lfo1Params.ampDepth + lfo2 * lfo2Params.ampDepth);
-            }
-            if (v.upper->expressionEnabled) modGain *= ch.expression;
-            if (v.upper->breathEnabled) modGain *= ch.breath;
-            if (v.upper->aftertouchEnabled) modGain *= (0.5F + 0.5F * ch.pressure);
-
-            const float controllerLevelDb = routeActive(ModDestination::LevelDb)
-                ? controllerAmount(*v.upper, ch, ModDestination::LevelDb) : 0.0F;
-            float panLeft = v.leftGain;
-            float panRight = v.rightGain;
-            if (routeActive(ModDestination::Pan)) {
-                const float controllerPan = controllerAmount(*v.upper, ch, ModDestination::Pan);
-                const float dynamicPan = std::clamp(v.basePan + controllerPan, -1.0F, 1.0F);
-                const float panAngle = (dynamicPan + 1.0F) * static_cast<float>(kPi * 0.25);
-                panLeft = std::cos(panAngle);
-                panRight = std::sin(panAngle);
+            if (ampLfo) modGain *= std::max(0.0F, 1.0F + lfo1 * lfo1Params.ampDepth + lfo2 * lfo2Params.ampDepth);
+            if (anyChannelGain) {
+                if (v.upper->expressionEnabled) modGain *= ch.expression;
+                if (v.upper->breathEnabled) modGain *= ch.breath;
+                if (v.upper->aftertouchEnabled) modGain *= (0.5F + 0.5F * ch.pressure);
             }
             float g = v.baseGain * modGain;
-            if (controllerLevelDb != 0.0F) g *= dbToGain(std::clamp(controllerLevelDb, -96.0F, 24.0F));
+            if (controllerLevelDb != 0.0F) g *= levelGain;
             if (v.fadeStep != 0.0F) {
                 v.fadeGain += v.fadeStep;
-                if (v.fadeGain <= 0.0F) { v.ampEnv.forceOff(); v.active = false; v.fading = false; continue; }
+                if (v.fadeGain <= 0.0F) { v.ampEnv.forceOff(); v.active = false; v.fading = false; break; }
                 if (v.fadeGain >= 1.0F) { v.fadeGain = 1.0F; v.fadeStep = 0.0F; }
             }
             if (v.fadeStep != 0.0F || v.fadeGain < 1.0F) g *= std::sin(v.fadeGain * 1.57079632679F); // equal-power fade
-            const float oL = sL * g * panLeft;
-            const float oR = sR * g * panRight;
-            upperL[ui] += oL;
-            upperR[ui] += oR;
+            outL[i] += sL * g * panLeft;
+            outR[i] += sR * g * panRight;
 
-            if (v.zone->reverse) v.position -= ratio; else v.position += ratio;
-            if (!v.zone->reverse && looping && v.position >= static_cast<double>(sample.loop.endFrame)) {
-                const double len = static_cast<double>(sample.loop.endFrame - sample.loop.startFrame);
-                if (len > 0.0) v.position = static_cast<double>(sample.loop.startFrame) + std::fmod(v.position - static_cast<double>(sample.loop.startFrame), len);
+            if (reverse) v.position -= ratio; else v.position += ratio;
+            if (!reverse && looping && v.position >= loopEnd) {
+                if (loopLen > 0.0) v.position = loopStart + std::fmod(v.position - loopStart, loopLen);
             }
-            if (v.zone->reverse && v.position < 0.0) { v.ampEnv.forceOff(); v.active = false; }
-            else if (!looping && v.position >= static_cast<double>(sample.frameCount())) { v.ampEnv.forceOff(); v.active = false; }
+            if (reverse && v.position < 0.0) { v.ampEnv.forceOff(); v.active = false; break; }
+            else if (!looping && v.position >= sampleEnd) { v.ampEnv.forceOff(); v.active = false; break; }
+        }
+      }
+
+      for (std::uint32_t ci = 0U; ci < n; ++ci) {
+        const std::uint32_t i = chunkStart + ci;
+        std::array<float, kUpperCount> upperL{};
+        std::array<float, kUpperCount> upperR{};
+        for (std::size_t u = 0; u < static_cast<std::size_t>(kUpperCount); ++u) {
+            upperL[u] = impl_->chunkL[u][ci];
+            upperR[u] = impl_->chunkR[u][ci];
         }
 
         float dryL = 0.0F, dryR = 0.0F;
@@ -1516,6 +1677,7 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
         out[static_cast<std::size_t>(i) * 2U + 1U] = r;
         peakL = std::max(peakL, std::abs(l));
         peakR = std::max(peakR, std::abs(r));
+      }
     }
 
     for (std::size_t vi = 0; vi < impl_->voices.size(); ++vi) publishVoiceWindows(*impl_, vi);

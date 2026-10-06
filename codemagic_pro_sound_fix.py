@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """SILVETON PRO SOUND (must run LAST, after codemagic_crackle_fix.py).
 
-1. PORTAMENTO like KORG KRONOS (Fingered, Constant Time): glides only when playing legato
-   (new key while another key of the Upper is held), the same time for every interval,
-   TIME 1..100 ms; detached notes start clean. MONO / LEGATO: held keys are remembered,
-   LEGATO keeps the same sound and only moves its pitch.
+1. PORTAMENTO exactly like the SILVETON keyboard processor: TIME 1..100 ms, the same time for
+   every interval, automatic MONO while portamento is ON (POLY Upper -> one line, last key wins,
+   back to a held key; the old note gets a normal Note Off and ends with its own release),
+   glides from the last note also after release; starts fresh on another Sound, after OFF,
+   PANIC or CC#120/123. LEGATO keeps the same sound and only moves its pitch.
+   PORTA BALANCE (SETTINGS, 3..40, default 11, kept between sessions): the processor's Korg
+   glide model - the CC#5 it would send for the interval, played as the PA600 plays it.
 2. Professional exponential ADSR and a 12 dB low-pass CUTOFF / RESONANCE per Upper (TONE),
    live while keys are held, stored in SET v11.
 3. Audio start exactly as in the working crackle-fix version; if the PCM reports EINVAL
@@ -12,6 +15,9 @@
 4. Headphone lock: SILVETON plays only through the headphone jack (DL1 only into the ADDA
    headphone DAC, line-out/speaker mux open, Headset Volume 12); re-checked while playing.
    Tablet volume keys change SILVETON's MASTER and are kept away from Android's audio system.
+5. Render speed: every voice renders its block at once; controller, bend, filter base, pan and
+   level are computed once per block, filter coefficients only when they change. Same sound
+   (bit-exact against the previous engine), about 2.7x less CPU per voice.
 
 The files are complete replacements. Each one is checked against the exact generated
 file it was made from; if anything differs the build stops instead of mixing versions.

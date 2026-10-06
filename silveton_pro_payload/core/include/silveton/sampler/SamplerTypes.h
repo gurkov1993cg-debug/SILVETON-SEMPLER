@@ -43,6 +43,9 @@ struct SampleData {
 
     [[nodiscard]] std::uint64_t preloadedFrameCount() const noexcept {
         if (channels == 0U) return 0U;
+        // Called for every sample of every voice: avoid the division for mono/stereo.
+        if (channels == 1U) return static_cast<std::uint64_t>(interleaved.size());
+        if (channels == 2U) return static_cast<std::uint64_t>(interleaved.size() >> 1U);
         return static_cast<std::uint64_t>(interleaved.size() / static_cast<std::size_t>(channels));
     }
 

@@ -88,6 +88,11 @@ public:
     void prepare(double sampleRate, std::uint32_t maximumBlockFrames);
     void reset() noexcept;
 
+    // PORTA BALANCE of the SILVETON keyboard processor (3..40, default 11):
+    // how its Korg glide model turns TIME into a glide for each interval.
+    void setPortamentoBalance(float balance) noexcept;
+    [[nodiscard]] float portamentoBalance() const noexcept;
+
     // Control thread publishes a fully prepared immutable graph. The audio thread
     // adopts it at a block boundary; Direct ALSA is never stopped for SOUND/COMBI changes.
     void setState(std::shared_ptr<const EngineState> state) noexcept;

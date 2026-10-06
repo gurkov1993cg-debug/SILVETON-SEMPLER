@@ -1605,59 +1605,128 @@ void testPortamentoSameTimeEveryInterval() {
     }
 }
 
-// Like KORG KRONOS (Fingered): only legato playing glides - the new key is
-// pressed while another key is still held - in POLY too. A detached note
-// starts clean. OFF = no glide.
+// Like the SILVETON keyboard processor: while portamento is ON a POLY Upper
+// becomes MONO (one line, last key wins) and every note glides from the last
+// note - also after the key was released. OFF = POLY again, no glide.
 void testPortamentoPolyFromLastNote() {
     auto st=makeToneState(UpperVoiceMode::Poly);
     st->combi.uppers[0].portamentoSec=0.08F;
     SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
     e.postNoteOn(0U,69U,100U); renderLeft(e,40);               // 69 held
-    e.postNoteOn(0U,81U,100U);                                  // legato
-    e.postNoteOff(0U,69U,0U);                                   // 69 fades out in 20 ms, 81 keeps gliding
+    e.postNoteOn(0U,81U,100U);                                  // 69 is taken over, 81 glides from it
     auto x=renderLeft(e,150);
+    assert(e.activeVoiceCount()==1U);                           // automatic MONO: one line
     assert(std::abs(glideHzAt(x,40.0)-622.25)<622.25*0.03);    // half way 440 -> 880
     assert(std::abs(glideHzAt(x,110.0)-880.0)<880.0*0.006);
-    e.postNoteOff(0U,81U,0U); renderLeft(e,200);
+    e.postNoteOff(0U,81U,0U);                                   // back to the still held 69 - glides
+    auto back=renderLeft(e,150);
+    assert(std::abs(glideHzAt(back,40.0)-622.25)<622.25*0.03);
+    assert(std::abs(glideHzAt(back,110.0)-440.0)<440.0*0.006);
+    e.postNoteOff(0U,69U,0U); renderLeft(e,200);
     assert(e.activeVoiceCount()==0U);
-    e.postNoteOn(0U,69U,100U);                                  // detached: no glide from 81
-    auto d=renderLeft(e,40);
-    assert(std::abs(glideHzAt(d,8.0)-440.0)<440.0*0.006);
-    // OFF: straight to the note even when legato
-    auto off=makeToneState(UpperVoiceMode::Poly);
-    SamplerEngine f; f.prepare(96000.0,96U); f.setState(off);
-    f.postNoteOn(0U,69U,100U); renderLeft(f,40); f.postNoteOff(0U,69U,0U); renderLeft(f,100);
-    f.postNoteOn(0U,81U,100U);
-    auto y=renderLeft(f,40);
-    assert(std::abs(glideHzAt(y,10.0)-880.0)<880.0*0.006);
-    // Panic forgets everything: the next note does not glide
-    e.postNoteOn(0U,81U,100U); renderLeft(e,20);
+    e.postNoteOn(0U,81U,100U);                                  // detached: still glides from 69
+    auto d=renderLeft(e,150);
+    assert(std::abs(glideHzAt(d,40.0)-622.25)<622.25*0.03);
+    assert(std::abs(glideHzAt(d,110.0)-880.0)<880.0*0.006);
+    // Portamento OFF: POLY chords again, no glide
+    auto off=std::make_shared<EngineState>(*st);
+    off->combi.uppers[0].portamentoSec=0.0F;
+    e.setState(off);
+    e.postNoteOn(0U,69U,100U); e.postNoteOn(0U,76U,100U);
+    auto y=renderLeft(e,40);
+    assert(e.activeVoiceCount()>=2U);
+    (void)y;
     e.postPanic(); renderLeft(e,10);
+    // Panic forgets the last note: the next one does not glide
+    e.setState(st);
+    e.postNoteOn(0U,81U,100U); renderLeft(e,20); e.postPanic(); renderLeft(e,10);
     e.postNoteOn(0U,69U,100U);
     auto z=renderLeft(e,40);
     assert(std::abs(glideHzAt(z,10.0)-440.0)<440.0*0.006);
 }
 
-// MONO / LEGATO detached notes do not glide; legato notes do.
-void testPortamentoFingeredMono() {
+// MONO / LEGATO: detached and legato notes both glide from the last note.
+void testPortamentoFromLastNoteMono() {
     for(auto mode : {UpperVoiceMode::Mono, UpperVoiceMode::Legato}) {
         auto st=makeToneState(mode);
         st->combi.uppers[0].portamentoSec=0.06F;
         SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
         e.postNoteOn(0U,69U,100U); renderLeft(e,40);
-        e.postNoteOff(0U,69U,0U); renderLeft(e,5);              // let go (still fading out)
-        e.postNoteOn(0U,81U,100U);                              // detached
-        auto x=renderLeft(e,60);
-        assert(std::abs(glideHzAt(x,10.0)-880.0)<880.0*0.006);
+        e.postNoteOff(0U,69U,0U); renderLeft(e,200);            // gone completely
+        e.postNoteOn(0U,81U,100U);                              // detached: glides from 69
+        auto x=renderLeft(e,100);
+        assert(std::abs(glideHzAt(x,30.0)-622.25)<622.25*0.03);
+        assert(std::abs(glideHzAt(x,80.0)-880.0)<880.0*0.006);
         e.postNoteOn(0U,69U,100U);                              // legato from 81
         auto y=renderLeft(e,100);
         assert(std::abs(glideHzAt(y,30.0)-622.25)<622.25*0.03);
         assert(std::abs(glideHzAt(y,80.0)-440.0)<440.0*0.006);
-        e.postNoteOff(0U,69U,0U);                               // back to the held 81 - legato, glides
+        e.postNoteOff(0U,69U,0U);                               // back to the held 81
         auto z=renderLeft(e,100);
         assert(std::abs(glideHzAt(z,30.0)-622.25)<622.25*0.03);
         assert(std::abs(glideHzAt(z,80.0)-880.0)<880.0*0.006);
     }
+}
+
+// Another Sound on the Upper: the first note does not glide.
+void testPortamentoNewSoundStartsFresh() {
+    auto st=makeToneState(UpperVoiceMode::Mono);
+    st->combi.uppers[0].portamentoSec=0.06F;
+    SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
+    e.postNoteOn(0U,69U,100U); renderLeft(e,40); e.postNoteOff(0U,69U,0U); renderLeft(e,200);
+    auto other=makeToneState(UpperVoiceMode::Mono);              // a different PROGRAM object
+    other->combi.uppers[0].portamentoSec=0.06F;
+    e.setState(other);
+    e.postNoteOn(0U,81U,100U);
+    auto x=renderLeft(e,40);
+    assert(std::abs(glideHzAt(x,10.0)-880.0)<880.0*0.006);
+}
+
+// Automatic MONO of a POLY Upper: like the processor (new note, then Note Off
+// of the old one) the old note ends with its own release; a MONO Upper cuts it.
+// CC#123 forgets the last note.
+void testPortamentoAutoMonoReleaseTail() {
+    auto st=makeToneState(UpperVoiceMode::Poly);
+    auto prog=std::const_pointer_cast<Program>(st->combi.uppers[0].program);
+    prog->layers[0].ampEnvelope={0.0F,0.01F,1.0F,0.3F};          // 300 ms release
+    st->combi.uppers[0].portamentoSec=0.03F;
+    SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
+    e.postNoteOn(0U,69U,100U); renderLeft(e,40);
+    e.postNoteOn(0U,76U,100U); renderLeft(e,50);
+    assert(e.activeVoiceCount()==2U);                             // old note still in its release
+    renderLeft(e,600);
+    assert(e.activeVoiceCount()==1U);
+    auto mono=std::make_shared<EngineState>(*st);
+    mono->combi.uppers[0].voiceMode=UpperVoiceMode::Mono;
+    SamplerEngine f; f.prepare(96000.0,96U); f.setState(mono);
+    f.postNoteOn(0U,69U,100U); renderLeft(f,40);
+    f.postNoteOn(0U,76U,100U); renderLeft(f,20);
+    assert(f.activeVoiceCount()==1U);                             // MONO: the old one is cut short
+    // CC#123 on the channel: the next note starts clean
+    e.postControlChange(0U,123U,0U); renderLeft(e,10);
+    e.postNoteOn(0U,81U,100U);
+    auto x=renderLeft(e,30);
+    assert(std::abs(glideHzAt(x,10.0)-880.0)<880.0*0.006);
+}
+
+// PORTA BALANCE (the processor's number, default 11): 11 = every interval in
+// TIME; a smaller number makes the processor send a smaller CC#5, so the
+// PA600's glide - and ours - gets shorter.
+void testPortamentoBalance() {
+    SamplerEngine probe; assert(std::abs(probe.portamentoBalance()-11.0F)<1.0e-6F);
+    for(float bal : {11.0F, 8.0F}) {
+        auto st=makeToneState(UpperVoiceMode::Legato);
+        st->combi.uppers[0].portamentoSec=0.05F;
+        SamplerEngine e; e.prepare(96000.0,96U); e.setPortamentoBalance(bal); e.setState(st);
+        e.postNoteOn(0U,69U,100U); renderLeft(e,40);
+        e.postNoteOn(0U,81U,100U);
+        auto x=renderLeft(e,80);
+        const double at30=glideHzAt(x,30.0);
+        if(bal>10.0F) assert(at30<850.0);                          // 11: still gliding at 30 of 50 ms
+        else assert(std::abs(at30-880.0)<880.0*0.006);             // 8: already there (~22 ms)
+        assert(std::abs(glideHzAt(x,70.0)-880.0)<880.0*0.006);
+    }
+    SamplerEngine c; c.setPortamentoBalance(100.0F); assert(std::abs(c.portamentoBalance()-40.0F)<1.0e-6F);
 }
 
 // TIME is 1..100 ms: an older SET with a longer time still glides in 100 ms.
@@ -1817,7 +1886,10 @@ int main() {
     testLegatoPortamentoGlide();
     testPortamentoSameTimeEveryInterval();
     testPortamentoPolyFromLastNote();
-    testPortamentoFingeredMono();
+    testPortamentoFromLastNoteMono();
+    testPortamentoNewSoundStartsFresh();
+    testPortamentoAutoMonoReleaseTail();
+    testPortamentoBalance();
     testPortamentoTimeLimit();
     testPortamentoAcrossRecordings();
     testMonoSplitUppersIndependent();

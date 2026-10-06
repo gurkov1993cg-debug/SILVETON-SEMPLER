@@ -1867,6 +1867,14 @@ private:
         if (config.periods == 0U) config.periods = requestedPeriods;
         if (config.bufferFrames == 0U) config.bufferFrames = config.periodFrames * config.periods;
 
+        if (config.rate != requestedRate
+            || config.periodFrames != kPreferredMinimumPeriodFrames
+            || config.periods != requestedPeriods
+            || config.bufferFrames != config.periodFrames * config.periods) {
+            errorOut = -EINVAL;
+            return false;
+        }
+
         snd_pcm_sw_params sw{};
         sw.tstamp_mode = SNDRV_PCM_TSTAMP_ENABLE;
         sw.period_step = 1U;
@@ -1942,7 +1950,26 @@ private:
         if (pcmFd_.load(std::memory_order_acquire) >= 0) return true;
         // Mixer route is configured by the privileged pre-open root gate.
         // The APK itself only owns the PCM realtime path.
-        if (!chooseAndOpenPcmLocked()) {
+        bool opened = chooseAndOpenPcmLocked();
+        std::string routeNote;
+        // SILVETON_ROUTE_FALLBACK_V1: EINVAL from the PCM means DL1 has no
+        // connected output path (the MediaTek DL1 -> DAC mixer route is not
+        // set: root tinymix missing/failed, or Android reset the route). Set the
+        // same proven SM-X130 route directly from this control thread (never
+        // the realtime audio thread) and open the same 96 kHz / 96 x 2 again.
+        for (int routeAttempt = 0;
+             !opened && routeAttempt < 3 && lastError_.load(std::memory_order_relaxed) == -EINVAL;
+             ++routeAttempt) {
+            if (routeAttempt > 0) std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            const bool routed = configureOutputRouteLocked();
+            const int routeError = routed ? 0 : lastError_.load(std::memory_order_relaxed);
+            routeNote = routed
+                ? std::string(" [route set by app]")
+                : std::string(" [route failed errno ") + std::to_string(-routeError) + "]";
+            lastError_.store(-EINVAL, std::memory_order_relaxed);
+            opened = chooseAndOpenPcmLocked();
+        }
+        if (!opened) {
             const int error = lastError_.load(std::memory_order_relaxed);
             if (error == -EACCES || error == -EPERM) {
                 recoverRequested_.store(true, std::memory_order_release);
@@ -1951,9 +1978,12 @@ private:
                 setTextError(
                     std::string("AUDIO DRIVER: PCM open/config failed ") + kPcmDevice
                     + " (errno " + std::to_string(-error) + ")"
-                    + (error == -EBUSY ? " [PCM BUSY]" : ""));
+                    + (error == -EBUSY ? " [PCM BUSY]" : "") + routeNote);
             }
             return false;
+        }
+        if (!routeNote.empty()) {
+            __android_log_print(ANDROID_LOG_INFO, kTag, "Direct ALSA opened after app route fallback");
         }
 
         const int sr = sampleRate();

@@ -29,8 +29,8 @@ EXPECTED = [
   "e9b99e01a64de5124ed9973e74cd8de698beb6f9742f4fea2e120dcf4d6cd733"
  ],
  [
-  "android/app/src/main/java/com/silveton/sampler/SilvetonRootRuntime.kt",
-  "321a403118af211535a1e68524c28e58c7c646f6eea8d276bae48b3ad26f97aa"
+  "android/app/src/main/java/com/silveton/sampler/SamplerRuntime.kt",
+  "12ba33d075b9247c7d645f4829363e1abf88b48e2eda2b7fbb989454a4dbf3a4"
  ],
  [
   "android/app/src/main/java/com/silveton/sampler/SilvetonSamplerView.kt",

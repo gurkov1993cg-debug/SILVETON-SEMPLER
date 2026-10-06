@@ -139,6 +139,8 @@ workflows:
           grep -F 'softKill(impl, tail);' "$ENGINE"
           grep -F 'softKill(impl, existing, ' "$ENGINE"
           grep -F 'SILVETON_PRO_SOUND_V1' "$ENGINE"
+          grep -F 'SILVETON_ROUTE_FALLBACK_V1' "$BRIDGE"
+          grep -F 'withRootNote(' "$RUNTIME"
           grep -F 'struct AmpEnv' "$ENGINE"
           grep -F 'void playUpperNote(' "$ENGINE"
           grep -F 'void handleNoteOff(' "$ENGINE"

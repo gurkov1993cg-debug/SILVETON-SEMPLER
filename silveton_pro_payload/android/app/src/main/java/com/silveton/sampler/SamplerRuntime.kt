@@ -16,8 +16,6 @@ class SamplerRuntime(
     private val handler = Handler(recoveryThread.looper)
     private var running = false
     private var closed = false
-    private var owned = false
-    private val instanceId = nextInstance.incrementAndGet()
 
     private fun promoteThreadsAsync() {
         Thread({
@@ -58,11 +56,8 @@ class SamplerRuntime(
         }
     }
 
-    fun start(): Boolean = synchronized(lifecycleLock) { startLocked() }
-
-    private fun startLocked(): Boolean {
+    fun start(): Boolean {
         if (closed) return false
-        if (!owned) { owned = true; SilvetonRootRuntime.acquire() }
         val root = SilvetonRootRuntime.enter()
         if (!root.ok) {
             statusChanged(root.message)
@@ -77,7 +72,7 @@ class SamplerRuntime(
             handler.post(recoveryPoll)
         }
         if (!engine.nativeAudioOpen()) {
-            statusChanged(engine.nativeLastTextError().ifBlank { "Audio open failed (${engine.nativeLastAudioError()})" })
+            statusChanged(withRootNote(engine.nativeLastTextError().ifBlank { "Audio open failed (${engine.nativeLastAudioError()})" }, audioPermissions))
             // Keep root/SELinux grants while the Activity is alive: MIDI is
             // independent and audio can be retried without tearing permissions down.
             return false
@@ -91,30 +86,15 @@ class SamplerRuntime(
         return true
     }
 
-    fun suspendAudio() = synchronized(lifecycleLock) {
-        if (closed) return@synchronized
+    fun suspendAudio() {
+        if (closed) return
         // Keep the root performance envelope active while the sampler Activity
         // is alive. This avoids CPU/IRQ/governor churn on transient focus loss.
         engine.nativeAudioStop()
     }
 
-    fun resumeAudio(): Boolean = synchronized(lifecycleLock) {
-        var ok = resumeOnce()
-        // A quick leave and re-enter can find the PCM still busy for a moment.
-        var attempt = 0
-        while (!ok && !closed && attempt < 4) {
-            attempt++
-            try { Thread.sleep(150L) } catch (_: InterruptedException) { break }
-            engine.nativeAudioStop()
-            engine.nativeAudioClose()
-            ok = resumeOnce()
-        }
-        ok
-    }
-
-    private fun resumeOnce(): Boolean {
+    fun resumeAudio(): Boolean {
         if (closed) return false
-        if (!owned) { owned = true; SilvetonRootRuntime.acquire() }
         val root = SilvetonRootRuntime.enter()
         if (!root.ok) {
             statusChanged(root.message)
@@ -129,7 +109,7 @@ class SamplerRuntime(
             return false
         }
         if (!engine.nativeAudioOpen()) {
-            statusChanged(engine.nativeLastTextError().ifBlank { "Audio reopen failed (${engine.nativeLastAudioError()})" })
+            statusChanged(withRootNote(engine.nativeLastTextError().ifBlank { "Audio reopen failed (${engine.nativeLastAudioError()})" }, audioPermissions))
             return false
         }
         val ok = engine.nativeAudioStart()
@@ -142,25 +122,19 @@ class SamplerRuntime(
         return ok
     }
 
-    override fun close() = synchronized(lifecycleLock) {
-        if (closed) return@synchronized
+    /** Keeps the root mixer/permission problem visible next to the audio error. */
+    private fun withRootNote(message: String, root: SilvetonRootRuntime.Result): String =
+        if (root.ok || root.message.isBlank()) message else "$message | ROOT: ${root.message.lines().lastOrNull { it.isNotBlank() } ?: root.message}"
+
+    override fun close() {
+        if (closed) return
         closed = true
         running = false
         handler.removeCallbacks(recoveryPoll)
         recoveryThread.quitSafely()
-        // The native sampler is shared by the whole process. If a newer
-        // Activity already took over, closing now would silence it.
-        if (instanceId == nextInstance.get()) {
-            engine.nativePanic()
-            engine.nativeAudioStop()
-            engine.nativeAudioClose()
-        }
-        if (owned) { owned = false; SilvetonRootRuntime.release() }
-        Unit
-    }
-
-    private companion object {
-        val lifecycleLock = Any()
-        val nextInstance = java.util.concurrent.atomic.AtomicInteger(0)
+        engine.nativePanic()
+        engine.nativeAudioStop()
+        engine.nativeAudioClose()
+        SilvetonRootRuntime.leave()
     }
 }

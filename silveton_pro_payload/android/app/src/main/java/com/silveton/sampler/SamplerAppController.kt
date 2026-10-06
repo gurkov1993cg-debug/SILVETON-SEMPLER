@@ -347,6 +347,44 @@ class SamplerAppController(
         return 500
     }
 
+    /**
+     * SILVETON_KORG_WRITE_V1: Korg-style WRITE of the current 7-UPPER COMBI to
+     * LIST position [position] (0-based, as shown 1..200 on screen).
+     * An occupied position is overwritten in place; a position after the end
+     * becomes the next free one (the LIST has no gaps). The COMBI data goes to
+     * the slot that position already owns, or to a free slot, so no other LIST
+     * entry and no other BLEND is changed. Returns the written index or -1.
+     */
+    fun writeCombiToList(position: Int, name: String): Int {
+        val items = listItems(0, 0, 0)
+        if (position < 0) { fail("LIST position is invalid"); return -1 }
+        val target = minOf(position, items.size)
+        if (target >= 200) { fail("LIST is full (200)"); return -1 }
+        val finalName = name.trim().ifBlank { combiName() }
+        val old = items.getOrNull(target)
+        fun usedElsewhere(slot: Int): Boolean = items.indices.any { k ->
+            k != target && items[k].combiBank == 0 && items[k].combiPage == 0 && items[k].combiSlot == slot
+        }
+        val slot = if (old != null && old.combiBank == 0 && old.combiPage == 0 &&
+            old.combiSlot in 1..500 && !usedElsewhere(old.combiSlot)) {
+            old.combiSlot
+        } else {
+            (1..500).firstOrNull { !engine.nativeCombiSlotOccupied(0, 0, it) } ?: -1
+        }
+        if (slot !in 1..500) { fail("No free COMBI position (1..500)"); return -1 }
+        if (!nativeResult(engine.nativeWriteCombi(0, 0, slot, finalName))) return -1
+        val listed = when {
+            old != null -> engine.nativeSetListEntry(0, 0, 0, target, old.number, finalName, 0, 0, slot)
+            items.isEmpty() -> engine.nativeWriteList(0, 0, 0, "LIVE", intArrayOf(1), arrayOf(finalName), intArrayOf(0, 0, slot))
+            else -> engine.nativeInsertListEntry(0, 0, 0, target,
+                (items.maxOfOrNull { it.number } ?: 0) + 1, finalName, 0, 0, slot)
+        }
+        if (!nativeResult(listed)) return -1
+        if (!nativeResult(engine.nativeActivateListEntry(0, 0, 0, target))) return -1
+        if (!persistLiveListEdits()) return -1
+        return target
+    }
+
     fun activateCombiAddress(bank: Int, page: Int, slot: Int): Boolean =
         nativeResult(engine.nativeActivateCombi(bank, page, slot))
 

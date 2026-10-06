@@ -585,10 +585,18 @@ struct SamplerEngine::Impl {
         float fadeStep{0.0F};
         bool fading{false};
         std::uint32_t delayFramesRemaining{0U};
+        // Zone/layer gain x velocity. The Upper's level, pan and ON/MUTE/SOLO are
+        // the live mix gains below (SILVETON_LIVE_EDIT_V1).
         float baseGain{1.0F};
-        float basePan{0.0F};
-        float leftGain{0.70710678F};
-        float rightGain{0.70710678F};
+        float mixL{0.70710678F};
+        float mixR{0.70710678F};
+        float mixTargetL{0.70710678F};
+        float mixTargetR{0.70710678F};
+        float mixPanIn{0.0F};
+        float mixLevelIn{0.0F};
+        bool mixAudibleIn{true};
+        // Upper + GLOBAL tuning (semitones) this voice is playing with now.
+        double tuneSemis{0.0};
         AmpEnv ampEnv{};
         ToneLowPass toneLp{};
         bool toneOn{false};
@@ -808,6 +816,47 @@ double noteRatio(const SamplerEngine::Impl& impl, const UpperPart& upper, const 
     return (static_cast<double>(zone.sample->sampleRate) / impl.sampleRate) * std::pow(2.0, pitch / 12.0);
 }
 
+// SILVETON_LIVE_EDIT_V1 - every setting is heard on notes that already sound.
+// While an Upper keeps the same Sound, its sounding notes follow every edit at
+// once: level, pan, ON / MUTE / SOLO (smoothed, no clicks), tuning (octave,
+// transpose, fine, master tune, global transpose), TONE, LFO, controllers, EQ.
+// A note of a Sound that was replaced (or of another COMBI) keeps its own
+// settings and ends naturally.
+constexpr double kLiveMixSmoothSec = 0.005;
+
+double liveTuneSemis(const UpperPart& upper, const GlobalState& global, std::uint8_t key) noexcept {
+    const int semis = static_cast<int>(upper.transposeSemitones) + static_cast<int>(upper.octave) * 12 +
+                      static_cast<int>(global.transposeSemitones);
+    const int root = static_cast<int>(global.scaleRoot % 12U);
+    const int pc = (static_cast<int>(key) - root + 120) % 12;
+    const float scaleCents = std::clamp(global.scaleOffsetsCents[static_cast<std::size_t>(pc)], -100.0F, 100.0F);
+    const double tuneHz = std::clamp(static_cast<double>(global.masterTuneHz), 400.0, 480.0);
+    return static_cast<double>(semis) + static_cast<double>(upper.tuneCents + scaleCents) / 100.0 +
+           12.0 * std::log2(tuneHz / 440.0);
+}
+
+bool upperAudible(const EngineState& state, const UpperPart& upper) noexcept {
+    if (!upper.enabled || upper.mute) return false;
+    for (const auto& u : state.combi.uppers) if (u.enabled && u.solo) return upper.solo;
+    return true;
+}
+
+// Mix gains of a voice: Upper level x equal-power pan x ON/MUTE/SOLO.
+// Recomputed only when one of its inputs changes.
+void updateMixTarget(SamplerEngine::Impl::Voice& v, const UpperPart& upper, bool audible, float extraPan) noexcept {
+    const float panIn = v.zone->pan + v.layer->pan + upper.pan + extraPan;
+    if (panIn == v.mixPanIn && upper.levelDb == v.mixLevelIn && audible == v.mixAudibleIn) return;
+    v.mixPanIn = panIn;
+    v.mixLevelIn = upper.levelDb;
+    v.mixAudibleIn = audible;
+    if (!audible) { v.mixTargetL = v.mixTargetR = 0.0F; return; }
+    const float pan = std::clamp(panIn, -1.0F, 1.0F);
+    const float angle = (pan + 1.0F) * static_cast<float>(kPi * 0.25);
+    const float level = dbToGain(upper.levelDb);
+    v.mixTargetL = level * std::cos(angle);
+    v.mixTargetR = level * std::sin(angle);
+}
+
 void startVoice(SamplerEngine::Impl& impl,
                  SamplerEngine::Impl::Voice& v,
                  const UpperPart& upper,
@@ -864,12 +913,12 @@ void startVoice(SamplerEngine::Impl& impl,
                 0.0F, 1.0F);
         }
     }
-    v.baseGain = dbToGain(zone.gainDb + layer.levelDb + upper.levelDb) * velGain * layerVelocityGain;
-    const float pan = std::clamp(zone.pan + layer.pan + upper.pan, -1.0F, 1.0F);
-    v.basePan = pan;
-    const float angle = (pan + 1.0F) * static_cast<float>(kPi * 0.25);
-    v.leftGain = std::cos(angle);
-    v.rightGain = std::sin(angle);
+    v.baseGain = dbToGain(zone.gainDb + layer.levelDb) * velGain * layerVelocityGain;
+    v.mixPanIn = std::numeric_limits<float>::quiet_NaN();
+    updateMixTarget(v, upper, true, 0.0F);
+    v.mixL = v.mixTargetL;
+    v.mixR = v.mixTargetR;
+    v.tuneSemis = liveTuneSemis(upper, global, key);
     v.filterEnv.params = layer.filterEnvelope;
     v.pitchEnv.params = layer.pitchEnvelope;
     v.ampEnv = AmpEnv{};
@@ -1092,6 +1141,7 @@ void legatoTo(SamplerEngine::Impl& impl, SamplerEngine::Impl::Voice& v, const Up
     const double target = noteRatio(impl, upper, layer, zone, key, global);
     v.key = key;
     v.targetRatio = target;
+    v.tuneSemis = liveTuneSemis(upper, global, key);
     const float portamentoSec = glideSec;
     if (portamentoSec > 0.0F && v.ratio > 0.0 && target > 0.0) {
         const auto frames = static_cast<std::uint32_t>(std::max(1.0, static_cast<double>(portamentoSec) * impl.sampleRate));
@@ -1399,7 +1449,24 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
         for (auto& v : impl_->voices) {
             if (!v.active || v.layer == nullptr || v.upper == nullptr) continue;
             const auto uix = static_cast<std::size_t>(std::clamp(v.upperIndex, 0, kUpperCount - 1));
-            const UpperToneValues tv = effectiveToneFor(current->combi.uppers[uix], v.layer->ampEnvelope);
+            // SILVETON_LIVE_EDIT_V1: the note follows the newest settings of its Upper
+            // while that Upper still plays the same Sound.
+            if (v.ownerState.get() != current.get()) {
+                const auto& now = current->combi.uppers[uix];
+                if (now.program != nullptr && v.upper->program.get() == now.program.get()) {
+                    v.ownerState = current;
+                    v.upper = &now;
+                    v.routeMask = impl_->upperRouteMask[uix];
+                }
+            }
+            const double tune = liveTuneSemis(*v.upper, current->global, v.key);
+            if (tune != v.tuneSemis) {
+                const double m = std::exp2((tune - v.tuneSemis) / 12.0);
+                v.ratio *= m;
+                v.targetRatio *= m;
+                v.tuneSemis = tune;
+            }
+            const UpperToneValues tv = effectiveToneFor(*v.upper, v.layer->ampEnvelope);
             v.ampEnv.setBlock(tv, impl_->sampleRate);
             const bool wantOn = tv.cutoffHz < kToneCutoffOpenHz - 1.0F;
             if (wantOn && !v.toneOn) { v.toneOn = true; v.toneLog = openLog; v.toneLp.prime = true; }
@@ -1417,6 +1484,7 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
     std::array<float, kUpperCount> upperPeakL{};
     std::array<float, kUpperCount> upperPeakR{};
     const float masterGain = dbToGain(current->global.masterGainDb);
+    const float mixSmooth = static_cast<float>(1.0 - std::exp(-1.0 / (kLiveMixSmoothSec * impl_->sampleRate)));
     const float limiterCeiling = dbToGain(current->global.limiterCeilingDb);
 
     // SILVETON_RENDER_SPEED_V1: every voice renders its whole chunk at once and
@@ -1512,15 +1580,11 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
         const float controllerLevelDb = routeActive(ModDestination::LevelDb)
             ? controllerAmount(*v.upper, ch, ModDestination::LevelDb) : 0.0F;
         const float levelGain = controllerLevelDb != 0.0F ? dbToGain(std::clamp(controllerLevelDb, -96.0F, 24.0F)) : 1.0F;
-        float panLeft = v.leftGain;
-        float panRight = v.rightGain;
-        if (routeActive(ModDestination::Pan)) {
-            const float controllerPan = controllerAmount(*v.upper, ch, ModDestination::Pan);
-            const float dynamicPan = std::clamp(v.basePan + controllerPan, -1.0F, 1.0F);
-            const float panAngle = (dynamicPan + 1.0F) * static_cast<float>(kPi * 0.25);
-            panLeft = std::cos(panAngle);
-            panRight = std::sin(panAngle);
-        }
+        const float controllerPan = routeActive(ModDestination::Pan) ? controllerAmount(*v.upper, ch, ModDestination::Pan) : 0.0F;
+        updateMixTarget(v, *v.upper, upperAudible(*v.ownerState, *v.upper), controllerPan);
+        const float mixTargetL = v.mixTargetL;
+        const float mixTargetR = v.mixTargetR;
+        const bool mixMoving = mixTargetL != v.mixL || mixTargetR != v.mixR;
         const bool reverse = v.zone->reverse;
         const double loopEnd = static_cast<double>(sample.loop.endFrame);
         const double loopStart = static_cast<double>(sample.loop.startFrame);
@@ -1594,8 +1658,12 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
                 if (v.fadeGain >= 1.0F) { v.fadeGain = 1.0F; v.fadeStep = 0.0F; }
             }
             if (v.fadeStep != 0.0F || v.fadeGain < 1.0F) g *= std::sin(v.fadeGain * 1.57079632679F); // equal-power fade
-            outL[i] += sL * g * panLeft;
-            outR[i] += sR * g * panRight;
+            if (mixMoving) {
+                v.mixL += (mixTargetL - v.mixL) * mixSmooth;
+                v.mixR += (mixTargetR - v.mixR) * mixSmooth;
+            }
+            outL[i] += sL * g * v.mixL;
+            outR[i] += sR * g * v.mixR;
 
             if (reverse) v.position -= ratio; else v.position += ratio;
             if (!reverse && looping && v.position >= loopEnd) {
@@ -1603,6 +1671,10 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
             }
             if (reverse && v.position < 0.0) { v.ampEnv.forceOff(); v.active = false; break; }
             else if (!looping && v.position >= sampleEnd) { v.ampEnv.forceOff(); v.active = false; break; }
+        }
+        if (mixMoving) {
+            if (std::abs(mixTargetL - v.mixL) < 1.0e-6F) v.mixL = mixTargetL;
+            if (std::abs(mixTargetR - v.mixR) < 1.0e-6F) v.mixR = mixTargetR;
         }
       }
 

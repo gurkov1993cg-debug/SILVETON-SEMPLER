@@ -15,9 +15,23 @@
 4. Headphone lock: SILVETON plays only through the headphone jack (DL1 only into the ADDA
    headphone DAC, line-out/speaker mux open, Headset Volume 12); re-checked while playing.
    Tablet volume keys change SILVETON's MASTER and are kept away from Android's audio system.
+6. The SOUND list of an Upper opens on that Upper's own sound (e.g. position 53) and the
+   BLENDS list on the loaded blend, instead of position 1.
 5. Render speed: every voice renders its block at once; controller, bend, filter base, pan and
    level are computed once per block, filter coefficients only when they change. Same sound
    (bit-exact against the previous engine), about 2.7x less CPU per voice.
+7. New look (the approved design): dark side menu, amber LCD screens, seven UPPER strips with
+   real faders, PAN knobs and L/R meters, knob boards for TUNE / TONE / FX / EFFECTS / SETTINGS.
+   Every key, fader and knob drives the real engine. Drawn at exactly 1340x800 and scaled
+   evenly on other screens; touches are mapped back the same way.
+8. WRITE like Korg: rename, then pick any LIST position (1..200) or BLEND (1..500); a used
+   position is overwritten after a confirmation, without touching any other entry or blend.
+   The LIST shows a saved, renamed, moved, copied or deleted entry at once.
+9. Every setting is heard at once on the notes you hold: Upper level, pan, ON / MUTE / SOLO
+   (smoothed, no clicks), octave / transpose / fine / master tune, TONE, LFO, EQ, FX,
+   controllers - as long as the Upper keeps the same Sound (a replaced Sound's notes keep
+   their own settings). The number box changes the sound while its slider or - / + is
+   moved; CANCEL puts the old value back.
 
 The files are complete replacements. Each one is checked against the exact generated
 file it was made from; if anything differs the build stops instead of mixing versions.

@@ -1814,6 +1814,43 @@ void testUpperAdsrAbsolute() {
     assert(peakOf(y,20000U,28800U)>0.33);
 }
 
+// SILVETON_LIVE_EDIT_V1: a held note hears every edit of its Upper at once
+// (level, pan, ON/MUTE/SOLO smoothly, tuning), a note of a replaced Sound does not.
+void testLiveEditsOnHeldNote() {
+    auto st=makeToneState(UpperVoiceMode::Poly);
+    st->combi.uppers[1]=st->combi.uppers[0]; st->combi.uppers[1].midiChannel=5U;
+    const auto tail=[](const std::vector<float>& x){ return rms(std::vector<float>(x.end()-9600,x.end())); };
+    SamplerEngine e; e.prepare(96000.0,96U); e.setState(st); e.postNoteOn(0U,69U,100U);
+    const float ref=tail(renderLeft(e,200));
+    assert(ref>0.1F);
+    auto lvl=std::make_shared<EngineState>(*st); lvl->combi.uppers[0].levelDb=-12.0F; e.setState(lvl);
+    assert(std::abs(tail(renderLeft(e,200))-ref*0.2512F)<0.01F);        // LEVEL -12 dB on the held note
+    auto mute=std::make_shared<EngineState>(*st); mute->combi.uppers[0].mute=true; e.setState(mute);
+    auto m=renderLeft(e,200);
+    assert(tail(m)<1.0e-4F);                                              // MUTE silences it
+    double jump=0.0; for(std::size_t i=1;i<m.size();++i) jump=std::max(jump,static_cast<double>(std::abs(m[i]-m[i-1])));
+    assert(jump<0.012);                                                   // ... without a click
+    e.setState(st);
+    assert(std::abs(tail(renderLeft(e,200))-ref)<0.01F);                 // back on
+    auto solo=std::make_shared<EngineState>(*st); solo->combi.uppers[1].solo=true; e.setState(solo);
+    assert(tail(renderLeft(e,200))<1.0e-4F);                              // SOLO of another Upper
+    auto tune=std::make_shared<EngineState>(*st); tune->combi.uppers[0].transposeSemitones=2; tune->combi.uppers[0].tuneCents=50.0F; e.setState(tune);
+    auto t=renderLeft(e,200);
+    assert(std::abs(measureHz(t,t.size()-9600,t.size(),96000.0)-440.0*std::pow(2.0,2.5/12.0))<0.5);
+    auto pan=std::make_shared<EngineState>(*st); pan->combi.uppers[0].pan=-1.0F; e.setState(pan);
+    std::vector<float> out(192); float right=0.0F;
+    for(int b=0;b<200;++b){ e.render(out.data(),96U); if(b>150) for(int i=0;i<96;++i) right=std::max(right,std::abs(out[static_cast<std::size_t>(i*2+1)])); }
+    assert(right<1.0e-4F);                                                // PAN hard left
+    // Another Sound on the Upper: the held note keeps its own settings.
+    auto other=std::make_shared<Program>(*st->combi.uppers[0].program);
+    SamplerEngine g; g.prepare(96000.0,96U); g.setState(st); g.postNoteOn(0U,69U,100U);
+    const float own=tail(renderLeft(g,200));
+    auto swapped=std::make_shared<EngineState>(*st); swapped->combi.uppers[0].program=other;
+    swapped->combi.uppers[0].levelDb=-20.0F; swapped->combi.uppers[0].octave=1; g.setState(swapped);
+    auto h=renderLeft(g,200);
+    assert(std::abs(tail(h)-own)<0.005F && std::abs(measureHz(h,h.size()-9600,h.size(),96000.0)-440.0)<0.5);
+}
+
 void testUpperCutoffResonance() {
     auto st=makeToneState(UpperVoiceMode::Poly);
     SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
@@ -1896,6 +1933,7 @@ int main() {
     testToneEditKeepsHeldKeys();
     testUpperAdsrAbsolute();
     testUpperCutoffResonance();
+    testLiveEditsOnHeldNote();
     std::puts("SILVETON sampler tests passed");
     return 0;
 }

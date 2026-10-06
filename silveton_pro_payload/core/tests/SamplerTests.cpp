@@ -116,8 +116,7 @@ std::shared_ptr<EngineState> makeState(const SamplePtr& sample) {
     st->combi.name="Test Combi";
     st->combi.uppers[0].name="U1"; st->combi.uppers[0].program=prog; st->combi.uppers[0].enabled=true;
     st->combi.uppers[0].midiChannel=0U; st->combi.uppers[0].breathEnabled=false;
-    // Timing tests run without the 0.5 ms look-ahead limiter; it has its own test.
-    st->global.limiterEnabled=false; st->global.limiterCeilingDb=-0.3F;
+    st->global.limiterEnabled=true; st->global.limiterCeilingDb=-0.3F;
     return st;
 }
 
@@ -1231,8 +1230,6 @@ void testSvBankRuntime() {
     std::vector<float> bankAudio(8U,0.0F); bankEngine.render(bankAudio.data(),4U);
     float bankPeak=0.0F; for(const float v:bankAudio){const float a=v<0.0F?-v:v;if(a>bankPeak)bankPeak=a;}
     assert(bankEngine.activeVoiceCount()>0U);
-    for(int b=0;b<16;++b) { bankEngine.render(bankAudio.data(),4U); // limiter look-ahead is 47 samples
-        for(const float v:bankAudio){const float a=v<0.0F?-v:v;if(a>bankPeak)bankPeak=a;} }
     assert(bankPeak>1.0e-6F);
 
     auto corrupted=file; corrupted.back()^=0x01U;
@@ -1279,8 +1276,8 @@ void testSincAntiAliasFinite() {
 
 // ---- crackle fix regression tests -------------------------------------------
 
-// SILVETON_SMOOTH_LIMITER_V1: a loud chord never passes the ceiling and is not
-// clipped: the gain moves smoothly (no sample-to-sample gain jumps).
+// SILVETON_SMOOTH_LIMITER_V1: a loud chord never passes the ceiling and the
+// limiter adds no delay.
 void testSmoothLimiter() {
     auto s=std::make_shared<SampleData>(); s->sampleRate=96000U; s->channels=1U; s->rootKey=60U;
     s->interleaved.resize(96000U);
@@ -1596,7 +1593,7 @@ void testLegatoPortamentoGlide() {
         auto x=renderLeft(e,400); // 400 ms
         const double early=measureHz(x,300U,1500U,96000.0);
         const double late=measureHz(x,34000U,38000U,96000.0);
-        assert(early>450.0 && early<880.0);   // still gliding
+        assert(early>430.0 && early<880.0);   // still gliding (soft S-curve: starts slowly)
         assert(std::abs(late-880.0)<12.0);    // arrived
         assert(peakOf(x,0U,x.size())>0.15);
     }
@@ -1620,9 +1617,14 @@ void testPortamentoSameTimeEveryInterval() {
         e.postNoteOn(0U,static_cast<std::uint8_t>(target),100U);
         auto x=renderLeft(e,120);
         const double goal=440.0*std::pow(2.0,(target-69)/12.0);
-        const double half=440.0*std::pow(2.0,(target-69)/24.0);   // half way in semitones
-        assert(std::abs(glideHzAt(x,25.0)-half)<half*0.03);         // exactly half way at 25 ms
-        assert(std::abs(glideHzAt(x,70.0)-goal)<goal*0.006);        // arrived after 50 ms
+        // SILVETON_SOFT_GLIDE_V1: soft S-curve + PORTA BALANCE (11 ms) rounding.
+        // Every interval is the same part of the way at the same moment.
+        const double progress=12.0*std::log2(glideHzAt(x,30.0)/440.0)/static_cast<double>(target-69);
+        static double firstProgress=-1.0;
+        if(firstProgress<0.0) firstProgress=progress;
+        assert(progress>0.2 && progress<0.8);
+        assert(std::abs(progress-firstProgress)<0.05);
+        assert(std::abs(glideHzAt(x,100.0)-goal)<goal*0.006);       // arrived (TIME + BALANCE)
     }
 }
 
@@ -1637,12 +1639,12 @@ void testPortamentoPolyFromLastNote() {
     e.postNoteOn(0U,81U,100U);                                  // glides from 69
     auto x=renderLeft(e,150);
     assert(e.activeVoiceCount()==1U);                           // one line
-    assert(std::abs(glideHzAt(x,40.0)-622.25)<622.25*0.03);    // half way 440 -> 880
-    assert(std::abs(glideHzAt(x,110.0)-880.0)<880.0*0.006);
+    { const double h=glideHzAt(x,45.0); assert(h>480.0 && h<820.0); }   // gliding 440 -> 880 (soft S-curve)
+    assert(std::abs(glideHzAt(x,140.0)-880.0)<880.0*0.006);           // arrived (TIME + BALANCE)
     e.postNoteOff(0U,81U,0U);                                   // back to the still held 69 - glides
     auto back=renderLeft(e,150);
-    assert(std::abs(glideHzAt(back,40.0)-622.25)<622.25*0.03);
-    assert(std::abs(glideHzAt(back,110.0)-440.0)<440.0*0.006);
+    { const double h=glideHzAt(back,45.0); assert(h>470.0 && h<810.0); }
+    assert(std::abs(glideHzAt(back,140.0)-440.0)<440.0*0.006);
     e.postNoteOff(0U,69U,0U); renderLeft(e,200);
     assert(e.activeVoiceCount()==0U);
     e.postNoteOn(0U,81U,100U);                                  // nothing held: no glide
@@ -1678,12 +1680,12 @@ void testPortamentoFromLastNoteMono() {
         assert(std::abs(glideHzAt(x,10.0)-880.0)<880.0*0.006);
         e.postNoteOn(0U,69U,100U);                              // legato from 81
         auto y=renderLeft(e,100);
-        assert(std::abs(glideHzAt(y,30.0)-622.25)<622.25*0.03);
-        assert(std::abs(glideHzAt(y,80.0)-440.0)<440.0*0.006);
+        { const double h=glideHzAt(y,35.0); assert(h>470.0 && h<810.0); }   // gliding (soft S-curve)
+        assert(std::abs(glideHzAt(y,95.0)-440.0)<440.0*0.006);
         e.postNoteOff(0U,69U,0U);                               // back to the held 81
         auto z=renderLeft(e,100);
-        assert(std::abs(glideHzAt(z,30.0)-622.25)<622.25*0.03);
-        assert(std::abs(glideHzAt(z,80.0)-880.0)<880.0*0.006);
+        { const double h=glideHzAt(z,35.0); assert(h>480.0 && h<820.0); }
+        assert(std::abs(glideHzAt(z,95.0)-880.0)<880.0*0.006);
     }
 }
 
@@ -1737,9 +1739,16 @@ void testPortamentoBalance() {
         SamplerEngine e; e.prepare(96000.0,96U); e.setPortamentoBalance(bal); e.setState(st);
         e.postNoteOn(0U,69U,100U); renderLeft(e,40);
         e.postNoteOn(0U,81U,100U);
-        auto x=renderLeft(e,80);
-        assert(std::abs(glideHzAt(x,25.0)-622.25)<622.25*0.03);   // half way at 25 of 50 ms
-        assert(std::abs(glideHzAt(x,70.0)-880.0)<880.0*0.006);
+        auto x=renderLeft(e,160);
+        // SILVETON_SOFT_GLIDE_V1: BALANCE rounds the glide; a bigger BALANCE is softer
+        // (a little later at the same moment), every BALANCE still arrives.
+        const double h=glideHzAt(x,30.0);
+        static double prevH=0.0; static float prevBal=0.0F;
+        assert(h>460.0 && h<840.0);
+        if(prevBal>0.0F && bal>prevBal) assert(h<prevH);
+        if(prevBal>0.0F && bal<prevBal) assert(h>prevH);
+        prevH=h; prevBal=bal;
+        assert(std::abs(glideHzAt(x,150.0)-880.0)<880.0*0.006);
     }
 }
 

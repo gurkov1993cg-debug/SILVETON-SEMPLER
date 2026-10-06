@@ -665,46 +665,28 @@ void RealtimeEventQueue::clear() noexcept {
     read_.store(write_.load(std::memory_order_acquire), std::memory_order_release);
 }
 
-// SILVETON_SMOOTH_LIMITER_V1: look-ahead brickwall limiter.
-// The signal is delayed by kLook-1 samples (0.49 ms at 96 kHz). The gain is the
-// lowest gain needed in the next kLook samples, released slowly, then smoothed by
-// a kLook-sample average, so it starts to fall before a peak arrives and never
-// cuts the waveform: the peak is at most the ceiling, without clipping distortion.
+// SILVETON_SMOOTH_LIMITER_V1: zero-latency limiter (no added delay).
+// When a sample would pass the ceiling the gain drops at once to exactly what
+// that sample needs, then comes back up slowly (80 ms). Unlike the old limiter
+// it does not jump back to full gain on the next sample, so the waveform is
+// not cut flat (no clipping distortion), and nothing is delayed.
 struct SmoothLimiter {
-    static constexpr std::size_t kLook = 48U;
-    std::array<float, kLook> needGain{};
-    std::array<float, kLook> released{};
-    std::array<float, kLook> delayL{};
-    std::array<float, kLook> delayR{};
-    std::size_t pos{0U};
-    float releaseGain{1.0F};
-    double sum{static_cast<double>(kLook)};
+    float gain{1.0F};
     float releaseCoef{0.0F};
 
     void reset(double sr) noexcept {
-        needGain.fill(1.0F); released.fill(1.0F); delayL.fill(0.0F); delayR.fill(0.0F);
-        pos = 0U; releaseGain = 1.0F; sum = static_cast<double>(kLook);
+        gain = 1.0F;
         releaseCoef = static_cast<float>(1.0 - std::exp(-1.0 / (0.080 * std::max(1.0, sr))));
     }
 
     // Returns the gain that was applied (for the meter).
     float process(float& l, float& r, float ceiling) noexcept {
         const float peak = std::max(std::abs(l), std::abs(r));
-        needGain[pos] = (peak > ceiling && peak > 0.0F) ? ceiling / peak : 1.0F;
-        float m = 1.0F;
-        for (std::size_t k = 0; k < kLook; ++k) m = std::min(m, needGain[k]);
-        releaseGain = (m < releaseGain) ? m : releaseGain + (m - releaseGain) * releaseCoef;
-        sum += static_cast<double>(releaseGain) - static_cast<double>(released[pos]);
-        released[pos] = releaseGain;
-        float g = static_cast<float>(sum / static_cast<double>(kLook));
-        // Rounding guard: never above the gain this delayed sample needs.
-        const std::size_t outPos = (pos + 1U) % kLook;   // the sample kLook-1 steps back
-        g = std::min(g, needGain[outPos]);
-        const float dl = delayL[outPos], dr = delayR[outPos];
-        delayL[pos] = l; delayR[pos] = r;
-        pos = outPos;
-        l = dl * g; r = dr * g;
-        return g;
+        const float need = (peak > ceiling && peak > 0.0F) ? ceiling / peak : 1.0F;
+        gain += (1.0F - gain) * releaseCoef;
+        if (need < gain) gain = need;
+        l *= gain; r *= gain;
+        return gain;
     }
 };
 
@@ -740,6 +722,13 @@ struct SamplerEngine::Impl {
         double glideLogStep{0.0};
         double glideMul{1.0};
         std::uint32_t glideFramesRemaining{0U};
+        // SILVETON_SOFT_GLIDE_V1: glide as an offset (semitones) from targetRatio.
+        std::uint32_t glideTotalFrames{0U};
+        double glideStartSemis{0.0};   // offset when the glide started
+        double glideRawSemis{0.0};     // S-curve offset now (before BALANCE rounding)
+        double glideSmooth1{0.0};      // BALANCE rounding, stage 1
+        double glideSmooth2{0.0};      // BALANCE rounding, stage 2 = what is heard
+        bool pitchGliding{false};
         // Click-free 4 ms fade used when a voice is taken over (voice limit,
         // MONO/LEGATO note change) instead of a one-sample cut.
         float fadeGain{1.0F};
@@ -1046,6 +1035,9 @@ void startVoice(SamplerEngine::Impl& impl,
 
     v.ratio = noteRatio(impl, upper, layer, zone, key, global);
     v.targetRatio = v.ratio;
+    v.pitchGliding = false;
+    v.glideFramesRemaining = 0U;
+    v.glideRawSemis = v.glideSmooth1 = v.glideSmooth2 = 0.0;
 
     const float velocityNorm = std::max(0.0F, static_cast<float>(velocity) * kInv127);
     float velGain = velocityNorm;
@@ -1200,7 +1192,7 @@ void monoPush(SamplerEngine::Impl::MonoKeys& m, std::uint8_t key, std::uint8_t v
 //    exactly TIME (1..100 ms), evenly in semitones, the same time for every interval.
 //  * With no key held the next note is struck normally and does not glide.
 //  * The note that already sounds, pressed again, changes nothing.
-// (PORTA BALANCE only chose the CC#5 number sent to a PA600; it never changes the sound.)
+// (PORTA BALANCE now rounds every glide: see SILVETON_SOFT_GLIDE_V1.)
 constexpr float kPortamentoMaxSec = 0.100F;
 
 float portamentoSecFor(const UpperPart& upper) noexcept {
@@ -1224,17 +1216,39 @@ UpperVoiceMode voiceModeNow(SamplerEngine::Impl& impl, int ui, const UpperPart& 
     return mode;
 }
 
+// SILVETON_SOFT_GLIDE_V1: every glide moves on a soft S-curve (slow start, slow
+// end) in exactly TIME, and PORTA BALANCE (3..40 ms) rounds the pitch further, so
+// neighbouring notes slide smoothly and a new glide that starts mid-glide carries
+// on without a corner. The pitch is a continuous offset from the new key.
+void beginGlide(SamplerEngine::Impl::Voice& v, double newTargetRatio, std::uint32_t frames) noexcept {
+    const double oldTarget = v.targetRatio > 0.0 ? v.targetRatio : newTargetRatio;
+    if (!v.pitchGliding) {
+        const double now = (v.ratio > 0.0 && oldTarget > 0.0) ? 12.0 * std::log2(v.ratio / oldTarget) : 0.0;
+        v.glideRawSemis = v.glideSmooth1 = v.glideSmooth2 = now;
+    }
+    const double shift = 12.0 * std::log2(oldTarget / newTargetRatio);
+    v.glideRawSemis += shift;
+    v.glideSmooth1 += shift;
+    v.glideSmooth2 += shift;
+    v.glideStartSemis = v.glideRawSemis;
+    v.glideTotalFrames = std::max<std::uint32_t>(1U, frames);
+    v.glideFramesRemaining = v.glideTotalFrames;
+    v.targetRatio = newTargetRatio;
+    v.pitchGliding = true;
+    v.ratio = v.targetRatio * std::exp2(v.glideSmooth2 / 12.0);
+}
+
 void startPortamentoGlide(const SamplerEngine::Impl& impl, SamplerEngine::Impl::Voice& v, double fromKey, float seconds) noexcept {
     if (seconds <= 0.0F || fromKey < 0.0 || v.ratio <= 0.0) return;
     if (v.zone != nullptr && v.zone->nonTranspose) return; // fixed-pitch sample: nothing to glide
     const double semitones = fromKey - static_cast<double>(v.key);
     if (std::abs(semitones) < 1.0e-6) return;
     v.targetRatio = v.ratio;
+    v.glideRawSemis = v.glideSmooth1 = v.glideSmooth2 = semitones;   // starts on the old key
+    v.pitchGliding = true;
     v.ratio = v.targetRatio * std::exp2(semitones / 12.0);
     const auto frames = static_cast<std::uint32_t>(std::max(1.0, static_cast<double>(seconds) * impl.sampleRate));
-    v.glideFramesRemaining = frames;
-    v.glideLogStep = std::log(v.targetRatio / v.ratio) / static_cast<double>(frames);
-    v.glideMul = std::exp(v.glideLogStep);
+    beginGlide(v, v.targetRatio, frames);
 }
 
 // Same sound keeps playing; only its pitch moves to the new key (true glissando).
@@ -1243,17 +1257,16 @@ void legatoTo(SamplerEngine::Impl& impl, SamplerEngine::Impl::Voice& v, const Up
               float glideSec) noexcept {
     const double target = noteRatio(impl, upper, layer, zone, key, global);
     v.key = key;
-    v.targetRatio = target;
     v.tuneSemis = liveTuneSemis(upper, global, key);
     const float portamentoSec = glideSec;
     if (portamentoSec > 0.0F && v.ratio > 0.0 && target > 0.0) {
         const auto frames = static_cast<std::uint32_t>(std::max(1.0, static_cast<double>(portamentoSec) * impl.sampleRate));
-        v.glideFramesRemaining = frames;
-        v.glideLogStep = std::log(target / v.ratio) / static_cast<double>(frames);
-        v.glideMul = std::exp(v.glideLogStep);
+        beginGlide(v, target, frames);
     } else {
+        v.targetRatio = target;
         v.ratio = target;
         v.glideFramesRemaining = 0U;
+        v.pitchGliding = false;
     }
 }
 
@@ -1664,6 +1677,9 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
     const float masterGain = dbToGain(current->global.masterGainDb);
     const float mixSmooth = static_cast<float>(1.0 - std::exp(-1.0 / (kLiveMixSmoothSec * impl_->sampleRate)));
     const float limiterCeiling = dbToGain(current->global.limiterCeilingDb);
+    // PORTA BALANCE (ms) -> two rounding stages, each half the balance time.
+    const double glideRound = 1.0 - std::exp(-1.0 / (std::max(0.0005, 0.0005 * static_cast<double>(
+        impl_->portaBalance.load(std::memory_order_relaxed))) * impl_->sampleRate));
 
     // SILVETON_RENDER_SPEED_V1: every voice renders its whole chunk at once and
     // everything that cannot change inside a block (controllers, pitch bend,
@@ -1783,10 +1799,23 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
             const float filterEnv = filterEnvNeeded ? v.filterEnv.process(impl_->sampleRate) : 0.0F;
             if (!v.ampEnv.active()) { v.active = false; break; }
 
-            if (v.glideFramesRemaining > 0U) {
-                v.ratio *= v.glideMul;
-                --v.glideFramesRemaining;
-                if (v.glideFramesRemaining == 0U) v.ratio = v.targetRatio;
+            if (v.pitchGliding) {
+                double raw = 0.0;
+                if (v.glideFramesRemaining > 0U) {
+                    --v.glideFramesRemaining;
+                    const double t = 1.0 - static_cast<double>(v.glideFramesRemaining) / static_cast<double>(v.glideTotalFrames);
+                    raw = v.glideStartSemis * (1.0 - t * t * (3.0 - 2.0 * t));
+                }
+                v.glideRawSemis = raw;
+                v.glideSmooth1 += (raw - v.glideSmooth1) * glideRound;
+                v.glideSmooth2 += (v.glideSmooth1 - v.glideSmooth2) * glideRound;
+                if (v.glideFramesRemaining == 0U && std::abs(v.glideSmooth2) < 1.0e-6 && std::abs(v.glideSmooth1) < 1.0e-6) {
+                    v.pitchGliding = false;
+                    v.glideSmooth1 = v.glideSmooth2 = 0.0;
+                    v.ratio = v.targetRatio;
+                } else {
+                    v.ratio = v.targetRatio * std::exp2(v.glideSmooth2 / 12.0);
+                }
             }
 
             double ratio = v.ratio;

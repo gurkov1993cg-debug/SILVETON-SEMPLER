@@ -613,7 +613,16 @@ class SilvetonSamplerView(
         cell(0, 1, "XRUN", a.xrunCount.toString(), if (a.xrunCount > 0) C_LCD_BAD else C_LCD_VALUE)
         cell(1, 1, "ЛАТЕНЦИЯ", if (a.estimatedLatencyMs >= 0.0) "%.1f ms".format(a.estimatedLatencyMs) else "—", C_LCD_VALUE)
         val porta = upperStates[selectedUpper]?.portamentoSec ?: 0f
-        cell(2, 1, "PORTA U${selectedUpper + 1}", if (porta <= 0f) "OFF" else "${round(porta * 1000f).toInt()} ms", C_LCD_VALUE)
+        // SILVETON_PORTA_BALANCE_V2: PORTA BALANCE is back (3..40 ms, whole sampler):
+        // how softly the pitch rounds into and out of every glide. Tap = change.
+        val bal = sampler.portaBalance()
+        cell(2, 1, "PORTA U${selectedUpper + 1}", (if (porta <= 0f) "OFF" else "${round(porta * 1000f).toInt()}ms") + " B$bal", C_LCD_VALUE)
+        val balR = RectF(st.left + 16f + 2f * colW, st.top + 40f, st.right - 4f, st.bottom - 2f)
+        hit(balR, { _, _ ->
+            val old = sampler.portaBalance()
+            showNumber("PORTA BALANCE (ms)", old.toFloat(), 3f, 40f, 0,
+                restore = { sampler.setPortaBalance(old); invalidate() }) { sampler.setPortaBalance(round(it).toInt()); invalidate() }
+        })
 
         val blendsR = RectF(1026f, 14f, 1206f, 50f)
         lightKey(c, blendsR, "BLENDS")

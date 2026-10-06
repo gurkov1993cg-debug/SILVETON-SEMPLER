@@ -42,10 +42,14 @@
    (24..64 points, 12 kernels per octave). 0..20 kHz flat, every image/alias that could
    land in 0..20 kHz rejected by 110 dB or more; after the first loop pass the frames
    before the loop start are taken from the loop end. The old 4-point cubic stays available.
-13. Smooth look-ahead limiter on MASTER (0.49 ms): the gain falls before a peak and
-   comes back in 80 ms, so loud playing is never clipped.
+13. Zero-latency smooth limiter on MASTER (no added delay): the gain drops to exactly
+   what a peak needs and comes back in 80 ms, so loud playing is not cut flat.
 14. TPDF dither before the 16-bit output: quiet tails fade smoothly, digital silence
    stays silent.
+15. MIDI: every input port of each USB MIDI device is read (a Korg sends what enters its
+   MIDI IN, e.g. a breath controller, on its second port).
+16. Soft portamento: every glide follows an S-curve in TIME, and PORTA BALANCE (3..40 ms,
+   default 11, tap the PORTA field on the status screen) rounds it further.
 
 The files are complete replacements. Each one is checked against the exact generated
 file it was made from; if anything differs the build stops instead of mixing versions.

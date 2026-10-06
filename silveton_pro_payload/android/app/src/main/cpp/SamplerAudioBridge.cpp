@@ -1513,24 +1513,42 @@ private:
             it = rawMidiPorts_.erase(it);
         }
 
+        // SILVETON_ALL_MIDI_PORTS_V1: one USB MIDI device can carry several MIDI
+        // ports inside one node (e.g. a Korg sends its keys on port 1 and what
+        // comes into its MIDI IN on port 2). Each open of the node takes the next
+        // free input port, so the node is opened once per port it has.
         int firstOpenError = 0;
         for (const auto& path : discovered) {
-            const bool alreadyOpen = std::any_of(rawMidiPorts_.begin(), rawMidiPorts_.end(), [&](const RawMidiPort& port) {
-                return port.path == path && port.fd >= 0;
-            });
-            if (alreadyOpen || rawMidiPorts_.size() >= kMaxRawMidiPorts) continue;
+            const auto openCount = static_cast<unsigned>(std::count_if(rawMidiPorts_.begin(), rawMidiPorts_.end(),
+                [&](const RawMidiPort& port) { return port.path == path && port.fd >= 0; }));
+            if (openCount > 0U || rawMidiPorts_.size() >= kMaxRawMidiPorts) continue;
 
             const int fd = openRawMidiInput(path);
             if (fd < 0) {
                 if (firstOpenError == 0) firstOpenError = -errno;
                 continue;
             }
+            unsigned inputPorts = 1U;
+            snd_rawmidi_info info{};
+            info.stream = SNDRV_RAWMIDI_STREAM_INPUT;
+            if (::ioctl(fd, SNDRV_RAWMIDI_IOCTL_INFO, &info) == 0 && info.subdevices_count > 1U) {
+                inputPorts = std::min<unsigned>(info.subdevices_count, 8U);
+            }
 
             RawMidiPort port{};
             port.path = path;
             port.fd = fd;
             rawMidiPorts_.push_back(std::move(port));
-            __android_log_print(ANDROID_LOG_INFO, kTag, "Direct MIDI attached: %s", path.c_str());
+            __android_log_print(ANDROID_LOG_INFO, kTag, "Direct MIDI attached: %s (%u ports)", path.c_str(), inputPorts);
+
+            for (unsigned extra = 1U; extra < inputPorts && rawMidiPorts_.size() < kMaxRawMidiPorts; ++extra) {
+                const int more = openRawMidiInput(path);
+                if (more < 0) break;
+                RawMidiPort next{};
+                next.path = path;
+                next.fd = more;
+                rawMidiPorts_.push_back(std::move(next));
+            }
         }
 
         midiDeviceCount_.store(static_cast<int>(rawMidiPorts_.size()), std::memory_order_relaxed);

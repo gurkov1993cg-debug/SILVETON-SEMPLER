@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """SILVETON PRO SOUND (must run LAST, after codemagic_crackle_fix.py).
 
-1. PORTAMENTO exactly like the SILVETON keyboard processor: TIME 1..100 ms, the same time for
-   every interval, automatic MONO while portamento is ON (POLY Upper -> one line, last key wins,
-   back to a held key; the old note gets a normal Note Off and ends with its own release),
-   glides from the last note also after release; starts fresh on another Sound, after OFF,
-   PANIC or CC#120/123. LEGATO keeps the same sound and only moves its pitch.
-   PORTA BALANCE (SETTINGS, 3..40, default 11, kept between sessions): the processor's Korg
-   glide model - the CC#5 it would send for the interval, played as the PA600 plays it.
+1. PORTAMENTO exactly like the SILVETON portamento page (Silveton-Portamento-Keys): while
+   portamento is ON an Upper plays one line (last key wins, back to a key still held). While a
+   key is held the line is one continuous sound - no new strike; the pitch glides from the pitch
+   sounding now to the new key in exactly TIME (1..100 ms), evenly in semitones, the same time
+   for every interval. With no key held the next note is struck normally without a glide; the
+   note that already sounds pressed again changes nothing. PORTA BALANCE is gone (it only chose
+   the CC#5 number for a PA600 and never changed the sound).
 2. Professional exponential ADSR and a 12 dB low-pass CUTOFF / RESONANCE per Upper (TONE),
    live while keys are held, stored in SET v11.
 3. Audio start exactly as in the working crackle-fix version; if the PCM reports EINVAL
@@ -32,6 +32,12 @@
    controllers - as long as the Upper keeps the same Sound (a replaced Sound's notes keep
    their own settings). The number box changes the sound while its slider or - / + is
    moved; CANCEL puts the old value back.
+10. LIST positions are fixed like Korg Performances: WRITE to any position 1..200 (also after
+   empty ones), COPY and MOVE to a position chosen on the same screen (a used one is
+   overwritten after a confirmation), DELETE leaves the place empty - nothing else moves.
+11. Effects: FX1 / FX2 knobs now reach FX1 / FX2 (they were one slot off), FX1 and FX2 have
+   their own engines, DELAY with working TONE and click-free TIME, a new studio plate REVERB
+   (DECAY 0.6..12 s, TONE), and every effect shows only the knobs it really uses.
 
 The files are complete replacements. Each one is checked against the exact generated
 file it was made from; if anything differs the build stops instead of mixing versions.

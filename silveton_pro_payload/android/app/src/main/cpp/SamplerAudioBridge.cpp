@@ -224,7 +224,38 @@ std::string jstringToUtf8(JNIEnv* env, jstring s) {
 class AndroidSamplerAudio {
 public:
     AndroidSamplerAudio() = default;
-    ~AndroidSamplerAudio() { close(); }
+    ~AndroidSamplerAudio() {
+        close();
+        std::lock_guard<std::mutex> lock(routeMutex_);
+        if (routeFd_ >= 0) { ::close(routeFd_); routeFd_ = -1; }
+    }
+
+    // SILVETON_HEADPHONE_LOCK_V1: SILVETON plays ONLY through the headphone jack.
+    // DL1 (SILVETON's PCM) feeds only the ADDA headphone DAC and the ADDA takes
+    // only DL1; the line-out (speaker) mux is open; the proven headphone route and
+    // Headset Volume 12 stay set. Runs before every PCM open and, while audio
+    // runs, from the recovery thread (never the realtime audio thread) so Android
+    // cannot move the output to the tablet speakers. Only differing values are written.
+    bool enforceHeadphoneRoute(bool onlyWhileRunning) {
+        if (onlyWhileRunning && !started_.load(std::memory_order_acquire)) return true;
+        std::lock_guard<std::mutex> lock(routeMutex_);
+        if (routeFd_ < 0) {
+            routeFd_ = ::open(kControlDevice, O_RDWR | O_CLOEXEC);
+            if (routeFd_ < 0) return false;
+            if (!scanRouteLocked() || routeTargets_.empty()) {
+                ::close(routeFd_); routeFd_ = -1; routeTargets_.clear();
+                return false;
+            }
+            __android_log_print(ANDROID_LOG_INFO, kTag, "Headphone lock: %zu mixer controls", routeTargets_.size());
+        }
+        const int changed = applyRouteLocked();
+        if (changed < 0) {
+            ::close(routeFd_); routeFd_ = -1; routeTargets_.clear(); // rescan next time
+            return false;
+        }
+        if (changed > 0) __android_log_print(ANDROID_LOG_INFO, kTag, "Headphone lock restored %d mixer controls", changed);
+        return true;
+    }
 
     bool open() {
         std::lock_guard<std::mutex> lock(controlMutex_);
@@ -1781,6 +1812,95 @@ private:
         return true;
     }
 
+    struct RouteTarget {
+        snd_ctl_elem_id id{};
+        bool enumerated{false};
+        unsigned count{0U};
+        long value{0};
+    };
+
+    bool scanRouteLocked() {
+        routeTargets_.clear();
+        snd_ctl_elem_list list{};
+        if (::ioctl(routeFd_, SNDRV_CTL_IOCTL_ELEM_LIST, &list) < 0 || list.count == 0U) return false;
+        std::vector<snd_ctl_elem_id> ids(list.count);
+        list.offset = 0U;
+        list.space = list.count;
+        list.pids = ids.data();
+        if (::ioctl(routeFd_, SNDRV_CTL_IOCTL_ELEM_LIST, &list) < 0) return false;
+        const unsigned used = std::min<unsigned>(list.used, static_cast<unsigned>(ids.size()));
+        for (unsigned i = 0U; i < used; ++i) {
+            const char* raw = reinterpret_cast<const char*>(ids[i].name);
+            const std::string name(raw, ::strnlen(raw, SNDRV_CTL_ELEM_ID_NAME_MAXLEN));
+            snd_ctl_elem_info info{};
+            info.id = ids[i];
+            if (::ioctl(routeFd_, SNDRV_CTL_IOCTL_ELEM_INFO, &info) < 0) continue;
+            const bool isSwitch = info.type == SNDRV_CTL_ELEM_TYPE_BOOLEAN ||
+                (info.type == SNDRV_CTL_ELEM_TYPE_INTEGER && info.value.integer.min == 0 && info.value.integer.max == 1);
+            RouteTarget t;
+            t.id = info.id;
+            t.count = std::min<unsigned>(info.count, 128U);
+            if (t.count == 0U) continue;
+            if (name == "ADDA_DL_CH1 DL1_CH1" || name == "ADDA_DL_CH2 DL1_CH2") {
+                if (!isSwitch) continue;
+                t.value = 1;                                   // DL1 -> headphone DAC
+            } else if (isSwitch && (name.find(" DL1_CH") != std::string::npos || name.rfind("ADDA_DL_CH", 0) == 0)) {
+                t.value = 0;                                   // DL1 nowhere else, nothing else into the DAC
+            } else if (info.type == SNDRV_CTL_ELEM_TYPE_ENUMERATED) {
+                const char* want = name == "DAC In Mux" ? "Normal Path"
+                    : (name == "HPL Mux" || name == "HPR Mux") ? "Audio Playback"
+                    : name == "LOL Mux" ? "Open" : nullptr;   // line-out (speaker) off
+                if (want == nullptr) continue;
+                bool found = false;
+                for (unsigned item = 0U; item < info.value.enumerated.items; ++item) {
+                    snd_ctl_elem_info itemInfo{};
+                    itemInfo.id = info.id;
+                    itemInfo.value.enumerated.item = item;
+                    if (::ioctl(routeFd_, SNDRV_CTL_IOCTL_ELEM_INFO, &itemInfo) < 0) break;
+                    if (std::strncmp(itemInfo.value.enumerated.name, want, sizeof(itemInfo.value.enumerated.name)) == 0) {
+                        t.value = static_cast<long>(item);
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) continue;
+                t.enumerated = true;
+            } else if (name == "Headset Volume" && info.type == SNDRV_CTL_ELEM_TYPE_INTEGER &&
+                       info.value.integer.min <= 12 && info.value.integer.max >= 12) {
+                t.value = 12;                                  // never above 12
+            } else {
+                continue;
+            }
+            routeTargets_.push_back(t);
+        }
+        return true;
+    }
+
+    // Number of controls that had to be changed back, -1 on error.
+    int applyRouteLocked() {
+        int changed = 0;
+        for (const auto& t : routeTargets_) {
+            snd_ctl_elem_value now{};
+            now.id = t.id;
+            if (::ioctl(routeFd_, SNDRV_CTL_IOCTL_ELEM_READ, &now) < 0) return -1;
+            bool same = true;
+            for (unsigned i = 0U; i < t.count; ++i) {
+                if (t.enumerated ? now.value.enumerated.item[i] != static_cast<unsigned>(t.value)
+                                 : now.value.integer.value[i] != t.value) { same = false; break; }
+            }
+            if (same) continue;
+            snd_ctl_elem_value want{};
+            want.id = t.id;
+            for (unsigned i = 0U; i < t.count; ++i) {
+                if (t.enumerated) want.value.enumerated.item[i] = static_cast<unsigned>(t.value);
+                else want.value.integer.value[i] = t.value;
+            }
+            if (::ioctl(routeFd_, SNDRV_CTL_IOCTL_ELEM_WRITE, &want) < 0) return -1;
+            ++changed;
+        }
+        return changed;
+    }
+
     bool configureOutputRouteLocked() {
         const int fd = ::open(kControlDevice, O_RDWR | O_CLOEXEC);
         if (fd < 0) {
@@ -1950,6 +2070,7 @@ private:
         if (pcmFd_.load(std::memory_order_acquire) >= 0) return true;
         // Mixer route is configured by the privileged pre-open root gate.
         // The APK itself only owns the PCM realtime path.
+        (void)enforceHeadphoneRoute(false);
         bool opened = chooseAndOpenPcmLocked();
         std::string routeNote;
         // SILVETON_ROUTE_FALLBACK_V1: EINVAL from the PCM means DL1 has no
@@ -2293,6 +2414,9 @@ private:
     mutable std::mutex controlMutex_;
     mutable std::mutex errorMutex_;
     std::string textError_;
+    std::mutex routeMutex_;
+    int routeFd_{-1};
+    std::vector<RouteTarget> routeTargets_{};
 };
 
 std::unique_ptr<AndroidSamplerAudio> gSampler;
@@ -2357,6 +2481,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_silveton_sampler_NativeSamplerEngine_
 extern "C" JNIEXPORT void JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeAudioClose(JNIEnv*,jobject){sampler().close();}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeAudioRecover(JNIEnv*,jobject){return sampler().recover()?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeAudioNeedsRecovery(JNIEnv*,jobject){return sampler().needsRecovery()?JNI_TRUE:JNI_FALSE;}
+extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeEnforceOutputRoute(JNIEnv*,jobject){return sampler().enforceHeadphoneRoute(true)?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeLoadAudio(JNIEnv* env,jobject,jstring path){return sampler().loadAudioFile(jstringToUtf8(env,path))?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeLoadKmp(JNIEnv* env,jobject,jstring path){return sampler().loadKmp(jstringToUtf8(env,path))?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jintArray JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeImportKmpToLibrary(JNIEnv* env,jobject,jstring path){return intVectorArray(env,sampler().importKmpToLibrary(jstringToUtf8(env,path)));}

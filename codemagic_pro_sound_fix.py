@@ -9,6 +9,9 @@
    live while keys are held, stored in SET v11.
 3. Audio start exactly as in the working crackle-fix version; if the PCM reports EINVAL
    (no DL1 -> DAC mixer route) the app sets the proven SM-X130 route itself and opens again.
+4. Headphone lock: SILVETON plays only through the headphone jack (DL1 only into the ADDA
+   headphone DAC, line-out/speaker mux open, Headset Volume 12); re-checked while playing.
+   Tablet volume keys change SILVETON's MASTER and are kept away from Android's audio system.
 
 The files are complete replacements. Each one is checked against the exact generated
 file it was made from; if anything differs the build stops instead of mixing versions.
@@ -19,6 +22,10 @@ EXPECTED = [
  [
   "android/app/src/main/cpp/SamplerAudioBridge.cpp",
   "bb3e83f5e598c4c155f6e30dbfc3867dbe29cf5253f7468a800c0c1648d1f26f"
+ ],
+ [
+  "android/app/src/main/java/com/silveton/sampler/MainActivity.kt",
+  "02187e015b8bd50af51a95b5332f049e19e7fe6039e2968e48edf6e13e46fea4"
  ],
  [
   "android/app/src/main/java/com/silveton/sampler/NativeSamplerEngine.kt",

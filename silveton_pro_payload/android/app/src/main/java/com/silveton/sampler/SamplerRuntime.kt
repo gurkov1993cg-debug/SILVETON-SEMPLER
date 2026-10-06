@@ -30,6 +30,8 @@ class SamplerRuntime(
     private val recoveryPoll = object : Runnable {
         override fun run() {
             if (closed) return
+            // Headphone lock: if Android moved the output to the speakers, put it back.
+            engine.nativeEnforceOutputRoute()
             if (engine.nativeAudioNeedsRecovery()) {
                 val root = SilvetonRootRuntime.enter()
                 if (!root.ok) {

@@ -14,6 +14,8 @@ class NativeSamplerEngine {
     external fun nativeAudioClose()
     external fun nativeAudioRecover(): Boolean
     external fun nativeAudioNeedsRecovery(): Boolean
+    /** Keeps SILVETON on the headphone jack only (no-op while audio is stopped). */
+    external fun nativeEnforceOutputRoute(): Boolean
     external fun nativeLoadAudio(path: String): Boolean
     external fun nativeLoadKmp(path: String): Boolean
     external fun nativeImportKmpToLibrary(path: String): IntArray

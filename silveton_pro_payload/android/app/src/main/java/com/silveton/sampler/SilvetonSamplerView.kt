@@ -1585,6 +1585,8 @@ class SilvetonSamplerView(
     private fun refreshAllUppers(){for(i in 0 until 7)refreshUpper(i)}
     private fun refreshFx(){fxState=sampler.combiFxState()}
     private fun refreshGlobal(){globalState=sampler.globalUiState()}
+    /** MASTER changed from outside the screen (tablet volume keys). */
+    fun globalChangedOutside(){refreshGlobal();invalidate()}
     private fun refreshListCache(){
         cachedListItems=sampler.listItems(0,0,0)
         cachedActiveListEntry=sampler.activeListEntry(0,0,0)

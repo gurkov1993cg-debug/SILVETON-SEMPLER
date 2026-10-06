@@ -523,6 +523,14 @@ class SamplerAppController(
             v[9].toInt(), v[10].toInt(), v[11].toInt(), v[12] >= 0.5f, v[13] >= 0.5f)
     }
 
+    /** Tablet volume keys: SILVETON's own MASTER level (same range as SETTINGS). */
+    fun nudgeMasterGain(stepDb: Float): Float? {
+        val g = globalUiState() ?: return null
+        val next = (g.masterGainDb + stepDb).coerceIn(-60f, 18f)
+        if (!updateGlobalUi(g.copy(masterGainDb = next))) return null
+        return next
+    }
+
     fun updateGlobalUi(state: GlobalUiState): Boolean = nativeResult(
         engine.nativeUpdateGlobal(state.masterTuneHz, state.transpose, state.masterGainDb, state.eqLowDb, state.eqMidDb, state.eqHighDb,
             state.limiterEnabled, state.limiterCeilingDb, state.velocityCurve, state.breathCc, state.expressionCc, state.damperCc,

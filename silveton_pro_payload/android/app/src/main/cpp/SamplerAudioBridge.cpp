@@ -1867,14 +1867,6 @@ private:
         if (config.periods == 0U) config.periods = requestedPeriods;
         if (config.bufferFrames == 0U) config.bufferFrames = config.periodFrames * config.periods;
 
-        if (config.rate != requestedRate
-            || config.periodFrames != kPreferredMinimumPeriodFrames
-            || config.periods != requestedPeriods
-            || config.bufferFrames != config.periodFrames * config.periods) {
-            errorOut = -EINVAL;
-            return false;
-        }
-
         snd_pcm_sw_params sw{};
         sw.tstamp_mode = SNDRV_PCM_TSTAMP_ENABLE;
         sw.period_step = 1U;

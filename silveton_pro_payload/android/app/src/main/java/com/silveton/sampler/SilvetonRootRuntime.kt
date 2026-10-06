@@ -13,19 +13,6 @@ internal object SilvetonRootRuntime {
 
     private val lock = Any()
     @Volatile private var active = false
-    private var owners = 0
-
-    /** Counted entry: a fast Activity re-launch must not lose the root envelope. */
-    fun acquire(): Result = synchronized(lock) {
-        owners++
-        enter()
-    }
-
-    /** Counted exit: restores the system only when the last owner leaves. */
-    fun release(): Result = synchronized(lock) {
-        if (owners > 0) owners--
-        if (owners > 0) Result(true) else leave()
-    }
 
     fun enter(): Result = synchronized(lock) {
         if (active) return@synchronized Result(true)
@@ -71,8 +58,6 @@ internal object SilvetonRootRuntime {
                 }
 
             # SILVETON takes the sound card away from Android while it runs.
-            # The running Android audio services are remembered and are started
-            # again when SILVETON leaves.
             if [ ! -s "${'$'}STATE/audio_services" ]; then
                 getprop | grep -E '^\[init\.svc\..*audio.*\]: \[running\]' \
                     | sed 's/^\[init\.svc\.\(.*\)\]: .*/\1/' > "${'$'}STATE/audio_services" 2>/dev/null || true

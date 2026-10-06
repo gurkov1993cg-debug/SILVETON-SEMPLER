@@ -6,7 +6,9 @@
    PORTAMENTO glides in pitch.
 2. Professional exponential ADSR (ATTACK / DECAY / SUSTAIN / RELEASE in ms and percent) and a
    12 dB low-pass CUTOFF / RESONANCE per Upper, live while keys are held, stored in SET v11.
-3. (lifecycle changes removed: audio start is exactly as in the working crackle-fix version)
+3. Quick leave / re-enter of the app: the native sampler (bank, BLENDS, audio) is no longer
+   replaced, the old Activity can no longer switch off the new one, the bank is loaded
+   even when audio needs a second try.
 
 The files are complete replacements. Each one is checked against the exact generated
 file it was made from; if anything differs the build stops instead of mixing versions.
@@ -25,6 +27,10 @@ EXPECTED = [
  [
   "android/app/src/main/java/com/silveton/sampler/SamplerAppController.kt",
   "e9b99e01a64de5124ed9973e74cd8de698beb6f9742f4fea2e120dcf4d6cd733"
+ ],
+ [
+  "android/app/src/main/java/com/silveton/sampler/SilvetonRootRuntime.kt",
+  "321a403118af211535a1e68524c28e58c7c646f6eea8d276bae48b3ad26f97aa"
  ],
  [
   "android/app/src/main/java/com/silveton/sampler/SilvetonSamplerView.kt",

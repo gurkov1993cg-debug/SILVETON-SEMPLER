@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """SILVETON PRO SOUND (must run LAST, after codemagic_crackle_fix.py).
 
-1. MONO / LEGATO: held keys are remembered; releasing the top key returns to the key
-   that is still held; LEGATO keeps the same sound and only moves its pitch (true glissando);
-   PORTAMENTO glides in pitch.
-2. Professional exponential ADSR (ATTACK / DECAY / SUSTAIN / RELEASE in ms and percent) and a
-   12 dB low-pass CUTOFF / RESONANCE per Upper, live while keys are held, stored in SET v11.
-3. Quick leave / re-enter of the app: the native sampler (bank, BLENDS, audio) is no longer
-   replaced, the old Activity can no longer switch off the new one, the bank is loaded
-   even when audio needs a second try.
+1. PORTAMENTO like KORG KRONOS (Fingered, Constant Time): glides only when playing legato
+   (new key while another key of the Upper is held), the same time for every interval,
+   TIME 1..100 ms; detached notes start clean. MONO / LEGATO: held keys are remembered,
+   LEGATO keeps the same sound and only moves its pitch.
+2. Professional exponential ADSR and a 12 dB low-pass CUTOFF / RESONANCE per Upper (TONE),
+   live while keys are held, stored in SET v11.
+3. Audio start exactly as in the working crackle-fix version; if the PCM reports EINVAL
+   (no DL1 -> DAC mixer route) the app sets the proven SM-X130 route itself and opens again.
 
 The files are complete replacements. Each one is checked against the exact generated
 file it was made from; if anything differs the build stops instead of mixing versions.

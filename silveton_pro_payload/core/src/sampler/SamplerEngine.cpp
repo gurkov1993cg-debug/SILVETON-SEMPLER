@@ -580,6 +580,10 @@ struct SamplerEngine::Impl {
         std::uint8_t count{0U};
     };
     std::array<MonoKeys, kUpperCount> mono{};
+    // PORTAMENTO like the SILVETON keyboard processor: the key each Upper last
+    // started (-1 = none, the next note does not glide) and the Sound it belongs to.
+    std::array<int, kUpperCount> portaLastKey{{-1, -1, -1, -1, -1, -1, -1}};
+    std::array<const Program*, kUpperCount> portaProgram{};
     std::uint64_t voiceAge{0U};
     float peakL{0.0F};
     float peakR{0.0F};
@@ -628,6 +632,8 @@ struct SamplerEngine::Impl {
         upperRouteMask.fill(0U);
         for (auto& c : channels) c = ChannelState{};
         for (auto& m : mono) m = MonoKeys{};
+        portaLastKey.fill(-1);
+        portaProgram.fill(nullptr);
         for (auto& v : voices) v = Voice{};
         lowEq.reset(); midEq.reset(); highEq.reset();
         for (auto& q : upperLowEq) q.reset();
@@ -913,6 +919,7 @@ void panic(SamplerEngine::Impl& impl) noexcept {
     }
     for (auto& c : impl.channels) c = SamplerEngine::Impl::ChannelState{};
     for (auto& m : impl.mono) m = SamplerEngine::Impl::MonoKeys{};
+    impl.portaLastKey.fill(-1);
 }
 
 constexpr float kLegatoCrossfadeSec = 0.030F; // equal-power, only between two different recordings
@@ -928,13 +935,55 @@ void monoPush(SamplerEngine::Impl::MonoKeys& m, std::uint8_t key, std::uint8_t v
     m.key[m.count] = key; m.vel[m.count] = vel; ++m.count;
 }
 
+// SILVETON_PORTA_PROCESSOR_V1 / SILVETON_PORTA_FINGERED_V1 - PORTAMENTO like
+// KORG KRONOS (Fingered, Constant Time): it glides ONLY when the new key is
+// pressed while another key of that Upper is still held (legato playing); a
+// detached note starts clean on its own pitch. Every interval takes exactly the
+// same time (TIME 1..100 ms), the pitch moves evenly in semitones. MONO/LEGATO
+// glide from the pitch that is sounding, POLY from the last key played. It
+// starts fresh when the Upper gets another Sound or portamento was OFF.
+constexpr float kPortamentoMaxSec = 0.100F;
+
+float portamentoSecFor(const UpperPart& upper) noexcept {
+    return std::clamp(upper.portamentoSec, 0.0F, kPortamentoMaxSec);
+}
+
+// Pitch (in keys) the Upper glides from: the pitch a MONO/LEGATO Upper is
+// sounding right now (also part-way through a glide), otherwise the last key.
+double portamentoFromKey(const SamplerEngine::Impl& impl, int ui, bool mono) noexcept {
+    if (mono) {
+        const SamplerEngine::Impl::Voice* newest = nullptr;
+        for (const auto& v : impl.voices) {
+            if (!v.active || v.fading || v.upperIndex != ui || v.ratio <= 0.0 || v.targetRatio <= 0.0) continue;
+            if (newest == nullptr || v.age > newest->age) newest = &v;
+        }
+        if (newest != nullptr) {
+            return static_cast<double>(newest->key) + 12.0 * std::log2(newest->ratio / newest->targetRatio);
+        }
+    }
+    return static_cast<double>(impl.portaLastKey[static_cast<std::size_t>(ui)]);
+}
+
+void startPortamentoGlide(const SamplerEngine::Impl& impl, SamplerEngine::Impl::Voice& v, double fromKey, float seconds) noexcept {
+    if (seconds <= 0.0F || fromKey < 0.0 || v.ratio <= 0.0) return;
+    if (v.zone != nullptr && v.zone->nonTranspose) return; // fixed-pitch sample: nothing to glide
+    const double semitones = fromKey - static_cast<double>(v.key);
+    if (std::abs(semitones) < 1.0e-6) return;
+    v.targetRatio = v.ratio;
+    v.ratio = v.targetRatio * std::exp2(semitones / 12.0);
+    const auto frames = static_cast<std::uint32_t>(std::max(1.0, static_cast<double>(seconds) * impl.sampleRate));
+    v.glideFramesRemaining = frames;
+    v.glideLogStep = std::log(v.targetRatio / v.ratio) / static_cast<double>(frames);
+    v.glideMul = std::exp(v.glideLogStep);
+}
+
 // Same sound keeps playing; only its pitch moves to the new key (true glissando).
 void legatoTo(SamplerEngine::Impl& impl, SamplerEngine::Impl::Voice& v, const UpperPart& upper,
               const ProgramLayer& layer, const SampleZone& zone, std::uint8_t key, const GlobalState& global) noexcept {
     const double target = noteRatio(impl, upper, layer, zone, key, global);
     v.key = key;
     v.targetRatio = target;
-    const float portamentoSec = std::max(0.0F, upper.portamentoSec);
+    const float portamentoSec = portamentoSecFor(upper);
     if (portamentoSec > 0.0F && v.ratio > 0.0 && target > 0.0) {
         const auto frames = static_cast<std::uint32_t>(std::max(1.0, static_cast<double>(portamentoSec) * impl.sampleRate));
         v.glideFramesRemaining = frames;
@@ -947,21 +996,25 @@ void legatoTo(SamplerEngine::Impl& impl, SamplerEngine::Impl::Voice& v, const Up
 }
 
 void playUpperNote(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineState>& stateOwner, int ui,
-                   const UpperPart& upper, std::uint8_t channel, std::uint8_t key, std::uint8_t velocity) noexcept {
+                   const UpperPart& upper, std::uint8_t channel, std::uint8_t key, std::uint8_t velocity,
+                   bool legatoPlayed) noexcept {
     const auto& global = stateOwner->global;
     const auto& program = *upper.program;
     const bool upperMono = upper.voiceMode != UpperVoiceMode::Poly;
     const bool upperLegato = upper.voiceMode == UpperVoiceMode::Legato;
-    bool hadMonoVoice = false;
     bool hadHeldVoice = false;
-    double previousRatio = 1.0;
     float previousAmp = 0.0F;
+    const float portaSec = portamentoSecFor(upper);
+    auto& portaLast = impl.portaLastKey[static_cast<std::size_t>(ui)];
+    auto& portaProgram = impl.portaProgram[static_cast<std::size_t>(ui)];
+    if (portaSec <= 0.0F || portaProgram != upper.program.get()) portaLast = -1; // OFF or another Sound: start fresh
+    portaProgram = upper.program.get();
+    // Fingered: only legato playing glides.
+    const double glideFromKey = (portaSec > 0.0F && legatoPlayed) ? portamentoFromKey(impl, ui, upperMono) : -1.0;
     if (upperMono) {
         for (auto& existing : impl.voices) {
             if (!existing.active || existing.fading || existing.upperIndex != ui) continue;
-            hadMonoVoice = true;
             if (existing.keyHeld && existing.delayFramesRemaining == 0U) hadHeldVoice = true;
-            previousRatio = existing.ratio;
             previousAmp = std::max(previousAmp, existing.ampEnv.value);
             existing.legatoKeep = false;
         }
@@ -1005,15 +1058,7 @@ void playUpperNote(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
             auto* v = chooseVoice(impl);
             startVoice(impl, *v, upper, layer, zone, ui, channel, key, velocity, global, stateOwner);
             v->mono = upperMono;
-            const float portamentoSec = std::max(0.0F, upper.portamentoSec);
-            if (upperMono && hadMonoVoice && portamentoSec > 0.0F && previousRatio > 0.0) {
-                v->targetRatio = v->ratio;
-                v->ratio = previousRatio;
-                const auto glideFrames = static_cast<std::uint32_t>(std::max(1.0, static_cast<double>(portamentoSec) * impl.sampleRate));
-                v->glideFramesRemaining = glideFrames;
-                v->glideLogStep = std::log(v->targetRatio / v->ratio) / static_cast<double>(glideFrames);
-                v->glideMul = std::exp(v->glideLogStep);
-            }
+            startPortamentoGlide(impl, *v, glideFromKey, portaSec);
             if (upperLegato && hadHeldVoice) {
                 v->ampEnv.value = previousAmp;
                 v->ampEnv.stage = AmpEnv::Stage::Decay;
@@ -1023,6 +1068,7 @@ void playUpperNote(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
         }
     }
     if (upperMono) for (auto& existing : impl.voices) if (existing.upperIndex == ui) existing.legatoKeep = false;
+    if (portaSec > 0.0F) portaLast = static_cast<int>(key);
 }
 
 void handleNoteOff(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineState>& stateOwner,
@@ -1041,7 +1087,7 @@ void handleNoteOff(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
         if (!wasTop) continue; // a lower held key was let go: the sound goes on
         if (mk.count > 0U && upper.program != nullptr) {
             // back to the key that is still held
-            playUpperNote(impl, stateOwner, ui, upper, channel, mk.key[mk.count - 1U], mk.vel[mk.count - 1U]);
+            playUpperNote(impl, stateOwner, ui, upper, channel, mk.key[mk.count - 1U], mk.vel[mk.count - 1U], true);
         } else {
             releaseUpperVoices(impl, ui, channel);
         }
@@ -1065,8 +1111,17 @@ void processEvent(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineS
                 if (upper.midiChannel != (e.channel & 0x0FU)) continue;
                 if (anySolo && !upper.solo) continue;
                 if (!upper.matches(e.data1, e.data2)) continue;
-                if (upper.voiceMode != UpperVoiceMode::Poly) monoPush(impl.mono[static_cast<std::size_t>(ui)], e.data1, e.data2);
-                playUpperNote(impl, stateOwner, ui, upper, e.channel, e.data1, e.data2);
+                bool legatoPlayed = false; // another key of this Upper is still held
+                if (upper.voiceMode != UpperVoiceMode::Poly) {
+                    auto& mk = impl.mono[static_cast<std::size_t>(ui)];
+                    monoPush(mk, e.data1, e.data2);
+                    legatoPlayed = mk.count >= 2U;
+                } else {
+                    for (const auto& v : impl.voices) {
+                        if (v.active && !v.fading && v.upperIndex == ui && v.keyHeld && v.key != e.data1) { legatoPlayed = true; break; }
+                    }
+                }
+                playUpperNote(impl, stateOwner, ui, upper, e.channel, e.data1, e.data2, legatoPlayed);
             }
             break;
         }

@@ -1568,7 +1568,7 @@ void testLegatoAcrossSamples() {
 void testLegatoPortamentoGlide() {
     for(auto mode : {UpperVoiceMode::Legato, UpperVoiceMode::Mono}) {
         auto st=makeToneState(mode);
-        st->combi.uppers[0].portamentoSec=0.2F;
+        st->combi.uppers[0].portamentoSec=0.1F;
         SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
         e.postNoteOn(0U,69U,100U); renderLeft(e,40);
         e.postNoteOn(0U,81U,100U);
@@ -1579,6 +1579,114 @@ void testLegatoPortamentoGlide() {
         assert(std::abs(late-880.0)<12.0);    // arrived
         assert(peakOf(x,0U,x.size())>0.15);
     }
+}
+
+
+// PORTAMENTO like the SILVETON keyboard processor.
+// Pitch reached `ms` milliseconds after a note: the glide is linear in semitones.
+double glideHzAt(const std::vector<float>& x, double ms) {
+    const auto c=static_cast<std::size_t>(ms*96.0);
+    return measureHz(x,c>240U?c-240U:0U,c+240U,96000.0);
+}
+
+// TIME portamento: a semitone and two octaves take exactly the same time.
+void testPortamentoSameTimeEveryInterval() {
+    for(int target : {70, 81, 93}) {
+        auto st=makeToneState(UpperVoiceMode::Mono);
+        st->combi.uppers[0].portamentoSec=0.05F; // 50 ms
+        SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
+        e.postNoteOn(0U,69U,100U); renderLeft(e,40);
+        e.postNoteOn(0U,static_cast<std::uint8_t>(target),100U);
+        auto x=renderLeft(e,120);
+        const double goal=440.0*std::pow(2.0,(target-69)/12.0);
+        const double half=440.0*std::pow(2.0,(target-69)/24.0);   // half way in semitones
+        assert(std::abs(glideHzAt(x,25.0)-half)<half*0.03);         // exactly half way at 25 ms
+        assert(std::abs(glideHzAt(x,70.0)-goal)<goal*0.006);        // arrived after 50 ms
+    }
+}
+
+// Like KORG KRONOS (Fingered): only legato playing glides - the new key is
+// pressed while another key is still held - in POLY too. A detached note
+// starts clean. OFF = no glide.
+void testPortamentoPolyFromLastNote() {
+    auto st=makeToneState(UpperVoiceMode::Poly);
+    st->combi.uppers[0].portamentoSec=0.08F;
+    SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
+    e.postNoteOn(0U,69U,100U); renderLeft(e,40);               // 69 held
+    e.postNoteOn(0U,81U,100U);                                  // legato
+    e.postNoteOff(0U,69U,0U);                                   // 69 fades out in 20 ms, 81 keeps gliding
+    auto x=renderLeft(e,150);
+    assert(std::abs(glideHzAt(x,40.0)-622.25)<622.25*0.03);    // half way 440 -> 880
+    assert(std::abs(glideHzAt(x,110.0)-880.0)<880.0*0.006);
+    e.postNoteOff(0U,81U,0U); renderLeft(e,200);
+    assert(e.activeVoiceCount()==0U);
+    e.postNoteOn(0U,69U,100U);                                  // detached: no glide from 81
+    auto d=renderLeft(e,40);
+    assert(std::abs(glideHzAt(d,8.0)-440.0)<440.0*0.006);
+    // OFF: straight to the note even when legato
+    auto off=makeToneState(UpperVoiceMode::Poly);
+    SamplerEngine f; f.prepare(96000.0,96U); f.setState(off);
+    f.postNoteOn(0U,69U,100U); renderLeft(f,40); f.postNoteOff(0U,69U,0U); renderLeft(f,100);
+    f.postNoteOn(0U,81U,100U);
+    auto y=renderLeft(f,40);
+    assert(std::abs(glideHzAt(y,10.0)-880.0)<880.0*0.006);
+    // Panic forgets everything: the next note does not glide
+    e.postNoteOn(0U,81U,100U); renderLeft(e,20);
+    e.postPanic(); renderLeft(e,10);
+    e.postNoteOn(0U,69U,100U);
+    auto z=renderLeft(e,40);
+    assert(std::abs(glideHzAt(z,10.0)-440.0)<440.0*0.006);
+}
+
+// MONO / LEGATO detached notes do not glide; legato notes do.
+void testPortamentoFingeredMono() {
+    for(auto mode : {UpperVoiceMode::Mono, UpperVoiceMode::Legato}) {
+        auto st=makeToneState(mode);
+        st->combi.uppers[0].portamentoSec=0.06F;
+        SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
+        e.postNoteOn(0U,69U,100U); renderLeft(e,40);
+        e.postNoteOff(0U,69U,0U); renderLeft(e,5);              // let go (still fading out)
+        e.postNoteOn(0U,81U,100U);                              // detached
+        auto x=renderLeft(e,60);
+        assert(std::abs(glideHzAt(x,10.0)-880.0)<880.0*0.006);
+        e.postNoteOn(0U,69U,100U);                              // legato from 81
+        auto y=renderLeft(e,100);
+        assert(std::abs(glideHzAt(y,30.0)-622.25)<622.25*0.03);
+        assert(std::abs(glideHzAt(y,80.0)-440.0)<440.0*0.006);
+        e.postNoteOff(0U,69U,0U);                               // back to the held 81 - legato, glides
+        auto z=renderLeft(e,100);
+        assert(std::abs(glideHzAt(z,30.0)-622.25)<622.25*0.03);
+        assert(std::abs(glideHzAt(z,80.0)-880.0)<880.0*0.006);
+    }
+}
+
+// TIME is 1..100 ms: an older SET with a longer time still glides in 100 ms.
+void testPortamentoTimeLimit() {
+    auto st=makeToneState(UpperVoiceMode::Legato);
+    st->combi.uppers[0].portamentoSec=2.0F;
+    SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
+    e.postNoteOn(0U,69U,100U); renderLeft(e,40);
+    e.postNoteOn(0U,81U,100U);
+    auto x=renderLeft(e,200);
+    assert(std::abs(glideHzAt(x,130.0)-880.0)<880.0*0.006);
+}
+
+// Two recordings (different root keys): the glide still starts at the pitch
+// that was sounding, not at the other recording's playback speed.
+void testPortamentoAcrossRecordings() {
+    auto st=makeToneState(UpperVoiceMode::Mono);
+    st->combi.uppers[0].portamentoSec=0.06F;
+    auto prog=std::const_pointer_cast<Program>(st->combi.uppers[0].program);
+    auto ms=std::const_pointer_cast<Multisample>(prog->layers[0].multisample);
+    SampleZone hi=ms->zones[0]; hi.sample=makeLoopedSine(880.0,81U); hi.rootKey=81U; hi.keyLow=76U; hi.keyHigh=127U;
+    ms->zones[0].keyHigh=75U; ms->zones.push_back(hi);
+    SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
+    e.postNoteOn(0U,69U,100U); renderLeft(e,40);
+    e.postNoteOn(0U,79U,100U);                                  // other recording
+    auto x=renderLeft(e,120);
+    const double start=glideHzAt(x,4.0);
+    assert(start>430.0 && start<520.0);                         // starts near 440 Hz
+    assert(std::abs(glideHzAt(x,90.0)-783.99)<783.99*0.006);    // ends on G5
 }
 
 // Each Upper keeps its own key stack.
@@ -1707,6 +1815,11 @@ int main() {
     testMonoReturnsToHeldKey();
     testLegatoAcrossSamples();
     testLegatoPortamentoGlide();
+    testPortamentoSameTimeEveryInterval();
+    testPortamentoPolyFromLastNote();
+    testPortamentoFingeredMono();
+    testPortamentoTimeLimit();
+    testPortamentoAcrossRecordings();
     testMonoSplitUppersIndependent();
     testToneEditKeepsHeldKeys();
     testUpperAdsrAbsolute();

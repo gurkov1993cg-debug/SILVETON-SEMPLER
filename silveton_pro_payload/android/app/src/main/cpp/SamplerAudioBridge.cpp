@@ -836,7 +836,7 @@ public:
         u.transposeSemitones = static_cast<std::int8_t>(std::clamp(transpose, -48, 48));
         u.tuneCents = std::clamp(fineCents, -100.0F, 100.0F);
         u.pitchBendRange = static_cast<std::int8_t>(std::clamp(pitchBendRange, 0, 24));
-        u.portamentoSec = std::clamp(portamentoSec, 0.0F, 5.0F);
+        u.portamentoSec = std::clamp(portamentoSec, 0.0F, 0.1F); // TIME 1..100 ms like the SILVETON keyboard processor
         return installState(std::move(next));
     }
 

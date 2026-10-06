@@ -707,15 +707,16 @@ class SilvetonSamplerView(
         paint.style = Paint.Style.FILL
     }
 
+    // PORTAMENTO TIME like the SILVETON keyboard processor: 0 = OFF, 1..100 ms (linear,
+    // the same total time for every interval).
     private fun portamentoUiValue(seconds: Float): Float {
         if (seconds <= 0f) return 0f
-        val normalized = (seconds / 5f).coerceIn(0f, 1f)
-        return (kotlin.math.sqrt(normalized) * 100f).coerceIn(0f, 100f)
+        return (seconds * 1000f).coerceIn(1f, 100f)
     }
 
     private fun portamentoSecondsFromUi(value: Float): Float {
-        val normalized = value.coerceIn(0f, 100f) / 100f
-        return 5f * normalized * normalized
+        val ms = kotlin.math.round(value.coerceIn(0f, 100f))
+        return if (ms <= 0f) 0f else ms / 1000f
     }
 
     private fun updatePortamentoFromX(x: Float) {
@@ -744,7 +745,7 @@ class SilvetonSamplerView(
             portamentoDragRect.set(bar.left - 8f.dp, bar.top - 18f.dp, bar.right + 8f.dp, bar.bottom + 18f.dp)
             val valueR = RectF(rr.left + 18f.dp, rr.bottom - 48f.dp, rr.right - 18f.dp, rr.bottom)
             val glideSec = portamentoSecondsFromUi(value.toFloat())
-            val glideText = if (value == 0) "OFF" else if (glideSec < 1f) "${kotlin.math.round(glideSec * 1000f).toInt()} ms" else "%.2f s".format(glideSec)
+            val glideText = if (value == 0) "OFF" else "${kotlin.math.round(glideSec * 1000f).toInt()} ms"
             text(c, glideText, rr.centerX(), rr.bottom - 18f.dp, 14f.dp, C_TEXT, alignCenter = true, bold = true, maxWidth = valueR.width())
             hit(valueR, { _, _ ->
                 showNumber("PORTAMENTO", value.toFloat(), 0f, 100f, 0) { exact ->

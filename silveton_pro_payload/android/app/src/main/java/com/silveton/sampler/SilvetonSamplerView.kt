@@ -62,6 +62,14 @@ class SilvetonSamplerView(
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val hits = ArrayList<Hit>(192)
+    // SILVETON_GUI_V3: a "-" / "+" pair; both pressed together = reset.
+    private class PairHit(val a: RectF, val b: RectF, val reset: () -> Unit)
+    private val pairHits = ArrayList<PairHit>(8)
+    private var pairConsumed = false
+    private var settingsTab = 0          // 0 ОБЩИ, 1 MIDI
+    private var scanMode = 0             // 0 none, 1 TERCA scan, 2 SCALE scan
+    private var copiedUpper: SamplerAppController.UpperState? = null
+    private var copiedFrom = -1
     private var page = Page.COMBI
     private var tab = UpperTab.TUNE
     private var selectedUpper = 0
@@ -194,6 +202,30 @@ class SilvetonSamplerView(
     }
 
     private fun handleTouch(event: MotionEvent): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_POINTER_DOWN) {
+            // SILVETON_GUI_V3: second finger on the partner of a - / + pair = reset.
+            val ix = event.actionIndex
+            val x2 = event.getX(ix)
+            val y2 = event.getY(ix)
+            val pair = pairHits.firstOrNull {
+                (it.a.contains(downX, downY) && it.b.contains(x2, y2)) || (it.b.contains(downX, downY) && it.a.contains(x2, y2))
+            }
+            if (pair != null) {
+                pair.reset()
+                pairConsumed = true
+                activeHit = null
+                performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                invalidate()
+            }
+            return true
+        }
+        if (pairConsumed && (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL)) {
+            pairConsumed = false
+            activeHit = null
+            activePointerId = -1
+            invalidate()
+            return true
+        }
         if (handleSmoothRangeTouch(event)) return true
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
@@ -446,10 +478,12 @@ class SilvetonSamplerView(
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         hits.clear()
+        pairHits.clear()
         smoothRangeHits.clear()
         listLongHits.clear()
         val telemetryNow = android.os.SystemClock.uptimeMillis()
         if (lastTelemetryMs == 0L || telemetryNow - lastTelemetryMs >= 50L) {
+            scanMode = sampler.pollScan()
             frameAudioStatus = sampler.audioStatus()
             frameUpperMeters = sampler.upperMeters()
             frameMidiStatus = sampler.midiStatus()
@@ -523,7 +557,7 @@ class SilvetonSamplerView(
         paint.shader = null
 
         c.save()
-        c.rotate(-90f, 48f, 66f)
+        c.rotate(90f, 48f, 66f)   // SILVETON_GUI_V3: reads top to bottom
         text(c, "SILVETON", 48f, 70f, 13f, C_LOGO, center = true, face = faceBold, spacing = 0.23f)
         c.restore()
 
@@ -681,14 +715,14 @@ class SilvetonSamplerView(
             face = faceBold, maxWidth = W - 24f)
         hit(RectF(L, T + 26f, r.right, T + 50f), { _, _ -> selectedUpper = i; showSoundPicker(i) })
 
-        // ON / S / M
-        val tgW = (W - 20f - 10f) / 3f
+        // ON / SOLO / MUTE - big keys (SILVETON_GUI_V3)
+        val tgW = (W - 16f - 8f) / 3f
         for (k in 0 until 3) {
-            val tr = RectF(L + 10f + k * (tgW + 5f), T + 52f, L + 10f + k * (tgW + 5f) + tgW, T + 80f)
+            val tr = RectF(L + 8f + k * (tgW + 4f), T + 52f, L + 8f + k * (tgW + 4f) + tgW, T + 90f)
             val on = when (k) { 0 -> s.enabled; 1 -> s.solo; else -> s.mute }
-            val label = when (k) { 0 -> "ON"; 1 -> "S"; else -> "M" }
+            val label = when (k) { 0 -> "ON"; 1 -> "SOLO"; else -> "MUTE" }
             val onColor = when (k) { 0 -> C_AMBER; 1 -> C_SOLO; else -> C_MUTE }
-            stripToggle(c, tr, label, on, onColor)
+            stripToggle(c, tr, label, on, onColor, size = if (k == 0) 15f else 11f)
             hit(tr, { _, _ ->
                 val cur = upperStates[i] ?: s
                 when (k) {
@@ -700,10 +734,10 @@ class SilvetonSamplerView(
         }
 
         // PAN knob: drag the whole row, long press = number, double tap = centre.
-        drawKnob(c, L + 31f, T + 110f, 21f, (s.pan + 1f) * 0.5f, bipolar = true, ring = false)
-        text(c, "PAN", L + 62f, T + 104f, 10f, C_LABEL_GREY, spacing = 0.2f)
-        text(c, panText(s.pan), L + 62f, T + 123f, 14f, C_INK, face = faceMonoBold)
-        knobHit(RectF(L, T + 84f, r.right, T + 136f), s.pan, -1f, 1f, 0.01f, 160f,
+        drawKnob(c, L + 29f, T + 116f, 19f, (s.pan + 1f) * 0.5f, bipolar = true, ring = false)
+        text(c, "PAN", L + 58f, T + 111f, 10f, C_LABEL_GREY, spacing = 0.2f)
+        text(c, panText(s.pan), L + 58f, T + 129f, 14f, C_INK, face = faceMonoBold)
+        knobHit(RectF(L, T + 94f, r.right, T + 140f), s.pan, -1f, 1f, 0.01f, 160f,
             onChange = { nv -> val cur = upperStates[i] ?: s; commitMain(i, cur.copy(pan = nv)) },
             exact = {
                 showNumber("UPPER ${i + 1} PAN", s.pan, -1f, 1f, 2) { nv ->
@@ -714,10 +748,10 @@ class SilvetonSamplerView(
             reset = { val cur = upperStates[i] ?: s; commitMain(i, cur.copy(pan = 0f)) })
 
         // LEVEL fader with L/R meters.
-        val trackL = L + 58f
-        val trackR = L + 70f
-        val trackTop = T + 160f
-        val trackBot = T + 282f
+        val trackL = L + 52f
+        val trackR = L + 68f
+        val trackTop = T + 150f
+        val trackBot = T + 248f
         val travel = trackBot - trackTop
         listOf("+12" to 1f, "0" to 2f / 3f, "-24" to 1f / 3f, "-60" to 0f).forEach { (lbl, t) ->
             text(c, lbl, L + 10f, trackBot - t * travel + 3.5f, 9f, C_SCALE, face = faceMono)
@@ -727,10 +761,10 @@ class SilvetonSamplerView(
         paint.shader = LinearGradient(trackL, 0f, trackR, 0f, Color.argb(70, 0, 0, 0), Color.argb(0, 0, 0, 0), Shader.TileMode.CLAMP)
         c.drawRoundRect(RectF(trackL, trackTop, trackR, trackBot), 6f, 6f, paint)
         paint.shader = null
-        stripMeter(c, RectF(L + 80f, trackTop, L + 90f, trackBot), meter.first)
-        stripMeter(c, RectF(L + 100f, trackTop, L + 110f, trackBot), meter.second)
-        faderCap(c, (trackL + trackR) * 0.5f, trackBot - faderT(s.levelDb) * travel)
-        text(c, dbText(s.levelDb), r.centerX(), T + 308f, 14f, C_INK, center = true, face = faceMonoBold)
+        stripMeter(c, RectF(L + 92f, trackTop, L + 103f, trackBot), meter.first)
+        stripMeter(c, RectF(L + 109f, trackTop, L + 120f, trackBot), meter.second)
+        faderCap(c, (trackL + trackR) * 0.5f, trackBot - faderT(s.levelDb) * travel, big = true)
+        text(c, dbText(s.levelDb), r.centerX(), T + 272f, 14f, C_INK, center = true, face = faceMonoBold)
         val exactLevel = {
             showNumber("UPPER ${i + 1} LEVEL dB", s.levelDb, -60f, 12f, 1) { nv ->
                 val cur = upperStates[i] ?: s
@@ -738,19 +772,28 @@ class SilvetonSamplerView(
             }
         }
         val resetLevel = { val cur = upperStates[i] ?: s; commitMain(i, cur.copy(levelDb = 0f)) }
-        faderHit(RectF(L + 34f, T + 140f, r.right - 4f, T + 292f), s.levelDb, travel,
+        faderHit(RectF(L + 26f, T + 136f, r.right - 4f, T + 258f), s.levelDb, travel,
             onChange = { nv -> val cur = upperStates[i] ?: s; commitMain(i, cur.copy(levelDb = nv)) },
             exact = exactLevel, reset = resetLevel)
-        hit(RectF(L, T + 292f, r.right, T + 316f), { _, _ -> exactLevel() }, resetLevel)
+        hit(RectF(L, T + 258f, r.right, T + 278f), { _, _ -> exactLevel() }, resetLevel)
 
-        // Voice mode + key range.
-        val half = (W - 20f - 5f) / 2f
-        val modeR = RectF(L + 10f, T + 322f, L + 10f + half, T + 350f)
-        val rangeR = RectF(modeR.right + 5f, T + 322f, r.right - 10f, T + 350f)
-        darkKey(c, modeR, voiceModeName(s.voiceMode))
-        lightKey(c, rangeR, "${noteName(s.keyLow)}–${noteName(s.keyHigh)}", size = 11f, radius = 6f)
-        hit(modeR, { _, _ -> val cur = upperStates[i] ?: s; commitMain(i, cur.copy(voiceMode = (cur.voiceMode + 1) % 3)) },
-            { val cur = upperStates[i] ?: s; commitMain(i, cur.copy(voiceMode = 0)) })
+        // POLY / MONO / LEGATO - three own keys (SILVETON_GUI_V3) + key range.
+        val mW = (W - 16f - 8f) / 3f
+        for (k in 0 until 3) {
+            val mr = RectF(L + 8f + k * (mW + 4f), T + 282f, L + 8f + k * (mW + 4f) + mW, T + 312f)
+            stripToggle(c, mr, when (k) { 0 -> "POLY"; 1 -> "MONO"; else -> "LEG" }, s.voiceMode == k, C_AMBER, size = 11f)
+            hit(mr, { _, _ -> val cur = upperStates[i] ?: s; commitMain(i, cur.copy(voiceMode = k)) })
+        }
+        // T = TERCA, Q = quarter tone (SILVETON_TERCA_V1 / SILVETON_SCALE_V1), then the key range.
+        val tqW = 40f
+        val tR = RectF(L + 8f, T + 316f, L + 8f + tqW, T + 354f)
+        val qR = RectF(tR.right + 4f, T + 316f, tR.right + 4f + tqW, T + 354f)
+        stripToggle(c, tR, "T", sampler.tercaOn(i), C_AMBER, size = 18f)
+        stripToggle(c, qR, "Q", sampler.quarterOn(i), C_AMBER, size = 18f)
+        hit(tR, { _, _ -> sampler.toggleTerca(i); invalidate() })
+        hit(qR, { _, _ -> sampler.toggleQuarter(i); invalidate() })
+        val rangeR = RectF(qR.right + 4f, T + 316f, r.right - 8f, T + 354f)
+        lightKey(c, rangeR, "${noteName(s.keyLow)}–${noteName(s.keyHigh)}", size = 10f, radius = 6f)
         hit(rangeR, { _, _ -> selectedUpper = i; showKeyRange(i, upperStates[i] ?: s) })
 
         if (!live) {
@@ -780,6 +823,14 @@ class SilvetonSamplerView(
             hit(rr, { _, _ -> tab = t })
             x += tw + 6f
         }
+
+        // SILVETON_GUI_V3: COPY / PASTE all settings of an Upper (portamento .. FX).
+        val copyR = RectF(1066f, 478f, 1190f, 512f)
+        val pasteR = RectF(1196f, 478f, 1326f, 512f)
+        lightKey(c, copyR, "COPY U${selectedUpper + 1}", size = 12f, radius = 7f)
+        lightKey(c, pasteR, if (copiedUpper != null) "PASTE U${copiedFrom + 1}" else "PASTE", enabled = copiedUpper != null, size = 12f, radius = 7f)
+        hit(copyR, { _, _ -> copiedUpper = upperStates[selectedUpper]; copiedFrom = selectedUpper; flash("КОПИРАН UPPER ${selectedUpper + 1}") })
+        hit(pasteR, { _, _ -> pasteUpper(selectedUpper) })
 
         board(c, RectF(112f, 514f, 1326f, 786f), squareTopLeft = true)
         val sec = RectF(128f, 530f, 1310f, 770f)
@@ -822,25 +873,26 @@ class SilvetonSamplerView(
             },
             reset = { commitTune(currentUpper(s).copy(portamentoSec = 0f)) })
 
-        knobControl(c, cx[1], cy, 42f, s.octave.toFloat(), -4f, 4f, 1f, 200f, true, signed(s.octave), "ОКТАВА",
-            onChange = { nv -> commitTune(currentUpper(s).copy(octave = nv.toInt())) },
-            exact = { showNumber("ОКТАВА", s.octave.toFloat(), -4f, 4f, 0) { nv -> commitTune(currentUpper(s).copy(octave = nv.toInt())) } },
-            reset = { commitTune(currentUpper(s).copy(octave = 0)) })
+        // SILVETON_GUI_V3: OCTAVE and TRANSPOSE on - / + keys; both keys together = 0.
+        stepper(c, RectF(cx[1] - 100f, 560f, cx[1] + 100f, 726f), "ОКТАВА", signed(s.octave),
+            onMinus = { val cur = currentUpper(s); commitTune(cur.copy(octave = (cur.octave - 1).coerceAtLeast(-4))) },
+            onPlus = { val cur = currentUpper(s); commitTune(cur.copy(octave = (cur.octave + 1).coerceAtMost(4))) },
+            onReset = { commitTune(currentUpper(s).copy(octave = 0)) })
+        stepper(c, RectF(cx[2] - 100f, 560f, cx[2] + 100f, 726f), "ТРАНСПОНИРАНЕ", signed(s.transpose),
+            onMinus = { val cur = currentUpper(s); commitTune(cur.copy(transpose = (cur.transpose - 1).coerceAtLeast(-12))) },
+            onPlus = { val cur = currentUpper(s); commitTune(cur.copy(transpose = (cur.transpose + 1).coerceAtMost(12))) },
+            onReset = { commitTune(currentUpper(s).copy(transpose = 0)) })
 
-        knobControl(c, cx[2], cy, 42f, s.transpose.toFloat(), -48f, 48f, 1f, 480f, true, signed(s.transpose), "ТРАНСПОНИРАНЕ",
-            onChange = { nv -> commitTune(currentUpper(s).copy(transpose = nv.toInt())) },
-            exact = { showNumber("ТРАНСПОНИРАНЕ", s.transpose.toFloat(), -48f, 48f, 0) { nv -> commitTune(currentUpper(s).copy(transpose = nv.toInt())) } },
-            reset = { commitTune(currentUpper(s).copy(transpose = 0)) })
-
-        knobControl(c, cx[3], cy, 42f, s.fineCents, -100f, 100f, 0.1f, 400f, true, "%.1f ct".format(s.fineCents), "ФИНА НАСТРОЙКА",
+        // SILVETON_TUNE_RANGES_V1: -1200..+1200 cents (one octave each way).
+        knobControl(c, cx[3], cy, 42f, s.fineCents, -1200f, 1200f, 1f, 600f, true, "%.0f ct".format(s.fineCents), "ФИНА НАСТРОЙКА",
             onChange = { nv -> commitTune(currentUpper(s).copy(fineCents = nv)) },
-            exact = { showNumber("ФИНА НАСТРОЙКА ct", s.fineCents, -100f, 100f, 1) { nv -> commitTune(currentUpper(s).copy(fineCents = nv)) } },
+            exact = { showNumber("ФИНА НАСТРОЙКА ct", s.fineCents, -1200f, 1200f, 0) { nv -> commitTune(currentUpper(s).copy(fineCents = nv)) } },
             reset = { commitTune(currentUpper(s).copy(fineCents = 0f)) })
 
         knobControl(c, cx[4], cy, 42f, s.pitchBendRange.toFloat(), 0f, 24f, 1f, 240f, false, "${s.pitchBendRange} st", "PITCH BEND",
             onChange = { nv -> commitTune(currentUpper(s).copy(pitchBendRange = nv.toInt())) },
             exact = { showNumber("PITCH BEND st", s.pitchBendRange.toFloat(), 0f, 24f, 0) { nv -> commitTune(currentUpper(s).copy(pitchBendRange = nv.toInt())) } },
-            reset = { commitTune(currentUpper(s).copy(pitchBendRange = 2)) })
+            reset = { commitTune(currentUpper(s).copy(pitchBendRange = 1)) })
 
         hintLine(c, sec)
     }
@@ -1132,8 +1184,7 @@ class SilvetonSamplerView(
                 }
             })
         }
-        text(c, "Докосни = зареди  ·  Задръж = меню: EDIT · RENAME · COPY · MOVE · DELETE",
-            316f, 769f, 12f, C_INK_SOFT, maxWidth = 830f)
+        drawQuickBar(c, 312f, 742f, 786f)
         val used = entries.count { !sampler.isEmptyListItem(it) }
         text(c, "$used / 200", 1326f, 769f, 13f, C_INK_SOFT, right = true, face = faceMonoBold)
     }
@@ -1564,8 +1615,18 @@ class SilvetonSamplerView(
     // ------------------------------------------------------------------ SETTINGS
 
     private fun drawSettings(c: Canvas) {
+        // SILVETON_GUI_V3: ОБЩИ / MIDI / SCALE · ТЕРЦА
+        val tabs = arrayOf("ОБЩИ", "MIDI")
+        for (t in tabs.indices) {
+            val tr = RectF(112f + t * 226f, 108f, 332f + t * 226f, 146f)
+            stripToggle(c, tr, tabs[t], settingsTab == t, C_AMBER, size = 14f)
+            hit(tr, { _, _ -> settingsTab = t })
+        }
+        when (settingsTab) {
+            1 -> { drawMidiSettings(c, RectF(112f, 154f, 1326f, 786f)); return }
+        }
         val g = globalState ?: sampler.globalUiState()?.also { globalState = it } ?: return
-        val b = RectF(112f, 108f, 1326f, 786f)
+        val b = RectF(112f, 154f, 1326f, 786f)
         board(c, b)
         val labels = arrayOf("MASTER TUNE", "TRANSPOSE", "MASTER GAIN", "EQ LOW", "EQ MID", "EQ HIGH", "LIMITER", "CEILING",
             "VELOCITY CURVE", "BREATH CC", "EXPRESSION CC", "DAMPER CC", "PITCH BEND", "AFTERTOUCH")
@@ -1604,13 +1665,13 @@ class SilvetonSamplerView(
 
     private fun globalStep(i: Int): Float = when (i) { 1, 8, 9, 10, 11 -> 1f; else -> 0.1f }
     private fun globalTravel(i: Int): Float = when (i) {
-        0 -> 400f; 1 -> 480f; 2 -> 390f; 3, 4, 5 -> 360f; 7 -> 240f; 8 -> 160f; else -> 508f
+        0 -> 400f; 1 -> 240f; 2 -> 390f; 3, 4, 5 -> 360f; 7 -> 240f; 8 -> 160f; else -> 508f
     }
 
     private fun editGlobal(i: Int, g: SamplerAppController.GlobalUiState) {
         when (i) {
             0 -> showNumber("Master Tune Hz", g.masterTuneHz, 400f, 480f, 1) { commitGlobal(g.copy(masterTuneHz = it)) }
-            1 -> showNumber("Transpose", g.transpose.toFloat(), -48f, 48f, 0) { commitGlobal(g.copy(transpose = it.toInt())) }
+            1 -> showNumber("Transpose", g.transpose.toFloat(), -12f, 12f, 0) { commitGlobal(g.copy(transpose = it.toInt())) }
             2 -> showNumber("Master Gain dB", g.masterGainDb, -60f, 18f, 1) { commitGlobal(g.copy(masterGainDb = it)) }
             3 -> showNumber("EQ Low dB", g.eqLowDb, -18f, 18f, 1) { commitGlobal(g.copy(eqLowDb = it)) }
             4 -> showNumber("EQ Mid dB", g.eqMidDb, -18f, 18f, 1) { commitGlobal(g.copy(eqMidDb = it)) }
@@ -1638,7 +1699,7 @@ class SilvetonSamplerView(
     }
 
     private fun globalSliderSpec(i: Int, g: SamplerAppController.GlobalUiState): Triple<Float, Float, Float> = when (i) {
-        0 -> Triple(g.masterTuneHz, 400f, 480f); 1 -> Triple(g.transpose.toFloat(), -48f, 48f); 2 -> Triple(g.masterGainDb, -60f, 18f)
+        0 -> Triple(g.masterTuneHz, 400f, 480f); 1 -> Triple(g.transpose.toFloat(), -12f, 12f); 2 -> Triple(g.masterGainDb, -60f, 18f)
         3 -> Triple(g.eqLowDb, -18f, 18f); 4 -> Triple(g.eqMidDb, -18f, 18f); 5 -> Triple(g.eqHighDb, -18f, 18f)
         7 -> Triple(g.limiterCeilingDb, -12f, 0f); 8 -> Triple(g.velocityCurve.toFloat(), 0f, 4f)
         9 -> Triple(g.breathCc.toFloat(), 0f, 127f); 10 -> Triple(g.expressionCc.toFloat(), 0f, 127f); 11 -> Triple(g.damperCc.toFloat(), 0f, 127f)
@@ -1671,28 +1732,21 @@ class SilvetonSamplerView(
                 .show()
             return
         }
-        val labels = blends.map { item ->
-            "%03d   %s".format(item.first, item.second.ifBlank { "COMBI ${item.first}" })
-        }.toTypedArray()
-        // Open the list on the blend that is loaded now, not on position 1.
-        val checkedBlend = editingCombiSlot?.let { slot -> blends.indexOfFirst { it.first == slot } } ?: -1
-        AlertDialog.Builder(context)
-            .setTitle("BLENDS  1–500")
-            .setSingleChoiceItems(labels, checkedBlend) { d, index ->
-                d.dismiss()
-                val item = blends[index]
-                if (sampler.activateCombiAddress(0, 0, item.first)) {
-                    editingCombiSlot = item.first
-                    loadedFromList = -1
-                    page = Page.COMBI
-                    cachedCombiName = sampler.combiName()
-                    refreshAllUppers()
-                    refreshFx()
-                    invalidate()
-                }
+        val items = blends.map { "%03d".format(it.first) to it.second.ifBlank { "COMBI ${it.first}" } }
+        // Open on the blend that is loaded now, not on position 1.
+        val current = editingCombiSlot?.let { slot -> blends.indexOfFirst { it.first == slot } } ?: -1
+        showGridPicker("BLENDS  1–500", items, current, null) { index ->
+            val item = blends[index]
+            if (sampler.activateCombiAddress(0, 0, item.first)) {
+                editingCombiSlot = item.first
+                loadedFromList = -1
+                page = Page.COMBI
+                cachedCombiName = sampler.combiName()
+                refreshAllUppers()
+                refreshFx()
+                invalidate()
             }
-            .setNegativeButton("CANCEL", null)
-            .show()
+        }
     }
 
     private fun showSoundPicker(upper: Int) {
@@ -1708,26 +1762,107 @@ class SilvetonSamplerView(
                 .show()
             return
         }
-        val labels = ArrayList<String>(sounds.size + 1)
-        labels.add("EMPTY")
-        sounds.forEach { item -> labels.add("%03d   %s".format(item.slot, item.name)) }
-        // Open the list on this Upper's own sound (e.g. position 53), not on position 1.
+        // Open on this Upper's own sound (e.g. position 53), not on position 1.
         val picked = lastPickedSound.getOrNull(upper)
         val currentName = upperStates.getOrNull(upper)?.soundName ?: sampler.upperState(upper)?.soundName
-        var checked = -1
+        var current = -1
         if (picked != null && picked.name == currentName) {
-            val k = sounds.indexOfFirst { it.bank == picked.bank && it.page == picked.page && it.slot == picked.slot }
-            if (k >= 0) checked = k + 1
+            current = sounds.indexOfFirst { it.bank == picked.bank && it.page == picked.page && it.slot == picked.slot }
         }
-        if (checked < 0 && currentName != null) {
-            checked = if (currentName == "EMPTY") 0 else sounds.indexOfFirst { it.name == currentName }.let { if (it >= 0) it + 1 else -1 }
+        if (current < 0 && currentName != null && currentName != "EMPTY") current = sounds.indexOfFirst { it.name == currentName }
+        val items = sounds.map { "%03d".format(it.slot) to it.name }
+        showGridPicker("UPPER ${upper + 1} — SOUND", items, current, "EMPTY") { index ->
+            if (index < 0) { sampler.clearUpperSound(upper); lastPickedSound[upper] = null }
+            else { sampler.assignUpperSound(upper, sounds[index]); lastPickedSound[upper] = sounds[index] }
+            refreshUpper(upper); invalidate()
         }
-        AlertDialog.Builder(context).setTitle("UPPER ${upper + 1} — SOUND").setSingleChoiceItems(labels.toTypedArray(), checked) { d, which ->
-            if (which == 0) { sampler.clearUpperSound(upper); lastPickedSound[upper] = null }
-            else { sampler.assignUpperSound(upper, sounds[which - 1]); lastPickedSound[upper] = sounds[which - 1] }
-            refreshUpper(upper); d.dismiss(); invalidate()
-        }.setNegativeButton("CANCEL", null).show()
     }
+
+    // SILVETON_GUI_V3: big pages of 20 (4 x 5), page keys on top, opens on the current item.
+    // pick(-1) = the extra key (EMPTY) when [extra] is given.
+    private fun showGridPicker(title: String, items: List<Pair<String, String>>, current: Int, extra: String?, pick: (Int) -> Unit) {
+        val perPage = 20
+        val pages = max(1, (items.size + perPage - 1) / perPage)
+        var pageNow = if (current >= 0) current / perPage else 0
+        val dialog = Dialog(context)
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        val root = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(uiPx(20f), uiPx(16f), uiPx(20f), uiPx(16f))
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = uiPx(16f).toFloat()
+                setColor(Color.rgb(20, 24, 29))
+                setStroke(uiPx(1f), Color.rgb(68, 84, 102))
+            }
+        }
+        val head = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        head.addView(TextView(context).apply {
+            text = title; setTextColor(Color.WHITE); textSize = 22f; setTypeface(typeface, Typeface.BOLD)
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        if (extra != null) head.addView(pickerKey(extra, false) { dialog.dismiss(); pick(-1) })
+        head.addView(pickerKey("CANCEL", false) { dialog.dismiss() })
+        root.addView(head)
+        val pageRow = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, uiPx(10f), 0, uiPx(10f)) }
+        val pageScroll = android.widget.HorizontalScrollView(context).apply { addView(pageRow) }
+        root.addView(pageScroll)
+        val grid = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+        root.addView(grid)
+        lateinit var render: () -> Unit
+        render = {
+            pageRow.removeAllViews()
+            for (pg in 0 until pages) {
+                pageRow.addView(pickerKey((pg + 1).toString(), pg == pageNow, small = true) { pageNow = pg; render() })
+            }
+            grid.removeAllViews()
+            for (row in 0 until 5) {
+                val line = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+                for (col in 0 until 4) {
+                    val idx = pageNow * perPage + row * 4 + col
+                    val lp = LinearLayout.LayoutParams(0, uiPx(64f), 1f).apply { setMargins(uiPx(4f), uiPx(4f), uiPx(4f), uiPx(4f)) }
+                    val item = items.getOrNull(idx)
+                    if (item == null) {
+                        line.addView(View(context), lp)
+                    } else {
+                        line.addView(pickerKey("${item.first}  ${item.second}", idx == current, tall = true) {
+                            dialog.dismiss(); pick(idx)
+                        }, lp)
+                    }
+                }
+                grid.addView(line)
+            }
+        }
+        render()
+        dialog.setContentView(root)
+        dialog.show()
+        dialog.window?.apply {
+            setBackgroundDrawableResource(android.R.color.transparent)
+            setDimAmount(0.76f)
+            addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+            setLayout((resources.displayMetrics.widthPixels * 0.92f).toInt(), WindowManager.LayoutParams.WRAP_CONTENT)
+        }
+    }
+
+    private fun pickerKey(label: String, selected: Boolean, small: Boolean = false, tall: Boolean = false, onTap: () -> Unit): TextView =
+        TextView(context).apply {
+            text = label
+            textSize = if (small) 15f else 16f
+            setTextColor(if (selected) Color.rgb(20, 20, 20) else Color.WHITE)
+            setTypeface(typeface, Typeface.BOLD)
+            gravity = if (tall) Gravity.CENTER_VERTICAL or Gravity.START else Gravity.CENTER
+            maxLines = 2
+            setPadding(uiPx(14f), uiPx(8f), uiPx(14f), uiPx(8f))
+            minWidth = uiPx(if (small) 56f else 110f)
+            background = GradientDrawable().apply {
+                cornerRadius = uiPx(10f).toFloat()
+                setColor(if (selected) Color.rgb(255, 150, 50) else Color.rgb(44, 50, 58))
+                setStroke(uiPx(1f), Color.rgb(78, 88, 100))
+            }
+            if (!tall) layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, uiPx(52f)).apply {
+                setMargins(uiPx(4f), 0, uiPx(4f), 0)
+            }
+            setOnClickListener { onTap() }
+        }
 
     private fun showKeyRange(upper: Int, s: SamplerAppController.UpperState) {
         showTwoInts("KEY RANGE", "Low 0-127", s.keyLow, "High 0-127", s.keyHigh, 0, 127) { lo, hi -> if (lo <= hi) commitMain(upper, s.copy(keyLow = lo, keyHigh = hi)) }
@@ -1766,7 +1901,7 @@ class SilvetonSamplerView(
     }
 
     private fun showEditorPage(title: String, subtitle: String, body: LinearLayout, applyLabel: String = "APPLY",
-                               onCancel: (() -> Unit)? = null, onApply: () -> Unit) {
+                               onCancel: (() -> Unit)? = null, focus: EditText? = null, onApply: () -> Unit) {
         val dialog = Dialog(context)
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
         val root = LinearLayout(context).apply {
@@ -1801,6 +1936,16 @@ class SilvetonSamplerView(
             setDimAmount(0.76f)
             addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
             setLayout((resources.displayMetrics.widthPixels * 0.78f).toInt(), WindowManager.LayoutParams.WRAP_CONTENT)
+            // SILVETON_GUI_V3: the name field takes the keyboard at once (no second tap).
+            if (focus != null) setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE)
+        }
+        if (focus != null) {
+            focus.requestFocus()
+            focus.selectAll()
+            focus.post {
+                val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager
+                imm?.showSoftInput(focus, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+            }
         }
     }
 
@@ -1808,7 +1953,7 @@ class SilvetonSamplerView(
         val body = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
         body.addView(editorLabel("NAME"))
         val edit = editorField(current, false); body.addView(edit)
-        showEditorPage(title, "Edit the name and confirm.", body) {
+        showEditorPage(title, "Edit the name and confirm.", body, focus = edit) {
             val value = edit.text.toString().trim(); if (value.isNotEmpty()) done(value); invalidate()
         }
     }
@@ -1895,6 +2040,175 @@ class SilvetonSamplerView(
             done(value)
             invalidate()
         }
+    }
+
+    // ------------------------------------------------------------------ SILVETON_GUI_V3 helpers
+
+    /** Title, value window and two big keys - / +. Both keys at the same time = onReset. */
+    private fun stepper(c: Canvas, r: RectF, title: String, value: String,
+                        onMinus: () -> Unit, onPlus: () -> Unit, onReset: () -> Unit) {
+        text(c, title, r.centerX(), r.top + 14f, 12f, C_KNOB_LABEL, center = true, face = faceBold, spacing = 0.12f, maxWidth = r.width())
+        val box = RectF(r.left + 30f, r.top + 26f, r.right - 30f, r.top + 74f)
+        lcd(c, box, 8f)
+        text(c, value, box.centerX(), box.centerY() + 10f, 28f, C_LCD, center = true, face = faceMono)
+        hit(box, { _, _ -> }, onReset)   // double tap on the value = 0
+        val kw = (r.width() - 12f) / 2f
+        val minus = RectF(r.left, r.top + 86f, r.left + kw, r.bottom)
+        val plus = RectF(minus.right + 12f, r.top + 86f, r.right, r.bottom)
+        stripToggle(c, minus, "−", false, C_AMBER, size = 34f)
+        stripToggle(c, plus, "+", false, C_AMBER, size = 34f)
+        hit(minus, { _, _ -> onMinus(); invalidate() })
+        hit(plus, { _, _ -> onPlus(); invalidate() })
+        pairHits.add(PairHit(minus, plus) { onReset(); invalidate() })
+    }
+
+    private fun pasteUpper(target: Int) {
+        val src = copiedUpper ?: return
+        val cur = upperStates[target] ?: sampler.upperState(target) ?: return
+        // Everything from portamento to the effects; the target keeps its own sound,
+        // ON / SOLO / MUTE, MIDI channel and keyboard / velocity zone.
+        val merged = src.copy(
+            enabled = cur.enabled, solo = cur.solo, mute = cur.mute, soundName = cur.soundName,
+            midiChannel = cur.midiChannel, keyLow = cur.keyLow, keyHigh = cur.keyHigh,
+            velocityLow = cur.velocityLow, velocityHigh = cur.velocityHigh
+        )
+        sampler.updateUpperMain(target, merged)
+        sampler.updateUpperTune(target, merged)
+        sampler.updateUpperControl(target, merged)
+        sampler.updateUpperTone(target, merged)
+        sampler.updateUpperFx(target, merged)
+        val tone = floatArrayOf(src.toneAttackMs, src.toneDecayMs, src.toneSustain, src.toneReleaseMs, src.toneCutoffHz, src.toneResonance)
+        for (k in tone.indices) sampler.setUpperTone(target, k, tone[k])
+        refreshUpper(target)
+        flash("ПОСТАВЕНО: U${copiedFrom + 1} → U${target + 1}")
+        invalidate()
+    }
+
+    private fun scanKey(c: Canvas, r: RectF, mode: Int, label: String) {
+        val on = scanMode == mode
+        val blink = on && (android.os.SystemClock.uptimeMillis() / 300L) % 2L == 0L
+        stripToggle(c, r, if (on) "SCAN… НАТИСНИ НОТИТЕ" else label, on, if (blink) C_ORANGE else C_AMBER, size = 13f)
+        hit(r, { _, _ ->
+            if (scanMode == mode) sampler.cancelScan()
+            else if (mode == 1) sampler.startTercaScan() else sampler.startScaleScan()
+            scanMode = sampler.pollScan()
+            invalidate()
+        })
+    }
+
+    private fun tercaText(t: SamplerAppController.TercaState): String =
+        if (t.root in 0..11 && t.cell in 0..5)
+            "${SamplerAppController.NOTE_NAMES[t.root]} ${SamplerAppController.TERCA_CELLS[t.cell]}"
+        else "—"
+
+    /** LIST quick keys: TRANSPOSE - / + (both = 0), T SCAN (tonality), Q SCAN (quarter-tone notes). */
+    private fun drawQuickBar(c: Canvas, left: Float, top: Float, bottom: Float) {
+        val g = globalState ?: sampler.globalUiState()?.also { globalState = it }
+        var x = left
+        val tv = RectF(x, top, x + 110f, bottom)
+        lcd(c, tv, 8f)
+        text(c, "TRANSPOSE", tv.centerX(), tv.top + 13f, 9f, C_LCD_DIM, center = true, face = faceMono)
+        text(c, signed(g?.transpose ?: 0), tv.centerX(), tv.bottom - 7f, 19f, C_LCD, center = true, face = faceMono)
+        hit(tv, { _, _ -> }, { sampler.stepGlobalTranspose(0); refreshGlobal() })
+        x = tv.right + 4f
+        val tm = RectF(x, top, x + 56f, bottom); x = tm.right + 4f
+        val tp = RectF(x, top, x + 56f, bottom); x = tp.right + 18f
+        stripToggle(c, tm, "−", false, C_AMBER, size = 26f)
+        stripToggle(c, tp, "+", false, C_AMBER, size = 26f)
+        hit(tm, { _, _ -> sampler.stepGlobalTranspose(-1); refreshGlobal() })
+        hit(tp, { _, _ -> sampler.stepGlobalTranspose(1); refreshGlobal() })
+        pairHits.add(PairHit(tm, tp) { sampler.stepGlobalTranspose(0); refreshGlobal() })
+        val ts = RectF(x, top, x + 210f, bottom); x = ts.right + 8f
+        scanKey(c, ts, 1, "T SCAN  ${tercaText(sampler.tercaState())}")
+        val qs = RectF(x, top, x + 230f, bottom)
+        val notes = sampler.quarterNotes()
+        val names = (0 until 12).filter { (notes and (1 shl it)) != 0 }.joinToString(" ") { SamplerAppController.NOTE_NAMES[it] }
+        scanKey(c, qs, 2, "Q SCAN  ${names.ifEmpty { "—" }}")
+    }
+
+    private fun cellKey(c: Canvas, r: RectF, title: String, value: String, on: Boolean? = null, tap: () -> Unit) {
+        if (on != null) {
+            stripToggle(c, r, "$title  ${if (on) "ON" else "OFF"}", on, C_AMBER, size = 13f)
+        } else {
+            fill(c, r, 10f, C_STRIP)
+            text(c, title, r.left + 12f, r.top + 18f, 11f, C_LABEL_GREY, face = faceBold, spacing = 0.1f, maxWidth = r.width() - 20f)
+            text(c, value, r.left + 12f, r.bottom - 12f, 19f, C_INK, face = faceMonoBold, maxWidth = r.width() - 20f)
+        }
+        hit(r, { _, _ -> tap(); invalidate() })
+    }
+
+    /** SILVETON_MIDI_FULL_V1: every MIDI setting of the sampler on one page. */
+    private fun drawMidiSettings(c: Canvas, b: RectF) {
+        board(c, b)
+        val g = globalState ?: sampler.globalUiState()?.also { globalState = it } ?: return
+        val a = sampler.globalAdvanced() ?: return
+        val L = b.left + 16f
+        val W = b.width() - 32f
+        // Row 1: MIDI channel of each Upper
+        text(c, "MIDI КАНАЛ НА ВСЕКИ UPPER", L, b.top + 26f, 12f, C_AMBER, face = faceBold, spacing = 0.12f)
+        val uw = (W - 6f * 8f) / 7f
+        for (i in 0 until 7) {
+            val st = upperStates[i] ?: sampler.upperState(i)?.also { upperStates[i] = it } ?: continue
+            val r = RectF(L + i * (uw + 8f), b.top + 36f, L + i * (uw + 8f) + uw, b.top + 96f)
+            cellKey(c, r, "UPPER ${i + 1}", "CH ${st.midiChannel + 1}") {
+                showNumber("UPPER ${i + 1} MIDI КАНАЛ", (st.midiChannel + 1).toFloat(), 1f, 16f, 0, live = false) { nv ->
+                    val cur = upperStates[i] ?: st
+                    val next = cur.copy(midiChannel = round(nv).toInt().coerceIn(1, 16) - 1)
+                    upperStates[i] = next
+                    if (!sampler.updateUpperControl(i, next)) refreshUpper(i)
+                }
+            }
+        }
+        // Row 2: MIDI IN channels
+        text(c, "MIDI IN - КОИ КАНАЛИ СЕ ПРИЕМАТ", L, b.top + 124f, 12f, C_AMBER, face = faceBold, spacing = 0.12f)
+        val cw = (W - 15f * 6f) / 16f
+        for (ch in 0 until 16) {
+            val r = RectF(L + ch * (cw + 6f), b.top + 134f, L + ch * (cw + 6f) + cw, b.top + 178f)
+            val on = (a.midiInMask and (1 shl ch)) != 0
+            stripToggle(c, r, (ch + 1).toString(), on, C_AMBER, size = 15f)
+            hit(r, { _, _ -> sampler.updateGlobalAdvanced(a.copy(midiInMask = a.midiInMask xor (1 shl ch))); invalidate() })
+        }
+        // Row 3: filters + damper polarity
+        text(c, "ФИЛТРИ (ON = СЕ ИГНОРИРА)", L, b.top + 206f, 12f, C_AMBER, face = faceBold, spacing = 0.12f)
+        val fw = (W - 4f * 8f) / 5f
+        val filters = listOf(
+            Triple("НОТИ", a.filterNotes) { sampler.updateGlobalAdvanced(a.copy(filterNotes = !a.filterNotes)) },
+            Triple("CC", a.filterCc) { sampler.updateGlobalAdvanced(a.copy(filterCc = !a.filterCc)) },
+            Triple("PITCH BEND", a.filterBend) { sampler.updateGlobalAdvanced(a.copy(filterBend = !a.filterBend)) },
+            Triple("AFTERTOUCH", a.filterAftertouch) { sampler.updateGlobalAdvanced(a.copy(filterAftertouch = !a.filterAftertouch)) },
+            Triple("ПЕДАЛ ОБЪРНАТ", a.damperReversed) { sampler.updateGlobalAdvanced(a.copy(damperReversed = !a.damperReversed)) }
+        )
+        filters.forEachIndexed { k, f ->
+            val r = RectF(L + k * (fw + 8f), b.top + 216f, L + k * (fw + 8f) + fw, b.top + 266f)
+            cellKey(c, r, f.first, "", on = f.second) { f.third() }
+        }
+        // Rows 4/5: BREATH, EXPRESSION, DAMPER, VELOCITY, BEND, AFTERTOUCH
+        text(c, "КОНТРОЛЕРИ", L, b.top + 294f, 12f, C_AMBER, face = faceBold, spacing = 0.12f)
+        val kw = (W - 4f * 8f) / 5f
+        fun row(y: Float, k: Int) = RectF(L + k * (kw + 8f), y, L + k * (kw + 8f) + kw, y + 62f)
+        val y1 = b.top + 304f
+        val y2 = b.top + 374f
+        val y3 = b.top + 444f
+        cellKey(c, row(y1, 0), "BREATH CC", "CC ${g.breathCc}") { editGlobal(9, g) }
+        cellKey(c, row(y1, 1), "BREATH MIN", "%.0f %%".format(a.breathMin * 100f)) {
+            showNumber("BREATH MIN %", a.breathMin * 100f, 0f, 99f, 0, live = false) { sampler.updateGlobalAdvanced(a.copy(breathMin = it / 100f)) } }
+        cellKey(c, row(y1, 2), "BREATH MAX", "%.0f %%".format(a.breathMax * 100f)) {
+            showNumber("BREATH MAX %", a.breathMax * 100f, 1f, 100f, 0, live = false) { sampler.updateGlobalAdvanced(a.copy(breathMax = it / 100f)) } }
+        cellKey(c, row(y1, 3), "BREATH CURVE", "%.2f".format(a.breathCurve)) {
+            showNumber("BREATH CURVE", a.breathCurve, 0.1f, 8f, 2, live = false) { sampler.updateGlobalAdvanced(a.copy(breathCurve = it)) } }
+        cellKey(c, row(y1, 4), "VELOCITY CURVE", g.velocityCurve.toString()) { editGlobal(8, g) }
+        cellKey(c, row(y2, 0), "EXPRESSION CC", "CC ${g.expressionCc}") { editGlobal(10, g) }
+        cellKey(c, row(y2, 1), "EXPRESSION MIN", "%.0f %%".format(a.expressionMin * 100f)) {
+            showNumber("EXPRESSION MIN %", a.expressionMin * 100f, 0f, 99f, 0, live = false) { sampler.updateGlobalAdvanced(a.copy(expressionMin = it / 100f)) } }
+        cellKey(c, row(y2, 2), "EXPRESSION MAX", "%.0f %%".format(a.expressionMax * 100f)) {
+            showNumber("EXPRESSION MAX %", a.expressionMax * 100f, 1f, 100f, 0, live = false) { sampler.updateGlobalAdvanced(a.copy(expressionMax = it / 100f)) } }
+        cellKey(c, row(y2, 3), "EXPRESSION CURVE", "%.2f".format(a.expressionCurve)) {
+            showNumber("EXPRESSION CURVE", a.expressionCurve, 0.1f, 8f, 2, live = false) { sampler.updateGlobalAdvanced(a.copy(expressionCurve = it)) } }
+        cellKey(c, row(y2, 4), "DAMPER CC", "CC ${g.damperCc}") { editGlobal(11, g) }
+        cellKey(c, row(y3, 0), "PITCH BEND", "", on = g.pitchBendEnabled) { editGlobal(12, g) }
+        cellKey(c, row(y3, 1), "AFTERTOUCH", "", on = g.aftertouchEnabled) { editGlobal(13, g) }
+        text(c, "Контролерите на всеки Upper (BREATH / EXPRESSION / AFTERTOUCH / ПЕДАЛ) са в КОМБИ → CONTROL.",
+            L, b.bottom - 16f, 12f, C_INK_SOFT, maxWidth = W)
     }
 
     // ------------------------------------------------------------------ commits
@@ -2068,7 +2382,7 @@ class SilvetonSamplerView(
         text(c, label, r.centerX(), r.centerY() + 4f, 11f, C_AMBER, center = true, face = faceMonoBold, spacing = 0.06f, maxWidth = r.width() - 8f)
     }
 
-    private fun stripToggle(c: Canvas, r: RectF, label: String, on: Boolean, onColor: Int) {
+    private fun stripToggle(c: Canvas, r: RectF, label: String, on: Boolean, onColor: Int, size: Float = 11f) {
         val down = isDown(r)
         if (on) {
             fill(c, r, 6f, Color.BLACK)
@@ -2077,7 +2391,8 @@ class SilvetonSamplerView(
             fill(c, r, 6f, C_KEY_LIGHT_EDGE)
             fill(c, RectF(r.left, r.top, r.right, r.bottom - if (down) 0.5f else 2f), 6f, if (down) Color.rgb(205, 208, 213) else C_TOGGLE)
         }
-        text(c, label, r.centerX(), r.centerY() + 4f, 11f, if (on) onColor else C_TOGGLE_TEXT, center = true, face = faceBold)
+        text(c, label, r.centerX(), r.centerY() + size * 0.36f, size, if (on) onColor else C_TOGGLE_TEXT, center = true, face = faceBold,
+            maxWidth = r.width() - 4f)
     }
 
     private fun segKey(c: Canvas, r: RectF, label: String, on: Boolean, size: Float = 13f, withLed: Boolean = false) {
@@ -2235,8 +2550,10 @@ class SilvetonSamplerView(
         }
     }
 
-    private fun faderCap(c: Canvas, cx: Float, cy: Float) {
-        val r = RectF(cx - 20f, cy - 11f, cx + 20f, cy + 11f)
+    private fun faderCap(c: Canvas, cx: Float, cy: Float, big: Boolean = false) {
+        val hw = if (big) 26f else 20f
+        val hh = if (big) 15f else 11f
+        val r = RectF(cx - hw, cy - hh, cx + hw, cy + hh)
         shadow(c, r, 5f, 3f, 110)
         fillV(c, r, 5f, Color.rgb(91, 95, 102), Color.rgb(42, 44, 49))
         line(c, r.left + 4f, r.top + 1f, r.right - 4f, r.top + 1f, Color.rgb(154, 160, 168), 1f)

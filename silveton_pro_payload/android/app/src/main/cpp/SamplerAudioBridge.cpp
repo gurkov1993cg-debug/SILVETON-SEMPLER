@@ -867,8 +867,9 @@ public:
         auto next = std::make_shared<EngineState>(state_ != nullptr ? *state_ : EngineState{});
         auto& u = next->combi.uppers[static_cast<std::size_t>(upperIndex)];
         u.octave = static_cast<std::int8_t>(std::clamp(octave, -4, 4));
-        u.transposeSemitones = static_cast<std::int8_t>(std::clamp(transpose, -48, 48));
-        u.tuneCents = std::clamp(fineCents, -100.0F, 100.0F);
+        // SILVETON_TUNE_RANGES_V1: TRANSPOSE -12..+12, FINE TUNE -1200..+1200 cents.
+        u.transposeSemitones = static_cast<std::int8_t>(std::clamp(transpose, -12, 12));
+        u.tuneCents = std::clamp(fineCents, -1200.0F, 1200.0F);
         u.pitchBendRange = static_cast<std::int8_t>(std::clamp(pitchBendRange, 0, 24));
         u.portamentoSec = std::clamp(portamentoSec, 0.0F, 0.1F); // TIME 1..100 ms like the SILVETON keyboard processor
         return installState(std::move(next));
@@ -1091,6 +1092,19 @@ public:
                static_cast<float>(g.breathCc), static_cast<float>(g.expressionCc),
                static_cast<float>(g.damperCc), g.pitchBendEnabled ? 1.0F : 0.0F,
                g.aftertouchEnabled ? 1.0F : 0.0F};
+        // SILVETON_MIDI_FULL_V1: 14 scaleRoot, 15..26 scale cents, 27 MIDI IN mask,
+        // 28..31 filters (notes, CC, bend, aftertouch), 32..34 breath min/max/curve,
+        // 35..37 expression min/max/curve, 38 damper polarity reversed.
+        out.push_back(static_cast<float>(g.scaleRoot));
+        for (const float cents : g.scaleOffsetsCents) out.push_back(cents);
+        out.push_back(static_cast<float>(g.midiInputChannelMask));
+        out.push_back(g.filterNotes ? 1.0F : 0.0F);
+        out.push_back(g.filterControlChange ? 1.0F : 0.0F);
+        out.push_back(g.filterPitchBend ? 1.0F : 0.0F);
+        out.push_back(g.filterAftertouch ? 1.0F : 0.0F);
+        out.push_back(g.breathMin); out.push_back(g.breathMax); out.push_back(g.breathCurve);
+        out.push_back(g.expressionMin); out.push_back(g.expressionMax); out.push_back(g.expressionCurve);
+        out.push_back(g.damperPolarityReversed ? 1.0F : 0.0F);
         return out;
     }
 
@@ -1108,7 +1122,7 @@ public:
         auto next = std::make_shared<EngineState>(state_ != nullptr ? *state_ : EngineState{});
         auto& g = next->global;
         g.masterTuneHz = std::clamp(masterTuneHz, 400.0F, 480.0F);
-        g.transposeSemitones = static_cast<std::int8_t>(std::clamp(transposeSemitones, -48, 48));
+        g.transposeSemitones = static_cast<std::int8_t>(std::clamp(transposeSemitones, -12, 12));
         g.masterGainDb = std::clamp(masterGainDb, -60.0F, 18.0F);
         g.eqLowDb = std::clamp(eqLowDb, -18.0F, 18.0F);
         g.eqMidDb = std::clamp(eqMidDb, -18.0F, 18.0F);
@@ -1330,9 +1344,83 @@ public:
         return true;
     }
 
+    // SILVETON_SCAN_V1: SCAN for TERCA (1) and SCALE (2), like the SILVETON
+    // processor / Korg Pa. While scanning the keys make no sound; TERCA takes the
+    // three-note shape held (tonality), SCALE takes every key pressed (notes of
+    // the scale). When all scan keys are up the result is published and the
+    // keyboard plays normally again. Keys held before SCAN are released normally.
+    void startScan(int mode) noexcept {
+        scanTercaPending_ = false;
+        scanScaleCollected_ = 0;
+        scanMode_.store(mode == 1 || mode == 2 ? mode : 0, std::memory_order_release);
+    }
+    std::vector<int> scanInfo() const {
+        return {scanMode_.load(std::memory_order_acquire), tercaRoot_.load(std::memory_order_acquire),
+                tercaCell_.load(std::memory_order_acquire), static_cast<int>(tercaSerial_.load(std::memory_order_acquire)),
+                scaleMask_.load(std::memory_order_acquire), static_cast<int>(scaleSerial_.load(std::memory_order_acquire))};
+    }
+    void setTerca(int upperMask, int root, int cell) noexcept { engine_.setTerca(upperMask, root, cell); }
+    void setScaleUppers(int upperMask) noexcept { engine_.setScaleUppers(upperMask); }
+
+    void scanObserveOn(int mode, std::uint8_t key) noexcept {
+        if (mode == 2) { scanScaleCollected_ |= 1 << (key % 12U); return; }
+        if (scanTercaPending_) return;
+        int mask = 0;
+        for (int n = 0; n < 128; ++n) if (scanSwallowed_[static_cast<std::size_t>(n)] != 0U) mask |= 1 << (n % 12);
+        if (__builtin_popcount(static_cast<unsigned>(mask)) != 3) return;
+        static constexpr int kCells[6][3] = {{0, 4, 7}, {0, 2, 4}, {0, 3, 7}, {0, 2, 3}, {0, 1, 3}, {0, 1, 4}};
+        for (int cell = 0; cell < 6; ++cell) {
+            for (int root = 0; root < 12; ++root) {
+                int shape = 0;
+                for (int k = 0; k < 3; ++k) shape |= 1 << ((root + kCells[cell][k]) % 12);
+                if (shape != mask) continue;
+                scanTercaRoot_ = root;
+                scanTercaCell_ = cell;
+                scanTercaPending_ = true;
+                return;
+            }
+        }
+    }
+
+    void scanFinishIfReleased(int mode) noexcept {
+        for (const auto refs : scanSwallowed_) if (refs != 0U) return;
+        if (mode == 1 && scanTercaPending_) {
+            tercaRoot_.store(scanTercaRoot_, std::memory_order_release);
+            tercaCell_.store(scanTercaCell_, std::memory_order_release);
+            tercaSerial_.fetch_add(1U, std::memory_order_acq_rel);
+            scanTercaPending_ = false;
+            scanMode_.store(0, std::memory_order_release);
+        } else if (mode == 2 && scanScaleCollected_ != 0) {
+            scaleMask_.store(scanScaleCollected_, std::memory_order_release);
+            scaleSerial_.fetch_add(1U, std::memory_order_acq_rel);
+            scanScaleCollected_ = 0;
+            scanMode_.store(0, std::memory_order_release);
+        }
+    }
+
     bool midi(std::uint8_t status, std::uint8_t data1, std::uint8_t data2) noexcept {
         const std::uint8_t kind = static_cast<std::uint8_t>(status & 0xF0U);
         const std::uint8_t ch = static_cast<std::uint8_t>(status & 0x0FU);
+        {
+            const bool isOn = kind == 0x90U && data2 > 0U;
+            const bool isOff = kind == 0x80U || (kind == 0x90U && data2 == 0U);
+            if (isOn || isOff) {
+                const std::size_t n = static_cast<std::size_t>(data1 & 0x7FU);
+                const int mode = scanMode_.load(std::memory_order_acquire);
+                if (isOff && scanSwallowed_[n] != 0U) {
+                    --scanSwallowed_[n];
+                    if (mode != 0) scanFinishIfReleased(mode);
+                    midiActivitySerial_.fetch_add(1U, std::memory_order_release);
+                    return true;
+                }
+                if (isOn && mode != 0) {
+                    if (scanSwallowed_[n] < 255U) ++scanSwallowed_[n];
+                    scanObserveOn(mode, static_cast<std::uint8_t>(n));
+                    midiActivitySerial_.fetch_add(1U, std::memory_order_release);
+                    return true;
+                }
+            }
+        }
         midiLastStatus_.store(static_cast<int>(status), std::memory_order_relaxed);
         midiLastData1_.store(static_cast<int>(data1), std::memory_order_relaxed);
         midiLastData2_.store(static_cast<int>(data2), std::memory_order_relaxed);
@@ -2442,6 +2530,17 @@ private:
     std::vector<RawMidiPort> rawMidiPorts_{};
     std::vector<float> renderBuffer_{};
     std::vector<std::int16_t> pcmBuffer_{};
+    std::atomic<int> scanMode_{0};
+    std::array<std::uint8_t, 128> scanSwallowed_{};
+    bool scanTercaPending_{false};
+    int scanTercaRoot_{0};
+    int scanTercaCell_{0};
+    int scanScaleCollected_{0};
+    std::atomic<int> tercaRoot_{-1};
+    std::atomic<int> tercaCell_{-1};
+    std::atomic<unsigned> tercaSerial_{0U};
+    std::atomic<int> scaleMask_{0};
+    std::atomic<unsigned> scaleSerial_{0U};
     std::uint32_t ditherState_{0x9E3779B9U};
     // Uniform 0..1 from a xorshift generator (audio thread only, no locks).
     double ditherNext() noexcept {
@@ -2637,6 +2736,10 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEng
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeUpdateCombiFx(JNIEnv*,jobject,jint slot,jint type,jfloat wet,jfloat timeMs,jfloat feedback,jfloat rateHz,jfloat depth,jfloat tone){return sampler().updateCombiFx(slot,type,wet,timeMs,feedback,rateHz,depth,tone)?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeUpdateCombiFxRouting(JNIEnv*,jobject,jint routing){return sampler().updateCombiFxRouting(routing)?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jfloatArray JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeCombiFxState(JNIEnv* env,jobject){return floatVectorArray(env,sampler().combiFxState());}
+extern "C" JNIEXPORT void JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeStartScan(JNIEnv*,jobject,jint mode){sampler().startScan(static_cast<int>(mode));}
+extern "C" JNIEXPORT jintArray JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeScanInfo(JNIEnv* env,jobject){const auto v=sampler().scanInfo();jintArray a=env->NewIntArray(static_cast<jsize>(v.size()));if(a!=nullptr){std::vector<jint> j(v.begin(),v.end());env->SetIntArrayRegion(a,0,static_cast<jsize>(j.size()),j.data());}return a;}
+extern "C" JNIEXPORT void JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeSetTerca(JNIEnv*,jobject,jint upperMask,jint root,jint cell){sampler().setTerca(static_cast<int>(upperMask),static_cast<int>(root),static_cast<int>(cell));}
+extern "C" JNIEXPORT void JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeSetScaleUppers(JNIEnv*,jobject,jint upperMask){sampler().setScaleUppers(static_cast<int>(upperMask));}
 extern "C" JNIEXPORT jfloatArray JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeGlobalState(JNIEnv* env,jobject){return floatVectorArray(env,sampler().globalState());}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeWriteGlobal(JNIEnv*,jobject){return sampler().writeGlobal()?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeUpdateGlobal(JNIEnv*,jobject,jfloat tune,jint transpose,jfloat gain,jfloat low,jfloat mid,jfloat high,jboolean limiter,jfloat ceiling,jint velocityCurve,jint breathCc,jint expressionCc,jint damperCc,jboolean pitchBend,jboolean aftertouch){return sampler().updateGlobal(tune,transpose,gain,low,mid,high,limiter==JNI_TRUE,ceiling,velocityCurve,breathCc,expressionCc,damperCc,pitchBend==JNI_TRUE,aftertouch==JNI_TRUE)?JNI_TRUE:JNI_FALSE;}

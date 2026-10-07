@@ -774,6 +774,12 @@ struct SamplerEngine::Impl {
     std::array<MonoKeys, kUpperCount> mono{};
     std::array<bool, kUpperCount> monoWas{};
     std::atomic<float> portaBalance{11.0F};
+    // SILVETON_TERCA_V1 (written by the control thread, read by the audio thread)
+    std::atomic<int> tercaConfig{-1};    // -1 off, else upperMask | root << 8 | cell << 12
+    std::atomic<int> scaleUppers{0};     // Uppers whose Q key is on
+    int tercaApplied{-1};                // config the maps below belong to (audio thread)
+    std::array<std::array<std::int8_t, 128>, 16> tercaKey{};       // physical key -> harmony (-1)
+    std::array<std::array<std::uint8_t, 128>, 16> tercaRefs{};     // harmony refcount
     std::uint64_t voiceAge{0U};
     float peakL{0.0F};
     float peakR{0.0F};
@@ -823,6 +829,9 @@ struct SamplerEngine::Impl {
         sampleRate = sr;
         voiceAge = 0U;
         peakL = peakR = limiterGrDb = 0.0F;
+        for (auto& ch : tercaKey) ch.fill(-1);
+        for (auto& ch : tercaRefs) ch.fill(0U);
+        tercaApplied = -1;
         limiter.reset(sr);
         upperPeakL.fill(0.0F);
         upperPeakR.fill(0.0F);
@@ -860,6 +869,55 @@ void SamplerEngine::prepare(double sampleRate, std::uint32_t maximumBlockFrames)
 
 void SamplerEngine::setPortamentoBalance(float balance) noexcept {
     impl_->portaBalance.store(std::isfinite(balance) ? std::clamp(balance, 3.0F, 40.0F) : 11.0F, std::memory_order_relaxed);
+}
+
+namespace {
+struct TercaCell { std::array<int, 7> scale; int direction; };
+constexpr std::array<TercaCell, 6> kTercaCells{{
+    {{{0, 2, 4, 5, 7, 9, 11}}, +1},   // major third up
+    {{{0, 2, 4, 5, 7, 9, 11}}, -1},   // major third down
+    {{{0, 2, 3, 5, 7, 8, 10}}, +1},   // minor third up
+    {{{0, 2, 3, 5, 7, 8, 10}}, -1},   // minor third down
+    {{{0, 1, 3, 5, 7, 8, 10}}, +1},   // phrygian third up
+    {{{0, 1, 4, 5, 7, 8, 10}}, +1},   // hijaz third up
+}};
+int tercaDegree(const std::array<int, 7>& scale, int relativePc) noexcept {
+    for (int i = 0; i < 7; ++i) if (scale[static_cast<std::size_t>(i)] == relativePc) return i;
+    return -1;
+}
+} // namespace
+
+int SamplerEngine::tercaHarmony(int root, int cell, int key) noexcept {
+    if (cell < 0 || cell >= 6 || key < 0 || key > 127) return -1;
+    const auto& c = kTercaCells[static_cast<std::size_t>(cell)];
+    const int dir = c.direction;
+    const int pc = key % 12;
+    const int relative = (pc - (root % 12) + 12) % 12;
+    const int degree = tercaDegree(c.scale, relative);
+    if (degree < 0) {
+        // Not in the scale: the minor third that lands in the scale, else the
+        // major third that does, else a plain minor third (processor rule).
+        int delta = 3 * dir;
+        if (tercaDegree(c.scale, ((relative + 3 * dir) % 12 + 12) % 12) >= 0) delta = 3 * dir;
+        else if (tercaDegree(c.scale, ((relative + 4 * dir) % 12 + 12) % 12) >= 0) delta = 4 * dir;
+        const int r = key + delta;
+        return (r < 0 || r > 127) ? -1 : r;
+    }
+    const int step = degree + 2 * dir;
+    const int octave = step >= 7 ? 12 : (step < 0 ? -12 : 0);
+    const int target = c.scale[static_cast<std::size_t>(((step % 7) + 7) % 7)] + octave;
+    const int r = key + target - c.scale[static_cast<std::size_t>(degree)];
+    return (r < 0 || r > 127) ? -1 : r;
+}
+
+void SamplerEngine::setTerca(int upperMask, int root, int cell) noexcept {
+    const int mask = upperMask & 0x7F;
+    const int cfg = (mask == 0 || cell < 0 || cell >= 6) ? -1 : (mask | ((root % 12 + 12) % 12) << 8 | cell << 12);
+    impl_->tercaConfig.store(cfg, std::memory_order_release);
+}
+
+void SamplerEngine::setScaleUppers(int upperMask) noexcept {
+    impl_->scaleUppers.store(upperMask & 0x7F, std::memory_order_release);
 }
 
 float SamplerEngine::portamentoBalance() const noexcept {
@@ -946,16 +1004,26 @@ SamplerEngine::Impl::Voice* chooseVoice(SamplerEngine::Impl& impl) noexcept {
 }
 
 // Playback ratio of a key for one layer/zone (also used by LEGATO pitch changes).
+std::uint8_t playKeyFor(const UpperPart& upper, const GlobalState& global, std::uint8_t key) noexcept {
+    const int k = static_cast<int>(key) + static_cast<int>(upper.transposeSemitones) +
+                  static_cast<int>(upper.octave) * 12 + static_cast<int>(global.transposeSemitones);
+    return static_cast<std::uint8_t>(std::clamp(k, 0, 127));
+}
+
 double noteRatio(const SamplerEngine::Impl& impl, const UpperPart& upper, const ProgramLayer& layer,
-                 const SampleZone& zone, std::uint8_t key, const GlobalState& global) noexcept {
-    const int keyTracking = zone.nonTranspose ? 0 : (static_cast<int>(key) - static_cast<int>(zone.rootKey));
+                 const SampleZone& zone, std::uint8_t key, const GlobalState& global, int ui) noexcept {
+    // SILVETON_OCTAVE_KEY_V1: OCTAVE / TRANSPOSE move the KEY (like Korg): the
+    // sample recorded for the new key is chosen and played at its own pitch,
+    // instead of stretching the sample of the pressed key.
+    const std::uint8_t pk = playKeyFor(upper, global, key);
+    const int keyTracking = zone.nonTranspose ? 0 : (static_cast<int>(pk) - static_cast<int>(zone.rootKey));
     const int semitones = keyTracking +
-                          static_cast<int>(zone.transposeSemitones) + static_cast<int>(layer.transposeSemitones) +
-                          static_cast<int>(upper.transposeSemitones) + static_cast<int>(upper.octave) * 12 +
-                          static_cast<int>(global.transposeSemitones);
+                          static_cast<int>(zone.transposeSemitones) + static_cast<int>(layer.transposeSemitones);
     const int root = static_cast<int>(global.scaleRoot % 12U);
-    const int pc = (static_cast<int>(key) - root + 120) % 12;
-    const float scaleCents = std::clamp(global.scaleOffsetsCents[static_cast<std::size_t>(pc)], -100.0F, 100.0F);
+    const int pc = (static_cast<int>(pk) - root + 120) % 12;
+    // SILVETON_SCALE_V1: only Uppers with their Q key on follow the scale.
+    const bool scaleOn = ((impl.scaleUppers.load(std::memory_order_relaxed) >> ui) & 1) != 0;
+    const float scaleCents = scaleOn ? std::clamp(global.scaleOffsetsCents[static_cast<std::size_t>(pc)], -100.0F, 100.0F) : 0.0F;
     const float cents = zone.tuneCents + layer.tuneCents + upper.tuneCents + zone.sample->fineTuneCents + scaleCents;
     const double tuneHz = std::clamp(static_cast<double>(global.masterTuneHz), 400.0, 480.0);
     const double masterTuneSemis = 12.0 * std::log2(tuneHz / 440.0);
@@ -971,14 +1039,15 @@ double noteRatio(const SamplerEngine::Impl& impl, const UpperPart& upper, const 
 // settings and ends naturally.
 constexpr double kLiveMixSmoothSec = 0.005;
 
-double liveTuneSemis(const UpperPart& upper, const GlobalState& global, std::uint8_t key) noexcept {
-    const int semis = static_cast<int>(upper.transposeSemitones) + static_cast<int>(upper.octave) * 12 +
-                      static_cast<int>(global.transposeSemitones);
+double liveTuneSemis(const UpperPart& upper, const GlobalState& global, std::uint8_t key, bool scaleOn) noexcept {
+    // OCTAVE / TRANSPOSE are part of the key (SILVETON_OCTAVE_KEY_V1): they take
+    // effect on the next key press; fine tune, MASTER TUNE and SCALE stay live.
+    const std::uint8_t pk = playKeyFor(upper, global, key);
     const int root = static_cast<int>(global.scaleRoot % 12U);
-    const int pc = (static_cast<int>(key) - root + 120) % 12;
-    const float scaleCents = std::clamp(global.scaleOffsetsCents[static_cast<std::size_t>(pc)], -100.0F, 100.0F);
+    const int pc = (static_cast<int>(pk) - root + 120) % 12;
+    const float scaleCents = scaleOn ? std::clamp(global.scaleOffsetsCents[static_cast<std::size_t>(pc)], -100.0F, 100.0F) : 0.0F;
     const double tuneHz = std::clamp(static_cast<double>(global.masterTuneHz), 400.0, 480.0);
-    return static_cast<double>(semis) + static_cast<double>(upper.tuneCents + scaleCents) / 100.0 +
+    return static_cast<double>(upper.tuneCents + scaleCents) / 100.0 +
            12.0 * std::log2(tuneHz / 440.0);
 }
 
@@ -1033,7 +1102,7 @@ void startVoice(SamplerEngine::Impl& impl,
     v.position = zone.reverse && zone.sample != nullptr ? static_cast<double>(zone.sample->frameCount() - 1U) : 0.0;
     v.loopWrapped = false;
 
-    v.ratio = noteRatio(impl, upper, layer, zone, key, global);
+    v.ratio = noteRatio(impl, upper, layer, zone, key, global, upperIndex);
     v.targetRatio = v.ratio;
     v.pitchGliding = false;
     v.glideFramesRemaining = 0U;
@@ -1069,7 +1138,7 @@ void startVoice(SamplerEngine::Impl& impl,
     updateMixTarget(v, upper, true, 0.0F);
     v.mixL = v.mixTargetL;
     v.mixR = v.mixTargetR;
-    v.tuneSemis = liveTuneSemis(upper, global, key);
+    v.tuneSemis = liveTuneSemis(upper, global, key, ((impl.scaleUppers.load(std::memory_order_relaxed) >> upperIndex) & 1) != 0);
     v.filterEnv.params = layer.filterEnvelope;
     v.pitchEnv.params = layer.pitchEnvelope;
     v.ampEnv = AmpEnv{};
@@ -1255,9 +1324,9 @@ void startPortamentoGlide(const SamplerEngine::Impl& impl, SamplerEngine::Impl::
 void legatoTo(SamplerEngine::Impl& impl, SamplerEngine::Impl::Voice& v, const UpperPart& upper,
               const ProgramLayer& layer, const SampleZone& zone, std::uint8_t key, const GlobalState& global,
               float glideSec) noexcept {
-    const double target = noteRatio(impl, upper, layer, zone, key, global);
+    const double target = noteRatio(impl, upper, layer, zone, key, global, v.upperIndex);
     v.key = key;
-    v.tuneSemis = liveTuneSemis(upper, global, key);
+    v.tuneSemis = liveTuneSemis(upper, global, key, ((impl.scaleUppers.load(std::memory_order_relaxed) >> v.upperIndex) & 1) != 0);
     const float portamentoSec = glideSec;
     if (portamentoSec > 0.0F && v.ratio > 0.0 && target > 0.0) {
         const auto frames = static_cast<std::uint32_t>(std::max(1.0, static_cast<double>(portamentoSec) * impl.sampleRate));
@@ -1292,9 +1361,9 @@ void playUpperNote(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
         if (upperLegato && hadHeldVoice) {
             // 1) a still-held voice on the same recording just changes pitch
             for (const auto& layer : program.layers) {
-                if (!layer.matches(key, velocity)) continue;
+                if (!layer.matches(playKeyFor(upper, global, key), velocity)) continue;
                 for (const auto& zone : layer.multisample->zones) {
-                    if (!zone.matches(key, velocity) || !zone.sample->valid()) continue;
+                    if (!zone.matches(playKeyFor(upper, global, key), velocity) || !zone.sample->valid()) continue;
                     for (auto& existing : impl.voices) {
                         if (existing.active && !existing.fading && existing.upperIndex == ui && existing.keyHeld &&
                             existing.delayFramesRemaining == 0U && !existing.legatoKeep &&
@@ -1324,9 +1393,9 @@ void playUpperNote(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
         }
     }
     for (const auto& layer : program.layers) {
-        if (!layer.matches(key, velocity)) continue;
+        if (!layer.matches(playKeyFor(upper, global, key), velocity)) continue;
         for (const auto& zone : layer.multisample->zones) {
-            if (!zone.matches(key, velocity) || !zone.sample->valid()) continue;
+            if (!zone.matches(playKeyFor(upper, global, key), velocity) || !zone.sample->valid()) continue;
             if (upperLegato && hadHeldVoice) {
                 bool kept = false;
                 for (const auto& existing : impl.voices) {
@@ -1370,9 +1439,9 @@ void playPortamentoNote(SamplerEngine::Impl& impl, const std::shared_ptr<const E
         // already ended starts again and glides from the previous key).
         const double fromKey = (keyWasHeld && previousKey >= 0) ? static_cast<double>(previousKey) : -1.0;
         for (const auto& layer : program.layers) {
-            if (!layer.matches(key, velocity)) continue;
+            if (!layer.matches(playKeyFor(upper, global, key), velocity)) continue;
             for (const auto& zone : layer.multisample->zones) {
-                if (!zone.matches(key, velocity) || !zone.sample->valid()) continue;
+                if (!zone.matches(playKeyFor(upper, global, key), velocity) || !zone.sample->valid()) continue;
                 auto* v = chooseVoice(impl);
                 startVoice(impl, *v, upper, layer, zone, ui, channel, key, velocity, global, stateOwner);
                 v->mono = true;
@@ -1386,9 +1455,9 @@ void playPortamentoNote(SamplerEngine::Impl& impl, const std::shared_ptr<const E
     const float previousAmp = sounding->ampEnv.value;
     for (auto& v : impl.voices) if (v.upperIndex == ui) v.legatoKeep = false;
     for (const auto& layer : program.layers) {
-        if (!layer.matches(key, velocity)) continue;
+        if (!layer.matches(playKeyFor(upper, global, key), velocity)) continue;
         for (const auto& zone : layer.multisample->zones) {
-            if (!zone.matches(key, velocity) || !zone.sample->valid()) continue;
+            if (!zone.matches(playKeyFor(upper, global, key), velocity) || !zone.sample->valid()) continue;
             SamplerEngine::Impl::Voice* keep = nullptr;
             for (auto& v : impl.voices) {
                 if (v.active && !v.fading && v.upperIndex == ui && v.keyHeld && v.delayFramesRemaining == 0U &&
@@ -1421,12 +1490,31 @@ void playPortamentoNote(SamplerEngine::Impl& impl, const std::shared_ptr<const E
 void handleNoteOff(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineState>& stateOwner,
                    std::uint8_t channel, std::uint8_t key) noexcept {
     std::uint16_t handled = 0U;
+    // SILVETON_TERCA_V1: the TERCA Upper releases the third that this key made.
+    const int tmask = impl.tercaApplied >= 0 ? (impl.tercaApplied & 0x7F) : 0;
+    int harmony = -1;
+    bool harmonyEnds = false;
+    if (tmask != 0) {
+        auto& slot = impl.tercaKey[channel & 0x0FU][key & 0x7FU];
+        harmony = slot;
+        slot = -1;
+        if (harmony >= 0) {
+            auto& refs = impl.tercaRefs[channel & 0x0FU][static_cast<std::size_t>(harmony)];
+            if (refs > 0U) --refs;
+            harmonyEnds = refs == 0U;
+        }
+    }
     for (int ui = 0; ui < kUpperCount; ++ui) {
         const auto& upper = stateOwner->combi.uppers[static_cast<std::size_t>(ui)];
         if (upper.midiChannel != (channel & 0x0FU) || voiceModeNow(impl, ui, upper) == UpperVoiceMode::Poly) continue;
+        std::uint8_t keyHere = key;
+        if (((tmask >> ui) & 1) != 0) {
+            if (harmony < 0 || !harmonyEnds) continue;
+            keyHere = static_cast<std::uint8_t>(harmony);
+        }
         auto& mk = impl.mono[static_cast<std::size_t>(ui)];
         std::size_t index = mk.count;
-        for (std::size_t i = 0; i < mk.count; ++i) if (mk.key[i] == key) { index = i; break; }
+        for (std::size_t i = 0; i < mk.count; ++i) if (mk.key[i] == keyHere) { index = i; break; }
         if (index >= mk.count) continue;
         handled = static_cast<std::uint16_t>(handled | static_cast<std::uint16_t>(1U << static_cast<unsigned>(ui)));
         const bool wasTop = index + 1U == mk.count;
@@ -1435,7 +1523,7 @@ void handleNoteOff(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
         if (mk.count > 0U && upper.program != nullptr) {
             // back to the key that is still held
             if (portamentoSecFor(upper) > 0.0F) {
-                playPortamentoNote(impl, stateOwner, ui, upper, channel, mk.key[mk.count - 1U], mk.vel[mk.count - 1U], true, static_cast<int>(key));
+                playPortamentoNote(impl, stateOwner, ui, upper, channel, mk.key[mk.count - 1U], mk.vel[mk.count - 1U], true, static_cast<int>(keyHere));
             } else {
                 playUpperNote(impl, stateOwner, ui, upper, channel, mk.key[mk.count - 1U], mk.vel[mk.count - 1U]);
             }
@@ -1443,11 +1531,39 @@ void handleNoteOff(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
             releaseUpperVoices(impl, ui, channel);
         }
     }
+    if (tmask != 0) {
+        const auto tBits = static_cast<std::uint16_t>(tmask);
+        if (harmony >= 0 && harmonyEnds) {
+            // only the TERCA Uppers not already handled as MONO above
+            releaseMatching(impl, channel, static_cast<std::uint8_t>(harmony),
+                            static_cast<std::uint16_t>((0x7FU & ~static_cast<unsigned>(tBits)) | handled));
+        }
+        handled = static_cast<std::uint16_t>(handled | tBits);
+    }
     releaseMatching(impl, channel, key, handled);
+}
+
+void syncTerca(SamplerEngine::Impl& impl) noexcept {
+    const int cfg = impl.tercaConfig.load(std::memory_order_acquire);
+    if (cfg == impl.tercaApplied) return;
+    // TERCA changed (on/off, other Upper or tonality): the old TERCA Upper lets
+    // its thirds go, so no third can hang.
+    const int oldMask = impl.tercaApplied >= 0 ? (impl.tercaApplied & 0x7F) : 0;
+    for (int ui = 0; ui < kUpperCount; ++ui) {
+        if (((oldMask >> ui) & 1) == 0) continue;
+        for (auto& v : impl.voices) {
+            if (v.active && v.upperIndex == ui) releaseOne(impl, v, false);
+        }
+        impl.mono[static_cast<std::size_t>(ui)] = SamplerEngine::Impl::MonoKeys{};
+    }
+    for (auto& ch : impl.tercaKey) ch.fill(-1);
+    for (auto& ch : impl.tercaRefs) ch.fill(0U);
+    impl.tercaApplied = cfg;
 }
 
 void processEvent(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineState>& stateOwner, const RealtimeEvent& e) noexcept {
     if (stateOwner == nullptr) return;
+    syncTerca(impl);
     const auto& state = *stateOwner;
     const std::uint8_t channel = static_cast<std::uint8_t>(e.channel & 0x0FU);
     if (e.type != EventType::Panic && (state.global.midiInputChannelMask & (1U << channel)) == 0U) return;
@@ -1457,25 +1573,46 @@ void processEvent(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineS
             if (state.global.filterNotes) break;
             if (e.data2 == 0U) { handleNoteOff(impl, stateOwner, e.channel, e.data1); break; }
             const bool anySolo = std::any_of(state.combi.uppers.begin(), state.combi.uppers.end(), [](const UpperPart& u) { return u.enabled && u.solo; });
+            const int tmask = impl.tercaApplied >= 0 ? (impl.tercaApplied & 0x7F) : 0;
+            int harmonyKey = -1;   // SILVETON_TERCA_V1: the third, sounded once for all T Uppers
+            if (tmask != 0) {
+                const int cfg = impl.tercaApplied;
+                auto& slot = impl.tercaKey[e.channel & 0x0FU][e.data1 & 0x7FU];
+                if (slot < 0) {
+                    const int h = SamplerEngine::tercaHarmony((cfg >> 8) & 0x0F, (cfg >> 12) & 0x0F, e.data1);
+                    if (h >= 0) {
+                        slot = static_cast<std::int8_t>(h);
+                        auto& refs = impl.tercaRefs[e.channel & 0x0FU][static_cast<std::size_t>(h)];
+                        if (refs < 255U) ++refs;
+                        if (refs == 1U) harmonyKey = h;   // otherwise another key already sounds it
+                    }
+                }
+            }
             for (int ui = 0; ui < kUpperCount; ++ui) {
                 const auto& upper = state.combi.uppers[static_cast<std::size_t>(ui)];
                 if (upper.midiChannel != (e.channel & 0x0FU)) continue;
                 if (anySolo && !upper.solo) continue;
                 if (!upper.matches(e.data1, e.data2)) continue;
+                std::uint8_t key = e.data1;
+                if (((tmask >> ui) & 1) != 0) {
+                    // SILVETON_TERCA_V1: a T Upper plays the third of the key.
+                    if (harmonyKey < 0) continue;
+                    key = static_cast<std::uint8_t>(harmonyKey);
+                }
                 if (voiceModeNow(impl, ui, upper) != UpperVoiceMode::Poly) {
                     auto& mk = impl.mono[static_cast<std::size_t>(ui)];
                     const bool keyWasHeld = mk.count > 0U;
                     const int previousKey = keyWasHeld ? static_cast<int>(mk.key[mk.count - 1U]) : -1;
-                    monoPush(mk, e.data1, e.data2);
+                    monoPush(mk, key, e.data2);
                     if (portamentoSecFor(upper) > 0.0F) {
                         // SILVETON_PORTA_PAGE_V1: the note that already sounds changes nothing
-                        if (previousKey != static_cast<int>(e.data1)) {
-                            playPortamentoNote(impl, stateOwner, ui, upper, e.channel, e.data1, e.data2, keyWasHeld, previousKey);
+                        if (previousKey != static_cast<int>(key)) {
+                            playPortamentoNote(impl, stateOwner, ui, upper, e.channel, key, e.data2, keyWasHeld, previousKey);
                         }
                         continue;
                     }
                 }
-                playUpperNote(impl, stateOwner, ui, upper, e.channel, e.data1, e.data2);
+                playUpperNote(impl, stateOwner, ui, upper, e.channel, key, e.data2);
             }
             break;
         }
@@ -1650,7 +1787,8 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
                     v.routeMask = impl_->upperRouteMask[uix];
                 }
             }
-            const double tune = liveTuneSemis(*v.upper, current->global, v.key);
+            const double tune = liveTuneSemis(*v.upper, current->global, v.key,
+                ((impl_->scaleUppers.load(std::memory_order_relaxed) >> v.upperIndex) & 1) != 0);
             if (tune != v.tuneSemis) {
                 const double m = std::exp2((tune - v.tuneSemis) / 12.0);
                 v.ratio *= m;

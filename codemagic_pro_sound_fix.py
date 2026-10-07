@@ -50,6 +50,15 @@
    MIDI IN, e.g. a breath controller, on its second port).
 16. Soft portamento: every glide follows an S-curve in TIME, and PORTA BALANCE (3..40 ms,
    default 11, tap the PORTA field on the status screen) rounds it further.
+17. LIST / BLENDS backup: after every save a copy goes to /storage/emulated/0/SILVETON
+   (survives an uninstall, previous copy kept as .BAK); a fresh install takes it back.
+18. OCTAVE / TRANSPOSE move the key (the sample recorded for the new key plays at its
+   own pitch) instead of stretching the pressed key's sample.
+19. Every Upper has a T key (TERCA of the SILVETON processor) and a Q key (quarter tone on
+   the notes taken by SCAN); LIST quick keys TRANSPOSE, T SCAN and Q SCAN.
+20. GUI: big ON / SOLO / MUTE, POLY / MONO / LEG keys, bigger faders, OCTAVE / TRANSPOSE
+   on - / + keys (both = 0), COPY / PASTE of an Upper, sound and blend pickers in pages,
+   name keyboard at once, SILVETON logo the right way, full MIDI settings page.
 
 The files are complete replacements. Each one is checked against the exact generated
 file it was made from; if anything differs the build stops instead of mixing versions.

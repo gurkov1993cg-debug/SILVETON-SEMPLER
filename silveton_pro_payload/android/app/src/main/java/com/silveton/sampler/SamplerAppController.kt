@@ -26,6 +26,8 @@ class SamplerAppController(
         const val TONE_RESONANCE = 5
         const val TONE_MAX_TIME_MS = 20000f
         const val TONE_CUTOFF_OPEN_HZ = 20000f
+        val TERCA_CELLS = arrayOf("MAJ ↑", "MAJ ↓", "MIN ↑", "MIN ↓", "PHR ↑", "HIJAZ ↑")
+        val NOTE_NAMES = arrayOf("C", "C#", "D", "Eb", "E", "F", "F#", "G", "G#", "A", "Bb", "B")
     }
 
     data class MidiStatus(
@@ -118,10 +120,105 @@ class SamplerAppController(
         if (save) portaPrefs.edit().putInt("porta_balance", portaBalanceValue).apply()
     }
 
+    // ---------------------------------------------------------------- TERCA / Q (quarter tone)
+    // SILVETON_TERCA_V1 / SILVETON_SCALE_V1: every Upper has a T key (plays the TERCA of
+    // the SILVETON processor) and a Q key (follows the quarter-tone scale). SCAN sets the
+    // tonality for T and the notes for Q. Kept between sessions.
+    data class TercaState(val root: Int, val cell: Int)
+
+    private var tercaUppers: Int = portaPrefs.getInt("terca_uppers", 0).toInt() and 0x7F
+    private var scaleUppers: Int = portaPrefs.getInt("scale_uppers", 0).toInt() and 0x7F
+    private var tercaRoot: Int = portaPrefs.getInt("terca_root", -1).toInt()
+    private var tercaCell: Int = portaPrefs.getInt("terca_cell", -1).toInt()
+    private var scaleMask: Int = portaPrefs.getInt("scale_mask", 0).toInt() and 0xFFF
+    private var lastTercaSerial = -1
+    private var lastScaleSerial = -1
+
+    fun tercaState() = TercaState(tercaRoot, tercaCell)
+    fun tercaOn(upper: Int): Boolean = (tercaUppers shr upper) and 1 != 0
+    fun quarterOn(upper: Int): Boolean = (scaleUppers shr upper) and 1 != 0
+    fun quarterNotes(): Int = scaleMask
+
+    fun toggleTerca(upper: Int) { tercaUppers = tercaUppers xor (1 shl upper); saveTercaScale(); applyTerca() }
+    fun toggleQuarter(upper: Int) { scaleUppers = scaleUppers xor (1 shl upper); saveTercaScale(); engine.nativeSetScaleUppers(scaleUppers) }
+
+    /** 0 = no scan, 1 = TERCA scan running, 2 = Q scan running. Also picks up finished scans. */
+    fun pollScan(): Int {
+        val v = engine.nativeScanInfo()
+        if (v.size < 6) return 0
+        if (lastTercaSerial < 0) lastTercaSerial = v[3]
+        if (lastScaleSerial < 0) lastScaleSerial = v[5]
+        if (v[3] != lastTercaSerial) {
+            lastTercaSerial = v[3]
+            if (v[1] in 0..11 && v[2] in 0..5) { tercaRoot = v[1]; tercaCell = v[2]; saveTercaScale(); applyTerca() }
+        }
+        if (v[5] != lastScaleSerial) {
+            lastScaleSerial = v[5]
+            if (v[4] != 0) { scaleMask = v[4] and 0xFFF; saveTercaScale(); applyScale() }
+        }
+        return v[0]
+    }
+
+    fun startTercaScan() = engine.nativeStartScan(1)
+    fun startScaleScan() = engine.nativeStartScan(2)
+    fun cancelScan() = engine.nativeStartScan(0)
+
+    private fun saveTercaScale() {
+        portaPrefs.edit().putInt("terca_uppers", tercaUppers).putInt("scale_uppers", scaleUppers)
+            .putInt("terca_root", tercaRoot).putInt("terca_cell", tercaCell).putInt("scale_mask", scaleMask).apply()
+    }
+
+    private fun applyTerca() {
+        val valid = tercaRoot in 0..11 && tercaCell in 0..5
+        engine.nativeSetTerca(if (valid) tercaUppers else 0, tercaRoot.coerceAtLeast(0), tercaCell.coerceAtLeast(0))
+    }
+
+    /** Q = quarter tone down (-50 cents) on the notes taken by SCAN. */
+    fun scaleCents(): FloatArray = FloatArray(12) { pc -> if ((scaleMask and (1 shl pc)) != 0) -50f else 0f }
+
+    private fun applyScale() {
+        engine.nativeSetScaleUppers(scaleUppers)
+        val adv = globalAdvanced() ?: return
+        // Offsets are given per real note (scaleRoot 0).
+        updateGlobalAdvanced(adv.copy(scaleRoot = 0, scaleCents = scaleCents()))
+    }
+
+    // ---------------------------------------------------------------- full MIDI / advanced GLOBAL
+    // SILVETON_MIDI_FULL_V1
+    data class GlobalAdvanced(
+        val scaleRoot: Int, val scaleCents: FloatArray, val midiInMask: Int,
+        val filterNotes: Boolean, val filterCc: Boolean, val filterBend: Boolean, val filterAftertouch: Boolean,
+        val breathMin: Float, val breathMax: Float, val breathCurve: Float,
+        val expressionMin: Float, val expressionMax: Float, val expressionCurve: Float,
+        val damperReversed: Boolean
+    )
+
+    fun globalAdvanced(): GlobalAdvanced? {
+        val v = engine.nativeGlobalState()
+        if (v.size < 39) return null
+        return GlobalAdvanced(v[14].toInt(), FloatArray(12) { v[15 + it] }, v[27].toInt(),
+            v[28] >= 0.5f, v[29] >= 0.5f, v[30] >= 0.5f, v[31] >= 0.5f,
+            v[32], v[33], v[34], v[35], v[36], v[37], v[38] >= 0.5f)
+    }
+
+    fun updateGlobalAdvanced(a: GlobalAdvanced): Boolean = nativeResult(
+        engine.nativeUpdateGlobalAdvanced(a.scaleRoot, a.scaleCents, a.midiInMask, a.filterNotes, a.filterCc,
+            a.filterBend, a.filterAftertouch, a.breathMin, a.breathMax, a.breathCurve,
+            a.expressionMin, a.expressionMax, a.expressionCurve, a.damperReversed)
+    )
+
+    /** Global transpose step (LIST quick keys). */
+    fun stepGlobalTranspose(step: Int): Boolean {
+        val g = globalUiState() ?: return false
+        return updateGlobalUi(g.copy(transpose = if (step == 0) 0 else (g.transpose + step).coerceIn(-12, 12)))
+    }
+
     /** Start low-latency output first, then accept MIDI. */
     fun start(): Boolean {
         if (closed.get()) return false
         engine.nativeSetPortaBalance(portaBalanceValue)
+        applyTerca()
+        engine.nativeSetScaleUppers(scaleUppers)
         if (started.get()) return true
         midi.start()
         val audioOk = runtime.start()
@@ -175,17 +272,21 @@ class SamplerAppController(
             statusChanged(engine.nativeLastTextError().ifBlank { "SILVETON_BANK.sv load failed: ${selected.absolutePath}" })
             return
         }
-        val userState = File(appContext.filesDir, "SILVETON_USER_STATE.SVSET")
+        restoreUserStateIfMissing()
+        val userState = userStateFile
         if (userState.exists() && !engine.nativeLoadUserPerformanceState(userState.absolutePath)) {
             statusChanged(engine.nativeLastTextError().ifBlank { "BLENDS/LIST user state load failed" })
             return
         }
+        if (userState.isFile && !backupFile.isFile) backupUserState()   // first copy for LIST/BLENDS made before this version
         val soundCount = engine.nativeSoundCatalogNames().size
         if (soundCount <= 0) {
             statusChanged("SILVETON_BANK.sv loaded but contains no visible SOUND positions")
             return
         }
         defaultBankAttempted = true
+        applyScale()
+        applyTerca()
         statusChanged(null)
     }
 
@@ -272,8 +373,47 @@ class SamplerAppController(
 
 
     private fun persistLiveListEdits(): Boolean {
-        val userState = File(appContext.filesDir, "SILVETON_USER_STATE.SVSET")
-        return nativeResult(engine.nativeSaveUserPerformanceState(userState.absolutePath))
+        return saveUserState()
+    }
+
+    // SILVETON_LIST_BACKUP_V1: LIST and BLENDS live in the app's own folder, which
+    // Android deletes when the app is uninstalled. After every save a copy goes to
+    // /storage/emulated/0/SILVETON (next to the bank), which survives an uninstall;
+    // the previous copy is kept as .BAK. A failed copy never blocks the save.
+    private val userStateFile: File get() = File(appContext.filesDir, "SILVETON_USER_STATE.SVSET")
+    private val backupDir: File = File("/storage/emulated/0/SILVETON")
+    private val backupFile: File get() = File(backupDir, "SILVETON_USER_STATE.SVSET")
+
+    private fun saveUserState(): Boolean {
+        val ok = nativeResult(engine.nativeSaveUserPerformanceState(userStateFile.absolutePath))
+        if (ok) backupUserState()
+        return ok
+    }
+
+    private fun backupUserState() {
+        try {
+            val src = userStateFile
+            if (!src.isFile || src.length() <= 0L) return
+            if (!backupDir.isDirectory && !backupDir.mkdirs()) return
+            val tmp = File(backupDir, "SILVETON_USER_STATE.SVSET.tmp")
+            src.copyTo(tmp, overwrite = true)
+            val dst = backupFile
+            if (dst.isFile) dst.copyTo(File(backupDir, "SILVETON_USER_STATE.SVSET.BAK"), overwrite = true)
+            if (!tmp.renameTo(dst)) { tmp.copyTo(dst, overwrite = true); tmp.delete() }
+        } catch (_: Exception) {
+        }
+    }
+
+    // A fresh install (no LIST/BLENDS of its own) takes the copy back automatically.
+    private fun restoreUserStateIfMissing() {
+        try {
+            val dst = userStateFile
+            if (dst.isFile && dst.length() > 0L) return
+            val src = listOf(backupFile, File(backupDir, "SILVETON_USER_STATE.SVSET.BAK"))
+                .firstOrNull { it.isFile && it.length() > 0L } ?: return
+            src.copyTo(dst, overwrite = true)
+        } catch (_: Exception) {
+        }
     }
 
     private fun renumberLiveList(): Boolean {
@@ -394,8 +534,7 @@ class SamplerAppController(
         val finalName = name.trim().ifBlank { combiName() }
         if (!nativeResult(engine.nativeWriteCombi(0, 0, slot, finalName))) return false
         if (!nativeResult(engine.nativeActivateCombi(0, 0, slot))) return false
-        val userState = File(appContext.filesDir, "SILVETON_USER_STATE.SVSET")
-        return nativeResult(engine.nativeSaveUserPerformanceState(userState.absolutePath))
+        return saveUserState()
     }
 
     fun firstFreeCombiSlot(): Int {
@@ -460,8 +599,7 @@ class SamplerAppController(
             ))
         }
         if (!changed) return false
-        val userState = File(appContext.filesDir, "SILVETON_USER_STATE.SVSET")
-        return nativeResult(engine.nativeSaveUserPerformanceState(userState.absolutePath))
+        return saveUserState()
     }
 
     fun kscNames(path: File): List<String> = engine.nativeKscNames(path.absolutePath).toList()

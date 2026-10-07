@@ -18,6 +18,14 @@ class NativeSamplerEngine {
     external fun nativeEnforceOutputRoute(): Boolean
     /** PORTA BALANCE of the SILVETON keyboard processor (3..40, default 11). */
     external fun nativeSetPortaBalance(balance: Int)
+    /** SILVETON_SCAN_V1: 1 = TERCA scan, 2 = SCALE scan, 0 = cancel. */
+    external fun nativeStartScan(mode: Int)
+    /** [scanMode, tercaRoot, tercaCell, tercaSerial, scaleMask, scaleSerial]. */
+    external fun nativeScanInfo(): IntArray
+    /** SILVETON_TERCA_V1: TERCA on the Uppers in [upperMask] (bit 0 = Upper 1, 0 = off). */
+    external fun nativeSetTerca(upperMask: Int, root: Int, cell: Int)
+    /** SILVETON_SCALE_V1: Uppers whose Q key is on follow the quarter-tone scale. */
+    external fun nativeSetScaleUppers(upperMask: Int)
     external fun nativeLoadAudio(path: String): Boolean
     external fun nativeLoadKmp(path: String): Boolean
     external fun nativeImportKmpToLibrary(path: String): IntArray

@@ -91,6 +91,15 @@ public:
     // PORTA BALANCE of the SILVETON keyboard processor (3..40, default 11):
     // how its Korg glide model turns TIME into a glide for each interval.
     void setPortamentoBalance(float balance) noexcept;
+    // SILVETON_TERCA_V1: TERCA of the SILVETON processor. upperMask = the Uppers
+    // with their T key on (bit 0 = Upper 1), 0 = off. cell 0..5 = MajorUp,
+    // MajorDown, MinorUp, MinorDown, PhrygianUp, HijazUp (the SCAN result);
+    // root 0..11 = tonic. Those Uppers play the diatonic third of every key.
+    void setTerca(int upperMask, int root, int cell) noexcept;
+    // SILVETON_SCALE_V1: the Uppers with their Q key on use the GLOBAL scale cents.
+    void setScaleUppers(int upperMask) noexcept;
+    // Third of `key` for a tonality (exactly the processor's rule), -1 = none.
+    [[nodiscard]] static int tercaHarmony(int root, int cell, int key) noexcept;
     [[nodiscard]] float portamentoBalance() const noexcept;
 
     // Control thread publishes a fully prepared immutable graph. The audio thread

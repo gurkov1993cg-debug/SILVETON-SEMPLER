@@ -217,7 +217,7 @@ struct UpperPart {
     std::int8_t transposeSemitones{0};
     float tuneCents{0.0F};
     std::int8_t octave{0};
-    std::int8_t pitchBendRange{2};
+    std::int8_t pitchBendRange{1};   // SILVETON_TUNE_RANGES_V1: default 1 semitone
     bool damperEnabled{true};
     bool expressionEnabled{true};
     bool breathEnabled{false};

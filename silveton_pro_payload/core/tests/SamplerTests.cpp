@@ -1689,6 +1689,49 @@ void testPortamentoFromLastNoteMono() {
     }
 }
 
+// SILVETON_OCTAVE_KEY_V1: OCTAVE +1 plays the sample recorded for the key an
+// octave up (its own sound), not the pressed key's sample stretched an octave.
+void testOctaveChoosesRecordedSample() {
+    auto st=makeToneState(UpperVoiceMode::Poly);
+    auto prog=std::const_pointer_cast<Program>(st->combi.uppers[0].program);
+    auto ms=std::const_pointer_cast<Multisample>(prog->layers[0].multisample);
+    SampleZone hi=ms->zones[0]; hi.sample=makeLoopedSine(1000.0,72U); hi.rootKey=72U; hi.keyLow=72U; hi.keyHigh=127U;
+    ms->zones[0].keyHigh=71U; ms->zones.push_back(hi);
+    st->combi.uppers[0].octave=1;
+    SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
+    e.postNoteOn(0U,60U,100U);
+    auto x=renderLeft(e,120);
+    assert(std::abs(measureHz(x,x.size()-9600,x.size(),96000.0)-1000.0)<2.0);
+}
+
+// SILVETON_TERCA_V1: the TERCA Upper plays the diatonic third (processor rule)
+// and lets it go with the key; switching TERCA off leaves nothing hanging.
+void testTercaOnAnyUpper() {
+    assert(SamplerEngine::tercaHarmony(0,0,60)==64);   // C major up: C -> E
+    assert(SamplerEngine::tercaHarmony(0,0,69)==72);   // A -> C
+    assert(SamplerEngine::tercaHarmony(0,1,64)==60);   // C major down: E -> C
+    assert(SamplerEngine::tercaHarmony(2,5,63)==67);   // D hijaz up: Eb -> G (minor third)
+    auto st=makeToneState(UpperVoiceMode::Poly);
+    SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
+    e.setTerca(1,0,0);   // T key on Upper 1
+    e.postNoteOn(0U,69U,100U);
+    auto x=renderLeft(e,150);
+    assert(std::abs(measureHz(x,x.size()-9600,x.size(),96000.0)-523.25)<1.5);
+    e.postNoteOff(0U,69U,0U); renderLeft(e,400);
+    assert(e.activeVoiceCount()==0U);
+    e.postNoteOn(0U,69U,100U); renderLeft(e,50);
+    e.setTerca(0,0,0); e.postNoteOff(0U,69U,0U); renderLeft(e,400);
+    assert(e.activeVoiceCount()==0U);
+    // SILVETON_SCALE_V1: the scale cents reach only Uppers with Q on.
+    auto q=std::make_shared<EngineState>(*st); q->global.scaleOffsetsCents[9]=-50.0F;   // A a quarter tone down
+    e.setState(q);
+    e.postNoteOn(0U,69U,100U); auto a=renderLeft(e,150);
+    assert(std::abs(measureHz(a,a.size()-9600,a.size(),96000.0)-440.0)<1.0);              // Q off: 440
+    e.setScaleUppers(1); auto b=renderLeft(e,150);                                        // Q on: live
+    assert(std::abs(measureHz(b,b.size()-9600,b.size(),96000.0)-440.0*std::pow(2.0,-0.5/12.0))<1.0);
+    e.postNoteOff(0U,69U,0U); renderLeft(e,300);
+}
+
 // Another Sound on the Upper: the first note does not glide.
 void testPortamentoNewSoundStartsFresh() {
     auto st=makeToneState(UpperVoiceMode::Mono);
@@ -1859,7 +1902,8 @@ void testLiveEditsOnHeldNote() {
     assert(tail(renderLeft(e,200))<1.0e-4F);                              // SOLO of another Upper
     auto tune=std::make_shared<EngineState>(*st); tune->combi.uppers[0].transposeSemitones=2; tune->combi.uppers[0].tuneCents=50.0F; e.setState(tune);
     auto t=renderLeft(e,200);
-    assert(std::abs(measureHz(t,t.size()-9600,t.size(),96000.0)-440.0*std::pow(2.0,2.5/12.0))<0.5);
+    // SILVETON_OCTAVE_KEY_V1: TRANSPOSE/OCTAVE move the key from the next press; fine tune is live.
+    assert(std::abs(measureHz(t,t.size()-9600,t.size(),96000.0)-440.0*std::pow(2.0,0.5/12.0))<0.5);
     auto pan=std::make_shared<EngineState>(*st); pan->combi.uppers[0].pan=-1.0F; e.setState(pan);
     std::vector<float> out(192); float right=0.0F;
     for(int b=0;b<200;++b){ e.render(out.data(),96U); if(b>150) for(int i=0;i<96;++i) right=std::max(right,std::abs(out[static_cast<std::size_t>(i*2+1)])); }
@@ -2008,7 +2052,7 @@ int main() {
     testPortamentoSameTimeEveryInterval();
     testPortamentoPolyFromLastNote();
     testPortamentoFromLastNoteMono();
-    testPortamentoNewSoundStartsFresh();
+    testOctaveChoosesRecordedSample(); testTercaOnAnyUpper(); testPortamentoNewSoundStartsFresh();
     testPortamentoAutoMonoReleaseTail();
     testPortamentoBalance();
     testPortamentoTimeLimit();

@@ -1730,6 +1730,47 @@ void testTercaOnAnyUpper() {
     e.setScaleUppers(1); auto b=renderLeft(e,150);                                        // Q on: live
     assert(std::abs(measureHz(b,b.size()-9600,b.size(),96000.0)-440.0*std::pow(2.0,-0.5/12.0))<1.0);
     e.postNoteOff(0U,69U,0U); renderLeft(e,300);
+    // SILVETON_TQ_TRANSPOSE_V1: with TRANSPOSE the scale stays on the PLAYED key.
+    auto t=std::make_shared<EngineState>(*q); t->global.transposeSemitones=-6;
+    e.setState(t);
+    e.postNoteOn(0U,69U,100U); auto c=renderLeft(e,150);                                   // played A, sounds D#
+    assert(std::abs(measureHz(c,c.size()-9600,c.size(),96000.0)-440.0*std::pow(2.0,(-6.0-0.5)/12.0))<1.0);
+    e.postNoteOff(0U,69U,0U); renderLeft(e,300);
+    e.postNoteOn(0U,75U,100U); auto d=renderLeft(e,150);                                   // played D#, sounds A: no Q
+    assert(std::abs(measureHz(d,d.size()-9600,d.size(),96000.0)-440.0)<1.0);
+    e.postNoteOff(0U,75U,0U); renderLeft(e,300);
+    // TERCA with TRANSPOSE: the third of the played key, then transposed.
+    e.setScaleUppers(0); e.setTerca(1,0,0);
+    e.postNoteOn(0U,69U,100U); auto h=renderLeft(e,150);                                   // A -> C, -6 = F#
+    assert(std::abs(measureHz(h,h.size()-9600,h.size(),96000.0)-523.25*std::pow(2.0,-6.0/12.0))<1.5);
+    e.postNoteOff(0U,69U,0U); renderLeft(e,400);
+    // A key held while T is switched ON does not hang.
+    e.setTerca(0,0,0); renderLeft(e,10);
+    e.postNoteOn(0U,69U,100U); renderLeft(e,50);
+    e.setTerca(1,0,0); renderLeft(e,10);
+    e.postNoteOff(0U,69U,0U); renderLeft(e,400);
+    assert(e.activeVoiceCount()==0U);
+}
+
+// SILVETON_FX_TAIL_V1: calling up another BLEND lets the old reverb ring out.
+void testFxTailOnBlendChange() {
+    auto st=makeToneState(UpperVoiceMode::Poly);
+    st->combi.fx1.type=EffectType::Reverb; st->combi.fx1.wet=0.8F; st->combi.fx1.feedback=0.8F;
+    st->combi.uppers[0].fxSend1=1.0F;
+    SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
+    e.postNoteOn(0U,69U,100U); renderLeft(e,200); e.postNoteOff(0U,69U,0U); renderLeft(e,30);
+    auto next=std::make_shared<EngineState>(*st);
+    next->combi.fx1.type=EffectType::Off; next->combiGeneration=st->combiGeneration+1U;
+    e.setState(next);
+    auto x=renderLeft(e,300);
+    assert(peakOf(x,x.size()/2U,x.size())>1.0e-4);      // the old reverb still rings
+    auto live=std::make_shared<EngineState>(*st);       // a live edit (same generation) changes at once
+    live->combi.fx1.type=EffectType::Off;
+    SamplerEngine f; f.prepare(96000.0,96U); f.setState(st);
+    f.postNoteOn(0U,69U,100U); renderLeft(f,200); f.postNoteOff(0U,69U,0U); renderLeft(f,30);
+    f.setState(live);
+    auto y=renderLeft(f,300);
+    assert(peakOf(y,y.size()/2U,y.size())<peakOf(x,x.size()/2U,x.size()));
 }
 
 // Another Sound on the Upper: the first note does not glide.
@@ -2052,7 +2093,7 @@ int main() {
     testPortamentoSameTimeEveryInterval();
     testPortamentoPolyFromLastNote();
     testPortamentoFromLastNoteMono();
-    testOctaveChoosesRecordedSample(); testTercaOnAnyUpper(); testPortamentoNewSoundStartsFresh();
+    testOctaveChoosesRecordedSample(); testTercaOnAnyUpper(); testFxTailOnBlendChange(); testPortamentoNewSoundStartsFresh();
     testPortamentoAutoMonoReleaseTail();
     testPortamentoBalance();
     testPortamentoTimeLimit();

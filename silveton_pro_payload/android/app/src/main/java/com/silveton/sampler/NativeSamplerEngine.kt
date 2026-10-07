@@ -38,6 +38,7 @@ class NativeSamplerEngine {
     external fun nativeLoadSet(path: String): Boolean
     external fun nativeSaveUserPerformanceState(path: String): Boolean
     external fun nativeLoadUserPerformanceState(path: String): Boolean
+    external fun nativeReplaceUserPerformanceState(path: String): Boolean
     external fun nativeSaveSet(path: String): Boolean
     external fun nativeSaveBank(path: String, bank: Int): Boolean
     external fun nativeLoadBank(path: String, targetBank: Int, overwrite: Boolean): Boolean

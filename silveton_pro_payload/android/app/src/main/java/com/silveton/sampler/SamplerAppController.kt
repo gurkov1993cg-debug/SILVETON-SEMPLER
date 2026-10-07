@@ -131,16 +131,44 @@ class SamplerAppController(
     private var tercaRoot: Int = portaPrefs.getInt("terca_root", -1).toInt()
     private var tercaCell: Int = portaPrefs.getInt("terca_cell", -1).toInt()
     private var scaleMask: Int = portaPrefs.getInt("scale_mask", 0).toInt() and 0xFFF
+    // SILVETON_TQ_LIST_V1: one T and one Q key on LIST switch TERCA / SCALE on and off
+    // for the Uppers chosen with T / Q in COMBI (the choice itself is kept).
+    private var tercaMaster: Boolean = portaPrefs.getBoolean("terca_master", true)
+    private var scaleMaster: Boolean = portaPrefs.getBoolean("scale_master", true)
     private var lastTercaSerial = -1
     private var lastScaleSerial = -1
 
     fun tercaState() = TercaState(tercaRoot, tercaCell)
-    fun tercaOn(upper: Int): Boolean = (tercaUppers shr upper) and 1 != 0
-    fun quarterOn(upper: Int): Boolean = (scaleUppers shr upper) and 1 != 0
+    /** COMBI T key lit: this Upper is chosen for TERCA and TERCA is on. */
+    fun tercaOn(upper: Int): Boolean = tercaMaster && (tercaUppers shr upper) and 1 != 0
+    fun quarterOn(upper: Int): Boolean = scaleMaster && (scaleUppers shr upper) and 1 != 0
+    /** Chosen in COMBI but switched off on LIST (shown dim). */
+    fun tercaChosen(upper: Int): Boolean = (tercaUppers shr upper) and 1 != 0
+    fun quarterChosen(upper: Int): Boolean = (scaleUppers shr upper) and 1 != 0
     fun quarterNotes(): Int = scaleMask
+    fun tercaMasterOn(): Boolean = tercaMaster && tercaUppers != 0
+    fun scaleMasterOn(): Boolean = scaleMaster && scaleUppers != 0
+    fun hasTercaUppers(): Boolean = tercaUppers != 0
+    fun hasScaleUppers(): Boolean = scaleUppers != 0
 
-    fun toggleTerca(upper: Int) { tercaUppers = tercaUppers xor (1 shl upper); saveTercaScale(); applyTerca() }
-    fun toggleQuarter(upper: Int) { scaleUppers = scaleUppers xor (1 shl upper); saveTercaScale(); engine.nativeSetScaleUppers(scaleUppers) }
+    /** COMBI T key: choose / un-choose the Upper. A chosen Upper while TERCA is off on LIST = TERCA on again. */
+    fun toggleTerca(upper: Int) {
+        val chosen = (tercaUppers shr upper) and 1 != 0
+        if (chosen && !tercaMaster) tercaMaster = true
+        else { tercaUppers = tercaUppers xor (1 shl upper); if (!chosen) tercaMaster = true }
+        saveTercaScale(); applyTerca()
+    }
+    fun toggleQuarter(upper: Int) {
+        val chosen = (scaleUppers shr upper) and 1 != 0
+        if (chosen && !scaleMaster) scaleMaster = true
+        else { scaleUppers = scaleUppers xor (1 shl upper); if (!chosen) scaleMaster = true }
+        saveTercaScale(); applyScaleUppers()
+    }
+    /** LIST T key. */
+    fun toggleTercaMaster() { tercaMaster = !tercaMaster; saveTercaScale(); applyTerca() }
+    /** LIST Q key. */
+    fun toggleScaleMaster() { scaleMaster = !scaleMaster; saveTercaScale(); applyScaleUppers() }
+    private fun applyScaleUppers() = engine.nativeSetScaleUppers(if (scaleMaster) scaleUppers else 0)
 
     /** 0 = no scan, 1 = TERCA scan running, 2 = Q scan running. Also picks up finished scans. */
     fun pollScan(): Int {
@@ -165,19 +193,20 @@ class SamplerAppController(
 
     private fun saveTercaScale() {
         portaPrefs.edit().putInt("terca_uppers", tercaUppers).putInt("scale_uppers", scaleUppers)
-            .putInt("terca_root", tercaRoot).putInt("terca_cell", tercaCell).putInt("scale_mask", scaleMask).apply()
+            .putInt("terca_root", tercaRoot).putInt("terca_cell", tercaCell).putInt("scale_mask", scaleMask)
+            .putBoolean("terca_master", tercaMaster).putBoolean("scale_master", scaleMaster).apply()
     }
 
     private fun applyTerca() {
         val valid = tercaRoot in 0..11 && tercaCell in 0..5
-        engine.nativeSetTerca(if (valid) tercaUppers else 0, tercaRoot.coerceAtLeast(0), tercaCell.coerceAtLeast(0))
+        engine.nativeSetTerca(if (valid && tercaMaster) tercaUppers else 0, tercaRoot.coerceAtLeast(0), tercaCell.coerceAtLeast(0))
     }
 
     /** Q = quarter tone down (-50 cents) on the notes taken by SCAN. */
     fun scaleCents(): FloatArray = FloatArray(12) { pc -> if ((scaleMask and (1 shl pc)) != 0) -50f else 0f }
 
     private fun applyScale() {
-        engine.nativeSetScaleUppers(scaleUppers)
+        applyScaleUppers()
         val adv = globalAdvanced() ?: return
         // Offsets are given per real note (scaleRoot 0).
         updateGlobalAdvanced(adv.copy(scaleRoot = 0, scaleCents = scaleCents()))
@@ -218,7 +247,7 @@ class SamplerAppController(
         if (closed.get()) return false
         engine.nativeSetPortaBalance(portaBalanceValue)
         applyTerca()
-        engine.nativeSetScaleUppers(scaleUppers)
+        applyScaleUppers()
         if (started.get()) return true
         midi.start()
         val audioOk = runtime.start()
@@ -402,6 +431,62 @@ class SamplerAppController(
             if (!tmp.renameTo(dst)) { tmp.copyTo(dst, overwrite = true); tmp.delete() }
         } catch (_: Exception) {
         }
+    }
+
+    // SILVETON_SET_SAVE_AS_V1: SAVE AS / LOAD of the whole set: every LIST position with
+    // its BLEND, all COMBI settings, GLOBAL settings and the T / Q choice.
+    // Files: /storage/emulated/0/SILVETON/SETS/<name>.SVSET (+ <name>.TQ).
+    private val setsDir: File get() = File(backupDir, "SETS")
+
+    private fun setFileName(name: String): String =
+        name.trim().replace(Regex("[^A-Za-z0-9 _\\-\\u0400-\\u04FF]"), "_").take(40).trim().ifBlank { "SET" }
+
+    fun savedSets(): List<String> = try {
+        (setsDir.listFiles { f -> f.isFile && f.name.endsWith(".SVSET") } ?: emptyArray())
+            .sortedByDescending { it.lastModified() }.map { it.name.removeSuffix(".SVSET") }
+    } catch (_: Exception) { emptyList() }
+
+    fun setExists(name: String): Boolean = File(setsDir, setFileName(name) + ".SVSET").isFile
+
+    /** Returns null when saved, else a short reason. */
+    fun saveSetAs(name: String): String? {
+        if (!saveUserState()) return engine.nativeLastTextError().ifBlank { "Записът не успя" }
+        return try {
+            if (!setsDir.isDirectory && !setsDir.mkdirs()) return "Няма достъп до папка SILVETON/SETS"
+            val base = setFileName(name)
+            userStateFile.copyTo(File(setsDir, "$base.SVSET"), overwrite = true)
+            File(setsDir, "$base.TQ").writeText(
+                "terca_uppers=$tercaUppers\nscale_uppers=$scaleUppers\nterca_root=$tercaRoot\nterca_cell=$tercaCell\n" +
+                "scale_mask=$scaleMask\nterca_master=$tercaMaster\nscale_master=$scaleMaster\n")
+            null
+        } catch (e: Exception) { e.message ?: "Записът не успя" }
+    }
+
+    /** Returns null when loaded, else a short reason. The current LIST / BLENDS are replaced. */
+    fun loadSavedSet(name: String): String? {
+        val file = File(setsDir, setFileName(name) + ".SVSET")
+        if (!file.isFile) return "Файлът го няма"
+        if (!nativeResult(engine.nativeReplaceUserPerformanceState(file.absolutePath)))
+            return engine.nativeLastTextError().ifBlank { "Зареждането не успя" }
+        try {
+            val tq = File(setsDir, setFileName(name) + ".TQ")
+            if (tq.isFile) {
+                val m = tq.readLines().mapNotNull { l -> l.split('=', limit = 2).takeIf { it.size == 2 }?.let { it[0] to it[1] } }.toMap()
+                m["terca_uppers"]?.toIntOrNull()?.let { tercaUppers = it and 0x7F }
+                m["scale_uppers"]?.toIntOrNull()?.let { scaleUppers = it and 0x7F }
+                m["terca_root"]?.toIntOrNull()?.let { tercaRoot = it }
+                m["terca_cell"]?.toIntOrNull()?.let { tercaCell = it }
+                m["scale_mask"]?.toIntOrNull()?.let { scaleMask = it and 0xFFF }
+                m["terca_master"]?.let { tercaMaster = it == "true" }
+                m["scale_master"]?.let { scaleMaster = it == "true" }
+                saveTercaScale()
+            }
+        } catch (_: Exception) {
+        }
+        applyScale()
+        applyTerca()
+        saveUserState()
+        return null
     }
 
     // A fresh install (no LIST/BLENDS of its own) takes the copy back automatically.

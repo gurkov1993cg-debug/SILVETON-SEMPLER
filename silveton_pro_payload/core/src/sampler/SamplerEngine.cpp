@@ -800,6 +800,20 @@ struct SamplerEngine::Impl {
     std::array<DelayFx, 2U> delay{};
     std::array<ChorusFx, 2U> chorus{};
     std::array<ReverbFx, 2U> reverb{};
+    // SILVETON_FX_TAIL_V1: a second effect engine per slot. When another BLEND is
+    // called up, the old effect keeps ringing out (reverb tail, delay repeats) on
+    // one engine while the new effect starts on the other - no cut, no restart.
+    std::array<DelayFx, 2U> delayB{};
+    std::array<ChorusFx, 2U> chorusB{};
+    std::array<ReverbFx, 2U> reverbB{};
+    std::array<std::uint8_t, 2U> fxInst{};        // engine the slot plays now (0 = A, 1 = B)
+    std::array<EffectSlot, 2U> fxRunning{};       // settings of the last block
+    bool fxRunningValid{false};
+    std::uint32_t fxGeneration{0U};
+    std::array<EffectSlot, 2U> tailCfg{};
+    std::array<std::uint8_t, 2U> tailInst{};
+    std::array<std::uint32_t, 2U> tailLeft{};     // frames the tail may still ring (0 = no tail)
+    std::array<std::uint32_t, 2U> tailQuiet{};    // frames the tail has been silent
 
     // Read-ahead windows for SampleStreamPrefetcher (one seqlock per slot).
     struct WindowSlot {
@@ -845,6 +859,8 @@ struct SamplerEngine::Impl {
         for (auto& q : upperMidEq) q.reset();
         for (auto& q : upperHighEq) q.reset();
         for (std::size_t k = 0; k < 2U; ++k) { delay[k].reset(sr); chorus[k].reset(sr); reverb[k].reset(sr); }
+        for (std::size_t k = 0; k < 2U; ++k) { delayB[k].reset(sr); chorusB[k].reset(sr); reverbB[k].reset(sr); }
+        fxInst.fill(0U); tailLeft.fill(0U); tailQuiet.fill(0U); fxRunningValid = false; fxGeneration = 0U;
         clearWindows();
     }
 };
@@ -1020,7 +1036,9 @@ double noteRatio(const SamplerEngine::Impl& impl, const UpperPart& upper, const 
     const int semitones = keyTracking +
                           static_cast<int>(zone.transposeSemitones) + static_cast<int>(layer.transposeSemitones);
     const int root = static_cast<int>(global.scaleRoot % 12U);
-    const int pc = (static_cast<int>(pk) - root + 120) % 12;
+    // SILVETON_TQ_TRANSPOSE_V1: the scale follows the PLAYED key, so TRANSPOSE /
+    // OCTAVE / TUNE never move it (same keys as SCAN saw).
+    const int pc = (static_cast<int>(key) - root + 120) % 12;
     // SILVETON_SCALE_V1: only Uppers with their Q key on follow the scale.
     const bool scaleOn = ((impl.scaleUppers.load(std::memory_order_relaxed) >> ui) & 1) != 0;
     const float scaleCents = scaleOn ? std::clamp(global.scaleOffsetsCents[static_cast<std::size_t>(pc)], -100.0F, 100.0F) : 0.0F;
@@ -1042,9 +1060,8 @@ constexpr double kLiveMixSmoothSec = 0.005;
 double liveTuneSemis(const UpperPart& upper, const GlobalState& global, std::uint8_t key, bool scaleOn) noexcept {
     // OCTAVE / TRANSPOSE are part of the key (SILVETON_OCTAVE_KEY_V1): they take
     // effect on the next key press; fine tune, MASTER TUNE and SCALE stay live.
-    const std::uint8_t pk = playKeyFor(upper, global, key);
     const int root = static_cast<int>(global.scaleRoot % 12U);
-    const int pc = (static_cast<int>(pk) - root + 120) % 12;
+    const int pc = (static_cast<int>(key) - root + 120) % 12;   // SILVETON_TQ_TRANSPOSE_V1: played key
     const float scaleCents = scaleOn ? std::clamp(global.scaleOffsetsCents[static_cast<std::size_t>(pc)], -100.0F, 100.0F) : 0.0F;
     const double tuneHz = std::clamp(static_cast<double>(global.masterTuneHz), 400.0, 480.0);
     return static_cast<double>(upper.tuneCents + scaleCents) / 100.0 +
@@ -1549,8 +1566,12 @@ void syncTerca(SamplerEngine::Impl& impl) noexcept {
     // TERCA changed (on/off, other Upper or tonality): the old TERCA Upper lets
     // its thirds go, so no third can hang.
     const int oldMask = impl.tercaApplied >= 0 ? (impl.tercaApplied & 0x7F) : 0;
+    const int newMask = cfg >= 0 ? (cfg & 0x7F) : 0;
+    // SILVETON_TQ_TRANSPOSE_V1: also the Upper that just became T (its held keys
+    // would otherwise never get their note-off).
+    const int touched = oldMask | newMask;
     for (int ui = 0; ui < kUpperCount; ++ui) {
-        if (((oldMask >> ui) & 1) == 0) continue;
+        if (((touched >> ui) & 1) == 0) continue;
         for (auto& v : impl.voices) {
             if (v.active && v.upperIndex == ui) releaseOne(impl, v, false);
         }
@@ -1819,6 +1840,33 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
     const double glideRound = 1.0 - std::exp(-1.0 / (std::max(0.0005, 0.0005 * static_cast<double>(
         impl_->portaBalance.load(std::memory_order_relaxed))) * impl_->sampleRate));
 
+    // SILVETON_FX_TAIL_V1: another BLEND was called up -> an effect that changes keeps
+    // ringing out on its own engine; the new effect starts on the other one.
+    const auto tailFadeFrames = static_cast<std::uint32_t>(0.25 * impl_->sampleRate);
+    const auto tailQuietFrames = static_cast<std::uint32_t>(0.30 * impl_->sampleRate);
+    {
+        const EffectSlot* nowFx[2] = {&current->combi.fx1, &current->combi.fx2};
+        if (impl_->fxRunningValid && current->combiGeneration != impl_->fxGeneration) {
+            for (std::size_t slot = 0; slot < 2U; ++slot) {
+                const EffectSlot& was = impl_->fxRunning[slot];
+                const EffectSlot& now = *nowFx[slot];
+                const bool same = was.type == now.type && was.wet == now.wet && was.timeMs == now.timeMs &&
+                                  was.feedback == now.feedback && was.rateHz == now.rateHz &&
+                                  was.depth == now.depth && was.tone == now.tone;
+                if (same || was.type == EffectType::Off || was.wet <= 0.0F) continue;
+                impl_->tailCfg[slot] = was;
+                impl_->tailInst[slot] = impl_->fxInst[slot];
+                impl_->tailLeft[slot] = static_cast<std::uint32_t>(20.0 * impl_->sampleRate);
+                impl_->tailQuiet[slot] = 0U;
+                impl_->fxInst[slot] = static_cast<std::uint8_t>(impl_->fxInst[slot] ^ 1U);
+            }
+        }
+        impl_->fxGeneration = current->combiGeneration;
+        impl_->fxRunning[0] = current->combi.fx1;
+        impl_->fxRunning[1] = current->combi.fx2;
+        impl_->fxRunningValid = true;
+    }
+
     // SILVETON_RENDER_SPEED_V1: every voice renders its whole chunk at once and
     // everything that cannot change inside a block (controllers, pitch bend,
     // LFO scaling, filter base, pan, level) is computed once per voice per chunk
@@ -2062,13 +2110,16 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
         }
 
         float fx1L = 0.0F, fx1R = 0.0F, fx2L = 0.0F, fx2R = 0.0F;
-        const auto processFx = [&](std::size_t slot, const EffectSlot& fx, float inL, float inR, float& wetL, float& wetR) noexcept {
+        const auto runFx = [&](std::size_t slot, std::uint8_t inst, const EffectSlot& fx, float inL, float inR, float& wetL, float& wetR) noexcept {
             switch (fx.type) {
                 case EffectType::Off: wetL = wetR = 0.0F; break;
-                case EffectType::Delay: impl_->delay[slot].process(inL, inR, fx, wetL, wetR); break;
-                case EffectType::Chorus: impl_->chorus[slot].process(inL, inR, fx, wetL, wetR); break;
-                case EffectType::Reverb: impl_->reverb[slot].process(inL, inR, fx, wetL, wetR); break;
+                case EffectType::Delay: (inst == 0U ? impl_->delay[slot] : impl_->delayB[slot]).process(inL, inR, fx, wetL, wetR); break;
+                case EffectType::Chorus: (inst == 0U ? impl_->chorus[slot] : impl_->chorusB[slot]).process(inL, inR, fx, wetL, wetR); break;
+                case EffectType::Reverb: (inst == 0U ? impl_->reverb[slot] : impl_->reverbB[slot]).process(inL, inR, fx, wetL, wetR); break;
             }
+        };
+        const auto processFx = [&](std::size_t slot, const EffectSlot& fx, float inL, float inR, float& wetL, float& wetR) noexcept {
+            runFx(slot, impl_->fxInst[slot], fx, inL, inR, wetL, wetR);
         };
         processFx(0U, current->combi.fx1, send1L, send1R, fx1L, fx1R);
         if (current->combi.fxRouting == EffectRouting::Fx1IntoFx2) {
@@ -2079,6 +2130,20 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
         }
         float l = dryL + fx1L * clamp01(current->combi.fx1.wet) + fx2L * clamp01(current->combi.fx2.wet);
         float r = dryR + fx1R * clamp01(current->combi.fx1.wet) + fx2R * clamp01(current->combi.fx2.wet);
+        // SILVETON_FX_TAIL_V1: the effect of the previous BLEND rings out by itself.
+        for (std::size_t slot = 0; slot < 2U; ++slot) {
+            if (impl_->tailLeft[slot] == 0U) continue;
+            float tl = 0.0F, tr = 0.0F;
+            runFx(slot, impl_->tailInst[slot], impl_->tailCfg[slot], 0.0F, 0.0F, tl, tr);
+            const float w = clamp01(impl_->tailCfg[slot].wet);
+            float fade = 1.0F;
+            if (impl_->tailLeft[slot] < tailFadeFrames) fade = static_cast<float>(impl_->tailLeft[slot]) / static_cast<float>(tailFadeFrames);
+            l += tl * w * fade;
+            r += tr * w * fade;
+            if (std::abs(tl) + std::abs(tr) < 2.0e-5F) ++impl_->tailQuiet[slot]; else impl_->tailQuiet[slot] = 0U;
+            --impl_->tailLeft[slot];
+            if (impl_->tailQuiet[slot] > tailQuietFrames) impl_->tailLeft[slot] = 0U;
+        }
 
         if (current->global.eqLowDb != 0.0F) impl_->lowEq.process(l, r);
         if (current->global.eqMidDb != 0.0F) impl_->midEq.process(l, r);

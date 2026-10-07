@@ -576,6 +576,24 @@ public:
         return true;
     }
 
+    // SILVETON_SET_SAVE_AS_V1: LOAD of a saved set. The LIST and all BLENDS are
+    // replaced by the ones in the file (nothing old is mixed in), and the GLOBAL
+    // settings saved with the set come back too. The sound bank is not touched.
+    bool replaceUserPerformanceState(const std::string& path) {
+        const auto check = SetPackage::load(path);
+        if (!check.ok()) { setTextError(check.error); return false; }
+        const auto before = library_.snapshot();
+        for (const auto& c : before.combis) library_.clearCombi(c.address);
+        for (const auto& l : before.lists) library_.clearList(l.address);
+        if (!loadUserPerformanceState(path)) return false;
+        auto next = std::make_shared<EngineState>(state_ != nullptr ? *state_ : EngineState{});
+        next->global = check.data.global;
+        library_.setGlobal(next->global);
+        if (!installState(std::move(next))) return false;
+        setTextError({});
+        return true;
+    }
+
     bool saveBank(const std::string& path, int bank) {
         if (bank < 0 || bank > 65535) { setTextError("Bank number is out of range"); return false; }
         syncCurrentStateToLibrary();
@@ -1322,6 +1340,8 @@ public:
         auto next = std::make_shared<EngineState>();
         next->global = state_ != nullptr ? state_->global : library_.global();
         next->combi = *combi;
+        // SILVETON_FX_TAIL_V1: a new BLEND -> the old effect rings out, no cut.
+        next->combiGeneration = (state_ != nullptr ? state_->combiGeneration : 0U) + 1U;
         for (auto& upper : next->combi.uppers) {
             if (upper.soundSlotId == kNoSoundSlot) continue;
             if (upper.soundSlotId > kFixedSoundSlotCount) {
@@ -2662,6 +2682,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEng
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeLoadSet(JNIEnv* env,jobject,jstring path){return sampler().loadSet(jstringToUtf8(env,path))?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeSaveUserPerformanceState(JNIEnv* env,jobject,jstring path){return sampler().saveUserPerformanceState(jstringToUtf8(env,path))?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeLoadUserPerformanceState(JNIEnv* env,jobject,jstring path){return sampler().loadUserPerformanceState(jstringToUtf8(env,path))?JNI_TRUE:JNI_FALSE;}
+extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeReplaceUserPerformanceState(JNIEnv* env,jobject,jstring path){return sampler().replaceUserPerformanceState(jstringToUtf8(env,path))?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeSaveBank(JNIEnv* env,jobject,jstring path,jint bank){return sampler().saveBank(jstringToUtf8(env,path),bank)?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeLoadBank(JNIEnv* env,jobject,jstring path,jint targetBank,jboolean overwrite){return sampler().loadBank(jstringToUtf8(env,path),targetBank,overwrite==JNI_TRUE)?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeWriteSample(JNIEnv* env,jobject,jint id,jint upper,jint layer,jint zone,jstring name){return sampler().writeCurrentSample(static_cast<std::uint32_t>(std::max(0,id)),upper,layer,zone,jstringToUtf8(env,name))?JNI_TRUE:JNI_FALSE;}

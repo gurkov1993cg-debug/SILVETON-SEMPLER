@@ -80,6 +80,8 @@ class SilvetonSamplerView(
     private var warning: String? = null
     private var listPage = 0
     private var listFollowedActive = -2
+    // SILVETON_LIST_GRID_V1: LIST position chosen for STORE / EDIT (-1 = none).
+    private var listSelected = -1
 
     private data class SmoothRangeHit(
         val rect: RectF,
@@ -432,7 +434,7 @@ class SilvetonSamplerView(
             if (!dragMoved) return@hit
             val d = (x - downX) - (y - downY)
             val moved = if (abs(d) <= touchSlop) 0f else d - Math.signum(d) * touchSlop
-            val nv = quantizeControl(start + moved / travel * (maxV - minV), minV, maxV, step)
+            val nv = quantizeControl(start + moved / (travel * DRAG_SLOW) * (maxV - minV), minV, maxV, step)
             if (nv != last) {
                 last = nv
                 onChange(nv)
@@ -450,7 +452,7 @@ class SilvetonSamplerView(
             if (!dragMoved) return@hit
             val d = downY - y
             val moved = if (abs(d) <= touchSlop) 0f else d - Math.signum(d) * touchSlop
-            val nv = quantizeControl(faderDb((startT + moved / travel).coerceIn(0f, 1f)), -60f, 12f, 0.1f)
+            val nv = quantizeControl(faderDb((startT + moved / (travel * DRAG_SLOW)).coerceIn(0f, 1f)), -60f, 12f, 0.1f)
             if (nv != last) {
                 last = nv
                 onChange(nv)
@@ -632,7 +634,7 @@ class SilvetonSamplerView(
         text(c, line2, big.left + 18f, big.top + 60f, 32f, C_LCD, face = faceMono, maxWidth = big.width() - 36f)
 
         // Status LCD.
-        val st = RectF(684f, 14f, 1014f, 96f)
+        val st = RectF(684f, 14f, 1206f, 96f)
         lcd(c, st)
         val colW = (st.width() - 32f) / 3f
         fun cell(col: Int, row: Int, label: String, value: String, valueColor: Int) {
@@ -658,15 +660,8 @@ class SilvetonSamplerView(
                 restore = { sampler.setPortaBalance(old); invalidate() }) { sampler.setPortaBalance(round(it).toInt()); invalidate() }
         })
 
-        val blendsR = RectF(1026f, 14f, 1206f, 50f)
-        lightKey(c, blendsR, "BLENDS")
-        hit(blendsR, { _, _ -> showBlendPicker() })
-        val writeR = RectF(1026f, 60f, 1112f, 96f)
-        lightKey(c, writeR, "WRITE")
-        hit(writeR, { _, _ -> openWrite(WriteTarget.LIST, append = false) })
-        val addR = RectF(1120f, 60f, 1206f, 96f)
-        lightKey(c, addR, "+ LIST")
-        hit(addR, { _, _ -> openWrite(WriteTarget.LIST, append = true) })
+        // SILVETON_LIST_GRID_V1: BLENDS / WRITE / + LIST are gone - a COMBI is stored
+        // from the LIST page (STORE), and changed with EDIT.
 
         val panic = RectF(1218f, 14f, 1326f, 96f)
         val down = isDown(panic)
@@ -788,8 +783,9 @@ class SilvetonSamplerView(
         val tqW = 40f
         val tR = RectF(L + 8f, T + 316f, L + 8f + tqW, T + 354f)
         val qR = RectF(tR.right + 4f, T + 316f, tR.right + 4f + tqW, T + 354f)
-        stripToggle(c, tR, "T", sampler.tercaOn(i), C_AMBER, size = 18f)
-        stripToggle(c, qR, "Q", sampler.quarterOn(i), C_AMBER, size = 18f)
+        // SILVETON_TQ_LIST_V1: lit = on; dim = chosen here but switched off on LIST.
+        stripToggle(c, tR, "T", sampler.tercaOn(i) || sampler.tercaChosen(i), if (sampler.tercaOn(i)) C_AMBER else C_LCD_DIM, size = 18f)
+        stripToggle(c, qR, "Q", sampler.quarterOn(i) || sampler.quarterChosen(i), if (sampler.quarterOn(i)) C_AMBER else C_LCD_DIM, size = 18f)
         hit(tR, { _, _ -> sampler.toggleTerca(i); invalidate() })
         hit(qR, { _, _ -> sampler.toggleQuarter(i); invalidate() })
         val rangeR = RectF(qR.right + 4f, T + 316f, r.right - 8f, T + 354f)
@@ -1122,6 +1118,10 @@ class SilvetonSamplerView(
 
     // ------------------------------------------------------------------ LIST
 
+    // SILVETON_LIST_GRID_V1: the LIST like the BLENDS picker - pages of 20 (4 x 5).
+    // Tap a BLEND = play it. Tap an empty place = choose it for STORE.
+    // STORE writes the COMBI that sounds now to the chosen place (asks before
+    // writing over a BLEND). EDIT opens the chosen BLEND in COMBI.
     private fun drawList(c: Canvas) {
         if (!listCacheLoaded) refreshListCache()
         val entries = cachedListItems
@@ -1129,32 +1129,36 @@ class SilvetonSamplerView(
         if (active != listFollowedActive) {
             // Follow a newly loaded entry once; the page keys stay free afterwards.
             listFollowedActive = active
-            if (active >= 0) listPage = (active / 10).coerceIn(0, 19)
+            if (active >= 0) { listPage = (active / LIST_PER_PAGE).coerceIn(0, LIST_PAGES - 1); listSelected = active }
         }
-        listPage = listPage.coerceIn(0, 19)
+        listPage = listPage.coerceIn(0, LIST_PAGES - 1)
+        if (listSelected !in 0 until LIST_SIZE) listSelected = if (active >= 0) active else -1
 
-        val keyW = (1214f - 19f * 6f) / 20f
-        for (i in 0 until 20) {
-            val pr = RectF(112f + i * (keyW + 6f), 108f, 112f + i * (keyW + 6f) + keyW, 156f)
-            val hasData = (i * 10 until i * 10 + 10).any { realListItem(it) != null }
-            pageKey(c, pr, (i + 1).toString(), i == listPage, hasData, active >= 0 && active / 10 == i)
+        val keyW = (1214f - (LIST_PAGES - 1) * 6f) / LIST_PAGES
+        for (i in 0 until LIST_PAGES) {
+            val pr = RectF(112f + i * (keyW + 6f), 108f, 112f + i * (keyW + 6f) + keyW, 152f)
+            val hasData = (i * LIST_PER_PAGE until (i + 1) * LIST_PER_PAGE).any { realListItem(it) != null }
+            pageKey(c, pr, "%03d–%03d".format(i * LIST_PER_PAGE + 1, (i + 1) * LIST_PER_PAGE), i == listPage, hasData,
+                active >= 0 && active / LIST_PER_PAGE == i)
             hit(pr, { _, _ -> listPage = i })
         }
 
-        val gridTop = 168f
-        val gridBottom = 730f
-        val rowH = (gridBottom - gridTop - 40f) / 5f
-        val colW = (1214f - 10f) / 2f
-        for (j in 0 until 10) {
-            val idx = listPage * 10 + j
-            val col = j % 2
-            val row = j / 2
-            val rr = RectF(112f + col * (colW + 10f), gridTop + row * (rowH + 10f),
-                112f + col * (colW + 10f) + colW, gridTop + row * (rowH + 10f) + rowH)
+        val gridTop = 162f
+        val gridBottom = 690f
+        val gap = 8f
+        val colW = (1214f - 3f * gap) / 4f
+        val rowH = (gridBottom - gridTop - 4f * gap) / 5f
+        for (j in 0 until LIST_PER_PAGE) {
+            val idx = listPage * LIST_PER_PAGE + j
+            val col = j % 4
+            val row = j / 4
+            val rr = RectF(112f + col * (colW + gap), gridTop + row * (rowH + gap),
+                112f + col * (colW + gap) + colW, gridTop + row * (rowH + gap) + rowH)
             val item = realListItem(idx)
-            listCard(c, rr, item, idx, idx == active)
+            listGridCell(c, rr, idx, item, idx == active, idx == listSelected)
             if (item != null) {
                 hit(rr, { _, _ ->
+                    listSelected = idx
                     if (sampler.activateListEntry(0, 0, 0, idx)) {
                         cachedActiveListEntry = idx
                         listFollowedActive = idx
@@ -1166,27 +1170,137 @@ class SilvetonSamplerView(
                     }
                 })
                 listLongHit(rr) { _, _ -> showListContextMenu(idx, item) }
+            } else {
+                hit(rr, { _, _ ->
+                    listSelected = idx
+                    flash("ЛИСТ %03d ИЗБРАН - STORE ЗАПИСВА ТУК".format(idx + 1))
+                })
             }
         }
 
-        val activeItem = realListItem(active)
-        val editR = RectF(112f, 742f, 300f, 786f)
-        lightKey(c, editR, "EDIT COMBI", enabled = activeItem != null)
-        if (activeItem != null) {
-            hit(editR, { _, _ ->
-                if (sampler.activateCombiAddress(activeItem.combiBank, activeItem.combiPage, activeItem.combiSlot)) {
-                    editingCombiSlot = activeItem.combiSlot
-                    loadedFromList = active
-                    page = Page.COMBI
-                    cachedCombiName = sampler.combiName()
-                    refreshAllUppers()
-                    refreshFx()
-                }
-            })
-        }
-        drawQuickBar(c, 312f, 742f, 786f)
+        // ---- keys: STORE, EDIT, T, Q, SAVE AS, LOAD
+        val top = 700f
+        val bottom = 742f
+        val chosenItem = realListItem(listSelected)
+        var x = 112f
+        val storeR = RectF(x, top, x + 210f, bottom); x = storeR.right + 10f
+        accentKey(c, storeR, if (listSelected >= 0) "STORE ► %03d".format(listSelected + 1) else "STORE", true)
+        hit(storeR, { _, _ -> storeToList() })
+        val editR = RectF(x, top, x + 150f, bottom); x = editR.right + 10f
+        lightKey(c, editR, "EDIT", enabled = chosenItem != null, size = 15f)
+        if (chosenItem != null) hit(editR, { _, _ -> editListCombi(chosenItem, listSelected) })
+        val tR = RectF(x, top, x + 130f, bottom); x = tR.right + 10f
+        val qR = RectF(x, top, x + 130f, bottom); x = qR.right + 24f
+        stripToggle(c, tR, if (sampler.hasTercaUppers()) "T  " + (if (sampler.tercaMasterOn()) "ON" else "OFF") else "T  —",
+            sampler.tercaMasterOn(), C_AMBER, size = 16f)
+        stripToggle(c, qR, if (sampler.hasScaleUppers()) "Q  " + (if (sampler.scaleMasterOn()) "ON" else "OFF") else "Q  —",
+            sampler.scaleMasterOn(), C_AMBER, size = 16f)
+        hit(tR, { _, _ ->
+            if (!sampler.hasTercaUppers()) flash("НЯМА UPPER С T - ИЗБЕРИ T В COMBI") else sampler.toggleTercaMaster()
+            invalidate()
+        })
+        hit(qR, { _, _ ->
+            if (!sampler.hasScaleUppers()) flash("НЯМА UPPER С Q - ИЗБЕРИ Q В COMBI") else sampler.toggleScaleMaster()
+            invalidate()
+        })
+        val saveR = RectF(x, top, x + 160f, bottom); x = saveR.right + 10f
+        lightKey(c, saveR, "SAVE AS", size = 15f)
+        hit(saveR, { _, _ -> saveSetAs() })
+        val loadR = RectF(x, top, x + 140f, bottom)
+        lightKey(c, loadR, "LOAD", size = 15f)
+        hit(loadR, { _, _ -> loadSet() })
         val used = entries.count { !sampler.isEmptyListItem(it) }
-        text(c, "$used / 200", 1326f, 769f, 13f, C_INK_SOFT, right = true, face = faceMonoBold)
+        text(c, "$used / $LIST_SIZE", 1326f, 727f, 13f, C_INK_SOFT, right = true, face = faceMonoBold)
+
+        drawQuickBar(c, 112f, 750f, 790f)
+    }
+
+    private fun listGridCell(c: Canvas, r: RectF, idx: Int, item: SamplerAppController.ListItem?, active: Boolean, chosen: Boolean) {
+        if (chosen) fill(c, RectF(r.left - 3f, r.top - 3f, r.right + 3f, r.bottom + 3f), 13f, C_ORANGE)
+        else shadow(c, r, 10f, 2f, 60)
+        val face = when { active -> Color.rgb(255, 150, 50); item != null -> Color.rgb(44, 50, 58); else -> Color.rgb(30, 34, 39) }
+        fill(c, r, 10f, face)
+        if (!active) line(c, r.left + 10f, r.top + 1f, r.right - 10f, r.top + 1f, Color.rgb(78, 88, 100), 1f)
+        if (isDown(r)) fill(c, r, 10f, Color.argb(60, 0, 0, 0))
+        val numColor = when { active -> Color.rgb(20, 20, 20); item != null -> C_AMBER; else -> Color.rgb(110, 118, 128) }
+        text(c, "%03d".format(idx + 1), r.left + 14f, r.top + 24f, 15f, numColor, face = faceMonoBold)
+        if (item != null) {
+            text(c, item.name, r.left + 14f, r.bottom - 22f, 20f, if (active) Color.rgb(20, 20, 20) else Color.WHITE,
+                face = faceBold, maxWidth = r.width() - 28f)
+        } else {
+            text(c, "—", r.left + 14f, r.bottom - 22f, 20f, Color.rgb(96, 104, 114))
+        }
+    }
+
+    /** STORE: the COMBI that sounds now goes to the chosen LIST place. */
+    private fun storeToList() {
+        val list = sampler.listItems(0, 0, 0)
+        fun nameAt(pos: Int): String? = list.getOrNull(pos)?.takeUnless { sampler.isEmptyListItem(it) }?.name
+        val pos = if (listSelected in 0 until LIST_SIZE) listSelected
+            else (0 until LIST_SIZE).firstOrNull { nameAt(it) == null } ?: -1
+        if (pos < 0) { flash("ЛИСТЪТ Е ПЪЛЕН"); return }
+        val old = nameAt(pos)
+        val askName = {
+            showTextPage("STORE  →  ЛИСТ %03d".format(pos + 1), old ?: sampler.combiName()) { newName ->
+                doWriteList(pos, newName.trim().ifBlank { sampler.combiName() })
+                listSelected = pos
+            }
+        }
+        if (old == null) { askName(); return }
+        AlertDialog.Builder(context)
+            .setTitle("ЛИСТ %03d".format(pos + 1))
+            .setMessage("Тук вече има „$old“.\nДа запиша ли отгоре?")
+            .setPositiveButton("ДА, ЗАПИШИ") { _, _ -> askName() }
+            .setNegativeButton("НЕ", null)
+            .show()
+    }
+
+    // SILVETON_SET_SAVE_AS_V1
+    private fun saveSetAs() {
+        showTextPage("SAVE AS  (ЦЕЛИЯТ СЕТ)", "SILVETON SET") { name ->
+            val doSave = {
+                val err = sampler.saveSetAs(name)
+                flash(if (err == null) "СЕТЪТ Е ЗАПИСАН: ${name.trim()}" else "ГРЕШКА: $err")
+            }
+            if (sampler.setExists(name)) {
+                AlertDialog.Builder(context)
+                    .setTitle("SAVE AS")
+                    .setMessage("Сет „${name.trim()}“ вече има.\nДа запиша ли отгоре?")
+                    .setPositiveButton("ДА, ЗАПИШИ") { _, _ -> doSave() }
+                    .setNegativeButton("НЕ", null)
+                    .show()
+            } else doSave()
+        }
+    }
+
+    private fun loadSet() {
+        val sets = sampler.savedSets()
+        if (sets.isEmpty()) {
+            AlertDialog.Builder(context).setTitle("LOAD")
+                .setMessage("Няма записани сетове.\nЗапиши с SAVE AS (папка SILVETON/SETS).")
+                .setPositiveButton("OK", null).show()
+            return
+        }
+        showGridPicker("LOAD  -  ЗАПИСАНИ СЕТОВЕ", sets.mapIndexed { i, n -> "%02d".format(i + 1) to n }, -1, null) { index ->
+            val name = sets[index]
+            AlertDialog.Builder(context)
+                .setTitle("LOAD  „$name“")
+                .setMessage("Целият ЛИСТ, блендите и настройките се сменят с тези от сета.\nСегашните (ако не са записани със SAVE AS) се губят.")
+                .setPositiveButton("LOAD") { _, _ ->
+                    val err = sampler.loadSavedSet(name)
+                    if (err == null) {
+                        loadedFromList = -1
+                        listSelected = -1
+                        refreshListCache()
+                        refreshAllUppers()
+                        refreshFx()
+                        refreshGlobal()
+                        flash("ЗАРЕДЕН СЕТ: $name")
+                    } else flash("ГРЕШКА: $err")
+                }
+                .setNegativeButton("CANCEL", null)
+                .show()
+        }
     }
 
     // SILVETON_LIST_POSITIONS_V1: a LIST position with a BLEND (null = empty position).
@@ -1465,7 +1579,7 @@ class SilvetonSamplerView(
         if (item != null && item.combiBank == 0 && item.combiPage == 0) editingCombiSlot = item.combiSlot
         loadedFromList = index
         listFollowedActive = cachedActiveListEntry
-        listPage = (index / 10).coerceIn(0, 19)
+        listPage = (index / LIST_PER_PAGE).coerceIn(0, LIST_PAGES - 1)
         cachedCombiName = sampler.combiName()
         refreshAllUppers()
         refreshFx()
@@ -1493,7 +1607,7 @@ class SilvetonSamplerView(
         else if (loadedFromList == to) loadedFromList = -1
         refreshListCache()
         listFollowedActive = cachedActiveListEntry.takeIf { realListItem(it) != null } ?: -1
-        listPage = (to / 10).coerceIn(0, 19)
+        listPage = (to / LIST_PER_PAGE).coerceIn(0, LIST_PAGES - 1)
         writeOpen = false
         page = Page.LIST
         flash((if (move) "ПРЕМЕСТЕНО: ЛИСТ %03d" else "КОПИРАНО: ЛИСТ %03d").format(to + 1))
@@ -1974,6 +2088,9 @@ class SilvetonSamplerView(
      * sound at once (you hear it on the notes you hold); CANCEL / Back puts the old
      * value back ([restore], or the starting value). A typed number counts on APPLY.
      */
+    // SILVETON_SIMPLE_NUMBER_V1: simple fine setting - the number, a big − and a big +.
+    // Tap = one small step, hold = it keeps going and gets faster. You hear it at once.
+    // The number can also be typed. APPLY keeps it, CANCEL goes back.
     private fun showNumber(title: String, current: Float, minV: Float, maxV: Float, decimals: Int,
                            live: Boolean = true, restore: (() -> Unit)? = null, done: (Float) -> Unit) {
         val body = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
@@ -1990,52 +2107,75 @@ class SilvetonSamplerView(
         }
         fun formatEditorValue(value: Float): String = if (decimals == 0) round(value).toInt().toString() else "% .${decimals}f".format(value).trim()
         val scale = when { decimals <= 0 -> 1; decimals == 1 -> 10; else -> 100 }
-        val sliderMax = max(1, round((maxV - minV) * scale).toInt())
-        body.addView(editorLabel("VALUE"))
-        val edit = editorField(formatEditorValue(current.coerceIn(minV, maxV)))
-        body.addView(edit)
-        body.addView(editorLabel("RANGE   ${formatEditorValue(minV)}  …  ${formatEditorValue(maxV)}"))
-        var syncing = false
-        val seek = SeekBar(context).apply {
-            max = sliderMax
-            progress = round((current.coerceIn(minV, maxV) - minV) * scale).toInt().coerceIn(0, sliderMax)
+        val step = 1f / scale.toFloat()
+        val edit = editorField(formatEditorValue(current.coerceIn(minV, maxV))).apply {
+            textSize = 40f
+            gravity = Gravity.CENTER
+            setTypeface(typeface, Typeface.BOLD)
         }
+        body.addView(edit)
+        fun currentTyped(): Float = edit.text.toString().replace(',', '.').toFloatOrNull()?.coerceIn(minV, maxV) ?: current.coerceIn(minV, maxV)
         fun setEditorValue(value: Float) {
-            val clamped = value.coerceIn(minV, maxV)
-            syncing = true
-            val newText = formatEditorValue(clamped)
+            val newText = formatEditorValue(value.coerceIn(minV, maxV))
             edit.setText(newText)
             edit.setSelection(newText.length)
-            seek.progress = round((clamped - minV) * scale).toInt().coerceIn(0, sliderMax)
-            syncing = false
         }
-        seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                if (!fromUser || syncing) return
-                val value = minV + progress.toFloat() / scale.toFloat()
-                setEditorValue(value)
-                preview(value)
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        fun stepKey(label: String, dir: Int): TextView = TextView(context).apply {
+            text = label
+            textSize = 40f
+            gravity = Gravity.CENTER
+            setTextColor(Color.rgb(255, 179, 71))
+            setTypeface(typeface, Typeface.BOLD)
+            background = GradientDrawable().apply {
+                cornerRadius = uiPx(14f).toFloat()
+                setColor(Color.rgb(44, 50, 58))
+                setStroke(uiPx(1f), Color.rgb(78, 88, 100))
             }
-            override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
-            override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
-        })
-        body.addView(seek)
-        val fine = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, uiPx(8f), 0, 0) }
-        val step = 1f / scale.toFloat()
-        fun currentTyped(): Float = edit.text.toString().replace(',', '.').toFloatOrNull()?.coerceIn(minV, maxV) ?: current.coerceIn(minV, maxV)
-        val minus = Button(context).apply { text = "−"; textSize = 20f; setOnClickListener { val v = (currentTyped() - step).coerceIn(minV, maxV); setEditorValue(v); preview(v) } }
-        val plus = Button(context).apply { text = "+"; textSize = 20f; setOnClickListener { val v = (currentTyped() + step).coerceIn(minV, maxV); setEditorValue(v); preview(v) } }
-        fine.addView(minus, LinearLayout.LayoutParams(0, uiPx(48f), 1f))
-        fine.addView(plus, LinearLayout.LayoutParams(0, uiPx(48f), 1f))
-        body.addView(fine)
-        val subtitle = if (live) "Плъзгай или натискай − / + : чуваш веднага. Или напиши число и натисни APPLY."
-            else "Drag smoothly or type the exact value."
+            var count = 0
+            fun once(mult: Float) {
+                val v = (currentTyped() + dir * step * mult).coerceIn(minV, maxV)
+                setEditorValue(v)
+                preview(v)
+            }
+            val repeat = object : Runnable {
+                override fun run() {
+                    count++
+                    once(when { count > 40 -> 100f; count > 15 -> 10f; else -> 1f })
+                    handler.postDelayed(this, 70L)
+                }
+            }
+            setOnTouchListener { view, ev ->
+                when (ev.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        count = 0
+                        view.alpha = 0.6f
+                        once(1f)
+                        handler.postDelayed(repeat, 420L)
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        handler.removeCallbacks(repeat)
+                        view.alpha = 1f
+                        if (ev.actionMasked == MotionEvent.ACTION_UP) view.performClick()
+                    }
+                }
+                true
+            }
+        }
+        val keys = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, uiPx(12f), 0, uiPx(4f)) }
+        keys.addView(stepKey("−", -1), LinearLayout.LayoutParams(0, uiPx(84f), 1f).apply { setMargins(0, 0, uiPx(8f), 0) })
+        keys.addView(stepKey("+", 1), LinearLayout.LayoutParams(0, uiPx(84f), 1f).apply { setMargins(uiPx(8f), 0, 0, 0) })
+        body.addView(keys)
+        val subtitle = if (live) "−  /  +  : една стъпка.  Задръж = по-бързо.  Чуваш веднага.   (${formatEditorValue(minV)} … ${formatEditorValue(maxV)})"
+            else "${formatEditorValue(minV)} … ${formatEditorValue(maxV)}"
         showEditorPage(title, subtitle, body, onCancel = {
+            handler.removeCallbacksAndMessages(null)
             if (previewed) {
                 if (restore != null) restore() else done(current.coerceIn(minV, maxV))
                 invalidate()
             }
         }) {
+            handler.removeCallbacksAndMessages(null)
             val value = edit.text.toString().replace(',', '.').toFloatOrNull()?.coerceIn(minV, maxV) ?: current.coerceIn(minV, maxV)
             done(value)
             invalidate()
@@ -2632,6 +2772,11 @@ class SilvetonSamplerView(
 
     companion object {
         private const val DESIGN_W = 1340f
+        // SILVETON_SLOW_DRAG_V1: knobs and faders move 2.5 x slower under the finger (finer).
+        private const val DRAG_SLOW = 2.5f
+        private const val LIST_SIZE = 200
+        private const val LIST_PER_PAGE = 20
+        private const val LIST_PAGES = LIST_SIZE / LIST_PER_PAGE
         private const val DESIGN_H = 800f
         // brushed metal + side navigation
         private val C_METAL_A = Color.rgb(217, 218, 222); private val C_METAL_B = Color.rgb(222, 223, 227)

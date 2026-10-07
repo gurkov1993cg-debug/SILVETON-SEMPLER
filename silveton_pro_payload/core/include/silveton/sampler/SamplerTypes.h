@@ -335,6 +335,9 @@ struct SetList {
 struct EngineState {
     Combi combi{};
     GlobalState global{};
+    // SILVETON_FX_TAIL_V1: changes only when another COMBI / BLEND is called up
+    // (not on live edits), so the old effect can ring out instead of stopping.
+    std::uint32_t combiGeneration{0U};
 };
 
 } // namespace silveton::sampler

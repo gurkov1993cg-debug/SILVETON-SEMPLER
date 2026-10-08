@@ -1612,7 +1612,7 @@ void testPortamentoSameTimeEveryInterval() {
     for(int target : {70, 81, 93}) {
         auto st=makeToneState(UpperVoiceMode::Mono);
         st->combi.uppers[0].portamentoSec=0.05F; // 50 ms
-        SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
+        SamplerEngine e; e.prepare(96000.0,96U); e.setPortamentoNear(0.0F); e.setState(st);
         e.postNoteOn(0U,69U,100U); renderLeft(e,40);
         e.postNoteOn(0U,static_cast<std::uint8_t>(target),100U);
         auto x=renderLeft(e,120);
@@ -1631,8 +1631,8 @@ void testPortamentoSameTimeEveryInterval() {
 // SILVETON_PORTA_PAGE_V1 - like the SILVETON portamento page: while portamento
 // is ON a POLY Upper plays one line, a held key glides to the next key and back
 // in TIME; with no key held the next note is struck normally without a glide.
-void testPortamentoPolyFromLastNote() {
-    auto st=makeToneState(UpperVoiceMode::Poly);
+void testPortamentoPolyFromLastNote() {   // (MONO now: POLY stays POLY, see testPolyPortamentoAndNear)
+    auto st=makeToneState(UpperVoiceMode::Mono);
     st->combi.uppers[0].portamentoSec=0.08F;
     SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
     e.postNoteOn(0U,69U,100U); renderLeft(e,40);               // 69 held
@@ -1654,6 +1654,7 @@ void testPortamentoPolyFromLastNote() {
     // Portamento OFF: POLY chords again, no glide
     auto off=std::make_shared<EngineState>(*st);
     off->combi.uppers[0].portamentoSec=0.0F;
+    off->combi.uppers[0].voiceMode=UpperVoiceMode::Poly;
     e.setState(off);
     e.postNoteOn(0U,69U,100U); e.postNoteOn(0U,76U,100U);
     renderLeft(e,40);
@@ -1773,6 +1774,24 @@ void testFxTailOnBlendChange() {
     assert(peakOf(y,y.size()/2U,y.size())<peakOf(x,x.size()/2U,x.size()));
 }
 
+// SILVETON_POLY_PORTA_V1 / SILVETON_PORTA_NEAR_V1
+void testPolyPortamentoAndNear() {
+    auto st=makeToneState(UpperVoiceMode::Poly);
+    st->combi.uppers[0].portamentoSec=0.03F;
+    SamplerEngine e; e.prepare(96000.0,96U); e.setPortamentoNear(0.0F); e.setState(st);
+    e.postNoteOn(0U,69U,100U); renderLeft(e,60);
+    e.postNoteOn(0U,81U,100U); auto x=renderLeft(e,200);
+    assert(e.activeVoiceCount()==2U);                          // POLY: both keys sound
+    e.postNoteOff(0U,69U,0U); e.postNoteOff(0U,81U,0U); renderLeft(e,400);
+    // NEAR: one semitone takes NEAR, an octave still takes TIME
+    SamplerEngine m; m.prepare(96000.0,96U); m.setPortamentoNear(90.0F);
+    auto mono=makeToneState(UpperVoiceMode::Legato); mono->combi.uppers[0].portamentoSec=0.03F; m.setState(mono);
+    m.postNoteOn(0U,69U,100U); renderLeft(m,60);
+    m.postNoteOn(0U,70U,100U); auto y=renderLeft(m,60);
+    assert(glideHzAt(y,40.0)<466.16*0.997);                   // after 40 ms still on the way (NEAR = 90 ms)
+    (void)x;
+}
+
 // Another Sound on the Upper: the first note does not glide.
 void testPortamentoNewSoundStartsFresh() {
     auto st=makeToneState(UpperVoiceMode::Mono);
@@ -1790,7 +1809,7 @@ void testPortamentoNewSoundStartsFresh() {
 // The held line is ONE continuous sound: a new key is not struck again (no new
 // ATTACK), in POLY, MONO and LEGATO; the sounding note pressed again changes nothing.
 void testPortamentoAutoMonoReleaseTail() {
-    for(auto mode : {UpperVoiceMode::Poly, UpperVoiceMode::Mono, UpperVoiceMode::Legato}) {
+    for(auto mode : {UpperVoiceMode::Mono, UpperVoiceMode::Legato}) {   // POLY stays POLY (SILVETON_POLY_PORTA_V1)
         auto st=makeToneState(mode);
         st->combi.uppers[0].portamentoSec=0.03F;
         st->combi.uppers[0].toneAttackMs=150.0F;                 // a slow attack would show a new strike
@@ -2093,7 +2112,7 @@ int main() {
     testPortamentoSameTimeEveryInterval();
     testPortamentoPolyFromLastNote();
     testPortamentoFromLastNoteMono();
-    testOctaveChoosesRecordedSample(); testTercaOnAnyUpper(); testFxTailOnBlendChange(); testPortamentoNewSoundStartsFresh();
+    testOctaveChoosesRecordedSample(); testTercaOnAnyUpper(); testFxTailOnBlendChange(); testPolyPortamentoAndNear(); testPortamentoNewSoundStartsFresh();
     testPortamentoAutoMonoReleaseTail();
     testPortamentoBalance();
     testPortamentoTimeLimit();

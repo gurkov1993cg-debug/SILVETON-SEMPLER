@@ -22,6 +22,12 @@
 #include "silveton/sampler/SamplerLibrary.h"
 #include "silveton/sampler/SetPackage.h"
 #include "silveton/sampler/SvBankRuntime.h"
+#include "silveton/sampler/SvBankFormat.h"
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <map>
+#include <set>
+#include <sstream>
 #include "silveton/sampler/SampleStreamPrefetcher.h"
 
 #include <algorithm>
@@ -43,6 +49,291 @@
 
 namespace {
 using namespace silveton::sampler;
+
+// ---------------------------------------------------------------- SILVETON_BANK_INFO_V1
+// INFO / DELETE of whole SOUNDs in SILVETON_BANK.sv on the tablet. A deleted
+// SOUND takes its samples with it (only samples no other SOUND uses), the bank
+// file is written again smaller (new file next to it, then renamed over it).
+struct Sha256Stream {
+    std::array<std::uint32_t, 8> h{{0x6a09e667U,0xbb67ae85U,0x3c6ef372U,0xa54ff53aU,0x510e527fU,0x9b05688cU,0x1f83d9abU,0x5be0cd19U}};
+    std::array<std::uint8_t, 64> buf{};
+    std::size_t used{0U};
+    std::uint64_t bits{0U};
+    static std::uint32_t rr(std::uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+    void block(const std::uint8_t* p) {
+        static constexpr std::uint32_t k[64] = {
+            0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,
+            0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+            0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,
+            0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+            0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,
+            0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+        std::uint32_t w[64];
+        for (int i = 0; i < 16; ++i) w[i] = (std::uint32_t(p[4*i]) << 24) | (std::uint32_t(p[4*i+1]) << 16) | (std::uint32_t(p[4*i+2]) << 8) | std::uint32_t(p[4*i+3]);
+        for (int i = 16; i < 64; ++i) {
+            const std::uint32_t s0 = rr(w[i-15],7) ^ rr(w[i-15],18) ^ (w[i-15] >> 3);
+            const std::uint32_t s1 = rr(w[i-2],17) ^ rr(w[i-2],19) ^ (w[i-2] >> 10);
+            w[i] = w[i-16] + s0 + w[i-7] + s1;
+        }
+        std::uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+        for (int i = 0; i < 64; ++i) {
+            const std::uint32_t t1 = hh + (rr(e,6) ^ rr(e,11) ^ rr(e,25)) + ((e & f) ^ (~e & g)) + k[i] + w[i];
+            const std::uint32_t t2 = (rr(a,2) ^ rr(a,13) ^ rr(a,22)) + ((a & b) ^ (a & c) ^ (b & c));
+            hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+        }
+        h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
+    }
+    void add(const std::uint8_t* p, std::size_t n) {
+        bits += static_cast<std::uint64_t>(n) * 8U;
+        while (n > 0U) {
+            if (used == 0U && n >= 64U) { block(p); p += 64; n -= 64; continue; }
+            const std::size_t take = std::min<std::size_t>(64U - used, n);
+            std::memcpy(buf.data() + used, p, take); used += take; p += take; n -= take;
+            if (used == 64U) { block(buf.data()); used = 0U; }
+        }
+    }
+    std::array<std::uint8_t, 32> finish() {
+        const std::uint64_t total = bits;
+        const std::uint8_t one = 0x80U; add(&one, 1U); bits -= 8U;
+        const std::uint8_t zero = 0U;
+        while (used != 56U) { add(&zero, 1U); bits -= 8U; }
+        std::uint8_t len[8];
+        for (int i = 0; i < 8; ++i) len[i] = static_cast<std::uint8_t>(total >> (56 - 8 * i));
+        add(len, 8U);
+        std::array<std::uint8_t, 32> out{};
+        for (int i = 0; i < 8; ++i) for (int j = 0; j < 4; ++j) out[static_cast<std::size_t>(4*i+j)] = static_cast<std::uint8_t>(h[static_cast<std::size_t>(i)] >> (24 - 8 * j));
+        return out;
+    }
+};
+
+struct MappedFile {
+    const std::uint8_t* data{nullptr};
+    std::size_t size{0U};
+    bool open(const std::string& path) {
+        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return false;
+        struct stat st{};
+        if (::fstat(fd, &st) != 0 || st.st_size <= 0) { ::close(fd); return false; }
+        void* m = ::mmap(nullptr, static_cast<std::size_t>(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
+        ::close(fd);
+        if (m == MAP_FAILED) return false;
+        data = static_cast<const std::uint8_t*>(m);
+        size = static_cast<std::size_t>(st.st_size);
+        return true;
+    }
+    ~MappedFile() { if (data != nullptr) ::munmap(const_cast<std::uint8_t*>(data), size); }
+};
+
+struct BankModel {
+    SvBankHeader header{};
+    std::vector<SvSoundRecord> sounds;
+    std::vector<SvSoundLayerRecord> layers;
+    std::vector<SvMultisampleRecord> multisamples;
+    std::vector<SvSampleRecord> samples;
+    std::vector<SvZoneRecord> zones;
+};
+
+bool readBankModel(const MappedFile& f, BankModel& m, std::string& error) {
+    if (!deserializeHeader(f.data, f.size, m.header, error)) return false;
+    auto section = [&](SvSection s) { return m.header.sections[static_cast<std::size_t>(s)]; };
+    auto readAll = [&](SvSection s, std::uint32_t count, std::size_t recSize, auto& vec, auto reader) {
+        const auto sec = section(s);
+        if (sec.offset + static_cast<std::uint64_t>(count) * recSize > f.size) return false;
+        vec.resize(count);
+        for (std::uint32_t i = 0U; i < count; ++i)
+            if (!reader(f.data + sec.offset + static_cast<std::uint64_t>(i) * recSize, recSize, vec[i])) return false;
+        return true;
+    };
+    if (!readAll(SvSection::Sounds, m.header.soundCount, kSvSoundRecordSize, m.sounds, readSoundRecord) ||
+        !readAll(SvSection::SoundLayers, m.header.soundLayerCount, kSvSoundLayerRecordSize, m.layers, readSoundLayerRecord) ||
+        !readAll(SvSection::Multisamples, m.header.multisampleCount, kSvMultisampleRecordSize, m.multisamples, readMultisampleRecord) ||
+        !readAll(SvSection::Samples, m.header.sampleCount, kSvSampleRecordSize, m.samples, readSampleRecord) ||
+        !readAll(SvSection::Zones, m.header.zoneCount, kSvZoneRecordSize, m.zones, readZoneRecord)) {
+        error = "SILVETON_BANK.sv records cannot be read";
+        return false;
+    }
+    return true;
+}
+
+std::string bankString(const MappedFile& f, const BankModel& m, std::uint32_t offset) {
+    const auto sec = m.header.sections[static_cast<std::size_t>(SvSection::Strings)];
+    if (offset >= sec.size) return {};
+    std::size_t pos = static_cast<std::size_t>(sec.offset + offset);
+    const std::size_t end = static_cast<std::size_t>(std::min<std::uint64_t>(sec.offset + sec.size, f.size));
+    std::string out;
+    while (pos < end && f.data[pos] != 0U) out.push_back(static_cast<char>(f.data[pos++]));
+    return out;
+}
+
+// Sample ids used by a SOUND.
+std::set<std::uint32_t> soundSamples(const BankModel& m, const SvSoundRecord& s) {
+    std::map<std::uint32_t, const SvMultisampleRecord*> msById;
+    for (const auto& ms : m.multisamples) msById[ms.multisampleId] = &ms;
+    std::set<std::uint32_t> ids;
+    for (std::uint32_t l = s.firstLayer; l < s.firstLayer + s.layerCount && l < m.layers.size(); ++l) {
+        const auto it = msById.find(m.layers[l].multisampleId);
+        if (it == msById.end()) continue;
+        for (std::uint32_t z = it->second->firstZone; z < it->second->firstZone + it->second->zoneCount && z < m.zones.size(); ++z)
+            ids.insert(m.zones[z].sampleId);
+    }
+    return ids;
+}
+
+// Text for INFO: first line "TOTAL\tsounds\tsamples\taudioBytes\tfileBytes", then
+// one line per SOUND "slot\tname\tsamples\tbytes" (bytes = audio only this SOUND uses... and shared).
+std::string bankInfoText(const std::string& path, std::string& error) {
+    MappedFile f;
+    if (!f.open(path)) { error = "Cannot open " + path; return {}; }
+    BankModel m;
+    if (!readBankModel(f, m, error)) return {};
+    std::map<std::uint32_t, const SvSampleRecord*> sampleById;
+    for (const auto& r : m.samples) sampleById[r.sampleId] = &r;
+    std::set<std::uint64_t> allAudio;
+    std::uint64_t totalAudio = 0U;
+    for (const auto& r : m.samples) if (allAudio.insert(r.audioOffset).second) totalAudio += r.audioSize;
+    std::ostringstream out;
+    out << "TOTAL\t" << m.sounds.size() << "\t" << m.samples.size() << "\t" << totalAudio << "\t" << f.size << "\n";
+    for (const auto& s : m.sounds) {
+        const auto ids = soundSamples(m, s);
+        std::set<std::uint64_t> audio;
+        std::uint64_t bytes = 0U;
+        for (auto id : ids) {
+            const auto it = sampleById.find(id);
+            if (it != sampleById.end() && audio.insert(it->second->audioOffset).second) bytes += it->second->audioSize;
+        }
+        std::string name = bankString(f, m, s.nameOffset);
+        for (auto& ch : name) if (ch == '\t' || ch == '\n') ch = ' ';
+        out << s.soundSlotId << "\t" << name << "\t" << ids.size() << "\t" << bytes << "\n";
+    }
+    return out.str();
+}
+
+bool removeBankSounds(const std::string& path, const std::set<std::uint16_t>& slots, std::string& error) {
+    std::string tmp = path + ".tmp";
+    {
+        MappedFile f;
+        if (!f.open(path)) { error = "Cannot open " + path; return false; }
+        BankModel m;
+        if (!readBankModel(f, m, error)) return false;
+        BankModel n;
+        n.header = m.header;
+        std::set<std::uint32_t> usedMs;
+        for (const auto& s : m.sounds) {
+            if (slots.count(s.soundSlotId) != 0U) continue;
+            SvSoundRecord r = s;
+            r.firstLayer = static_cast<std::uint32_t>(n.layers.size());
+            for (std::uint32_t l = s.firstLayer; l < s.firstLayer + s.layerCount && l < m.layers.size(); ++l) {
+                n.layers.push_back(m.layers[l]);
+                usedMs.insert(m.layers[l].multisampleId);
+            }
+            r.layerCount = static_cast<std::uint32_t>(n.layers.size()) - r.firstLayer;
+            n.sounds.push_back(r);
+        }
+        if (n.sounds.empty()) { error = "The last SOUND cannot be deleted"; return false; }
+        std::set<std::uint32_t> usedSamples;
+        for (const auto& ms : m.multisamples) {
+            if (usedMs.count(ms.multisampleId) == 0U) continue;
+            SvMultisampleRecord r = ms;
+            r.firstZone = static_cast<std::uint32_t>(n.zones.size());
+            for (std::uint32_t z = ms.firstZone; z < ms.firstZone + ms.zoneCount && z < m.zones.size(); ++z) {
+                n.zones.push_back(m.zones[z]);
+                usedSamples.insert(m.zones[z].sampleId);
+            }
+            r.zoneCount = static_cast<std::uint32_t>(n.zones.size()) - r.firstZone;
+            n.multisamples.push_back(r);
+        }
+        // audio: every kept piece once, aligned to 64 bytes
+        std::map<std::uint64_t, std::uint64_t> newOffset;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> copies;   // old offset, size
+        std::uint64_t audioSize = 0U;
+        for (const auto& r : m.samples) {
+            if (usedSamples.count(r.sampleId) == 0U) continue;
+            SvSampleRecord k = r;
+            auto it = newOffset.find(r.audioOffset);
+            if (it == newOffset.end()) {
+                audioSize = (audioSize + 63U) & ~std::uint64_t{63U};
+                it = newOffset.emplace(r.audioOffset, audioSize).first;
+                copies.emplace_back(r.audioOffset, r.audioSize);
+                audioSize += r.audioSize;
+            }
+            k.audioOffset = it->second;
+            n.samples.push_back(k);
+        }
+        // layout
+        auto& h = n.header;
+        h.soundCount = static_cast<std::uint32_t>(n.sounds.size());
+        h.soundLayerCount = static_cast<std::uint32_t>(n.layers.size());
+        h.multisampleCount = static_cast<std::uint32_t>(n.multisamples.size());
+        h.sampleCount = static_cast<std::uint32_t>(n.samples.size());
+        h.zoneCount = static_cast<std::uint32_t>(n.zones.size());
+        std::vector<std::uint8_t> records[5];
+        for (const auto& r : n.sounds) appendSoundRecord(records[0], r);
+        for (const auto& r : n.layers) appendSoundLayerRecord(records[1], r);
+        for (const auto& r : n.multisamples) appendMultisampleRecord(records[2], r);
+        for (const auto& r : n.samples) appendSampleRecord(records[3], r);
+        for (const auto& r : n.zones) appendZoneRecord(records[4], r);
+        const auto oldStrings = m.header.sections[static_cast<std::size_t>(SvSection::Strings)];
+        const auto oldAudio = m.header.sections[static_cast<std::size_t>(SvSection::Audio)];
+        std::uint64_t pos = kSvBankHeaderSize;
+        auto place = [&](SvSection s, std::uint64_t size, std::uint64_t align) {
+            pos = (pos + align - 1U) / align * align;
+            h.sections[static_cast<std::size_t>(s)] = SvSectionDesc{pos, size};
+            pos += size;
+        };
+        place(SvSection::Sounds, records[0].size(), 64U);
+        place(SvSection::SoundLayers, records[1].size(), 64U);
+        place(SvSection::Multisamples, records[2].size(), 64U);
+        place(SvSection::Samples, records[3].size(), 64U);
+        place(SvSection::Zones, records[4].size(), 64U);
+        place(SvSection::Strings, oldStrings.size, 64U);
+        place(SvSection::Audio, audioSize, 4096U);
+        h.fileSize = pos;
+        // write: header placeholder, payload streamed (SHA-256 on the way), header again
+        const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (fd < 0) { error = "Cannot write " + tmp; return false; }
+        Sha256Stream sha;
+        std::uint64_t written = 0U;
+        bool ok = true;
+        auto put = [&](const std::uint8_t* p, std::size_t len, bool hash) {
+            while (ok && len > 0U) {
+                const ssize_t w = ::write(fd, p, len);
+                if (w <= 0) { if (errno == EINTR) continue; ok = false; break; }
+                if (hash) sha.add(p, static_cast<std::size_t>(w));
+                p += w; len -= static_cast<std::size_t>(w); written += static_cast<std::uint64_t>(w);
+            }
+        };
+        std::vector<std::uint8_t> zeros(4096, 0U);
+        auto padTo = [&](std::uint64_t to) {
+            while (ok && written < to) put(zeros.data(), static_cast<std::size_t>(std::min<std::uint64_t>(zeros.size(), to - written)), true);
+        };
+        const auto headerBytes = serializeHeader(h);
+        put(headerBytes.data(), headerBytes.size(), false);
+        while (ok && written < kSvBankHeaderSize) put(zeros.data(), static_cast<std::size_t>(kSvBankHeaderSize - written), false);
+        const SvSection order[5] = {SvSection::Sounds, SvSection::SoundLayers, SvSection::Multisamples, SvSection::Samples, SvSection::Zones};
+        for (int i = 0; i < 5 && ok; ++i) {
+            padTo(h.sections[static_cast<std::size_t>(order[i])].offset);
+            put(records[i].data(), records[i].size(), true);
+        }
+        padTo(h.sections[static_cast<std::size_t>(SvSection::Strings)].offset);
+        if (oldStrings.offset + oldStrings.size <= f.size) put(f.data + oldStrings.offset, static_cast<std::size_t>(oldStrings.size), true);
+        const std::uint64_t audioBase = h.sections[static_cast<std::size_t>(SvSection::Audio)].offset;
+        for (const auto& c : copies) {
+            padTo(audioBase + newOffset[c.first]);
+            if (oldAudio.offset + c.first + c.second > f.size) { ok = false; error = "Bank audio is outside the file"; break; }
+            put(f.data + oldAudio.offset + c.first, static_cast<std::size_t>(c.second), true);
+        }
+        padTo(h.fileSize);
+        h.payloadSha256 = sha.finish();
+        const auto finalHeader = serializeHeader(h);
+        if (ok && ::lseek(fd, 0, SEEK_SET) == 0) { written = 0U; put(finalHeader.data(), finalHeader.size(), false); }
+        else ok = false;
+        if (ok && ::fsync(fd) != 0) ok = false;
+        ::close(fd);
+        if (!ok) { ::unlink(tmp.c_str()); if (error.empty()) error = "Writing the bank failed (storage full?)"; return false; }
+    }
+    if (::rename(tmp.c_str(), path.c_str()) != 0) { ::unlink(tmp.c_str()); error = "Cannot replace " + path; return false; }
+    return true;
+}
 
 constexpr const char* kTag = "SilvetonSampler";
 
@@ -238,6 +529,7 @@ public:
     // cannot move the output to the tablet speakers. Only differing values are written.
     // PORTA BALANCE of the SILVETON keyboard processor (3..40, default 11).
     void setPortamentoBalance(float balance) noexcept { engine_.setPortamentoBalance(balance); }
+    void setPortamentoNear(float ms) noexcept { engine_.setPortamentoNear(ms); }
 
     bool enforceHeadphoneRoute(bool onlyWhileRunning) {
         if (onlyWhileRunning && !started_.load(std::memory_order_acquire)) return true;
@@ -1372,18 +1664,22 @@ public:
     void startScan(int mode) noexcept {
         scanTercaPending_ = false;
         scanScaleCollected_ = 0;
-        scanMode_.store(mode == 1 || mode == 2 ? mode : 0, std::memory_order_release);
+        scanKeyPending_ = false;
+        scanMode_.store(mode >= 1 && mode <= 3 ? mode : 0, std::memory_order_release);
     }
     std::vector<int> scanInfo() const {
         return {scanMode_.load(std::memory_order_acquire), tercaRoot_.load(std::memory_order_acquire),
                 tercaCell_.load(std::memory_order_acquire), static_cast<int>(tercaSerial_.load(std::memory_order_acquire)),
-                scaleMask_.load(std::memory_order_acquire), static_cast<int>(scaleSerial_.load(std::memory_order_acquire))};
+                scaleMask_.load(std::memory_order_acquire), static_cast<int>(scaleSerial_.load(std::memory_order_acquire)),
+                keyScan_.load(std::memory_order_acquire), static_cast<int>(keyScanSerial_.load(std::memory_order_acquire))};
     }
     void setTerca(int upperMask, int root, int cell) noexcept { engine_.setTerca(upperMask, root, cell); }
     void setScaleUppers(int upperMask) noexcept { engine_.setScaleUppers(upperMask); }
 
     void scanObserveOn(int mode, std::uint8_t key) noexcept {
         if (mode == 2) { scanScaleCollected_ |= 1 << (key % 12U); return; }
+        // SILVETON_KEY_SCAN_V1: KEY RANGE - the first key pressed is the limit.
+        if (mode == 3) { if (!scanKeyPending_) { scanKeyValue_ = key; scanKeyPending_ = true; } return; }
         if (scanTercaPending_) return;
         int mask = 0;
         for (int n = 0; n < 128; ++n) if (scanSwallowed_[static_cast<std::size_t>(n)] != 0U) mask |= 1 << (n % 12);
@@ -1409,6 +1705,11 @@ public:
             tercaCell_.store(scanTercaCell_, std::memory_order_release);
             tercaSerial_.fetch_add(1U, std::memory_order_acq_rel);
             scanTercaPending_ = false;
+            scanMode_.store(0, std::memory_order_release);
+        } else if (mode == 3 && scanKeyPending_) {
+            keyScan_.store(scanKeyValue_, std::memory_order_release);
+            keyScanSerial_.fetch_add(1U, std::memory_order_acq_rel);
+            scanKeyPending_ = false;
             scanMode_.store(0, std::memory_order_release);
         } else if (mode == 2 && scanScaleCollected_ != 0) {
             scaleMask_.store(scanScaleCollected_, std::memory_order_release);
@@ -2556,6 +2857,10 @@ private:
     int scanTercaRoot_{0};
     int scanTercaCell_{0};
     int scanScaleCollected_{0};
+    bool scanKeyPending_{false};
+    int scanKeyValue_{0};
+    std::atomic<int> keyScan_{-1};
+    std::atomic<std::uint32_t> keyScanSerial_{0U};
     std::atomic<int> tercaRoot_{-1};
     std::atomic<int> tercaCell_{-1};
     std::atomic<unsigned> tercaSerial_{0U};
@@ -2654,6 +2959,9 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEng
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeAudioNeedsRecovery(JNIEnv*,jobject){return sampler().needsRecovery()?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeEnforceOutputRoute(JNIEnv*,jobject){return sampler().enforceHeadphoneRoute(true)?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT void JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeSetPortaBalance(JNIEnv*,jobject,jint balance){sampler().setPortamentoBalance(static_cast<float>(balance));}
+extern "C" JNIEXPORT void JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeSetPortaNear(JNIEnv*,jobject,jint ms){sampler().setPortamentoNear(static_cast<float>(ms));}
+extern "C" JNIEXPORT jstring JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeBankInfo(JNIEnv* env,jobject,jstring path){std::string err;const auto t=bankInfoText(jstringToUtf8(env,path),err);return env->NewStringUTF(t.empty()?("ERROR\t"+err).c_str():t.c_str());}
+extern "C" JNIEXPORT jstring JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeRemoveBankSounds(JNIEnv* env,jobject,jstring path,jintArray slots){std::set<std::uint16_t> s;if(slots!=nullptr){const jsize n=env->GetArrayLength(slots);std::vector<jint> v(static_cast<std::size_t>(n));env->GetIntArrayRegion(slots,0,n,v.data());for(jint x:v)if(x>=1&&x<=65535)s.insert(static_cast<std::uint16_t>(x));}std::string err;const bool ok=removeBankSounds(jstringToUtf8(env,path),s,err);return env->NewStringUTF(ok?"":(err.empty()?"Delete failed":err).c_str());}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeLoadAudio(JNIEnv* env,jobject,jstring path){return sampler().loadAudioFile(jstringToUtf8(env,path))?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeLoadKmp(JNIEnv* env,jobject,jstring path){return sampler().loadKmp(jstringToUtf8(env,path))?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jintArray JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeImportKmpToLibrary(JNIEnv* env,jobject,jstring path){return intVectorArray(env,sampler().importKmpToLibrary(jstringToUtf8(env,path)));}

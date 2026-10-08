@@ -120,6 +120,22 @@ class SamplerAppController(
         if (save) portaPrefs.edit().putInt("porta_balance", portaBalanceValue).apply()
     }
 
+    // SILVETON_PORTA_NEAR_V1: glide time for neighbouring keys (ms, whole sampler, 0..400).
+    private var portaNearValue = portaPrefs.getInt("porta_near", 90).coerceIn(0, 400)
+    fun portaNear(): Int = portaNearValue
+    fun setPortaNear(value: Int, save: Boolean = true) {
+        portaNearValue = value.coerceIn(0, 400)
+        engine.nativeSetPortaNear(portaNearValue)
+        if (save) portaPrefs.edit().putInt("porta_near", portaNearValue).apply()
+    }
+
+    // SILVETON_KEY_SCAN_V1: KEY RANGE of an Upper from a real key.
+    private var keyScanUpper = -1
+    private var lastKeySerial = -1
+    fun keyScanUpper(): Int = keyScanUpper
+    fun startKeyScan(upper: Int) { keyScanUpper = upper; engine.nativeStartScan(3) }
+    fun cancelKeyScan() { keyScanUpper = -1; engine.nativeStartScan(0) }
+
     // ---------------------------------------------------------------- TERCA / Q (quarter tone)
     // SILVETON_TERCA_V1 / SILVETON_SCALE_V1: every Upper has a T key (plays the TERCA of
     // the SILVETON processor) and a Q key (follows the quarter-tone scale). SCAN sets the
@@ -184,6 +200,22 @@ class SamplerAppController(
             lastScaleSerial = v[5]
             if (v[4] != 0) { scaleMask = v[4] and 0xFFF; saveTercaScale(); applyScale() }
         }
+        if (v.size >= 8) {
+            if (lastKeySerial < 0) lastKeySerial = v[7]
+            if (v[7] != lastKeySerial) {
+                lastKeySerial = v[7]
+                val upper = keyScanUpper
+                keyScanUpper = -1
+                val key = v[6]
+                val s = if (upper in 0..6) upperState(upper) else null
+                if (s != null && key in 0..127) {
+                    // the Upper plays up to the pressed key
+                    val low = if (s.keyLow > key) 0 else s.keyLow
+                    updateUpperMain(upper, s.copy(keyLow = low, keyHigh = key))
+                }
+            }
+        }
+        if (v[0] != 3 && keyScanUpper >= 0) keyScanUpper = -1
         return v[0]
     }
 
@@ -246,6 +278,7 @@ class SamplerAppController(
     fun start(): Boolean {
         if (closed.get()) return false
         engine.nativeSetPortaBalance(portaBalanceValue)
+        engine.nativeSetPortaNear(portaNearValue)
         applyTerca()
         applyScaleUppers()
         if (started.get()) return true
@@ -301,6 +334,7 @@ class SamplerAppController(
             statusChanged(engine.nativeLastTextError().ifBlank { "SILVETON_BANK.sv load failed: ${selected.absolutePath}" })
             return
         }
+        bankPath = selected.absolutePath
         restoreUserStateIfMissing()
         val userState = userStateFile
         if (userState.exists() && !engine.nativeLoadUserPerformanceState(userState.absolutePath)) {
@@ -431,6 +465,45 @@ class SamplerAppController(
             if (!tmp.renameTo(dst)) { tmp.copyTo(dst, overwrite = true); tmp.delete() }
         } catch (_: Exception) {
         }
+    }
+
+    // SILVETON_BANK_INFO_V1: INFO in SETTINGS - what is in SILVETON_BANK.sv, and
+    // DELETE of whole SOUNDs (with the samples only they use) from the bank file.
+    data class BankSound(val slot: Int, val name: String, val samples: Int, val bytes: Long)
+    data class BankInfo(val path: String, val sounds: Int, val samples: Int, val audioBytes: Long, val fileBytes: Long, val list: List<BankSound>)
+    @Volatile private var bankPath: String? = null
+
+    private fun bankFile(): File? {
+        bankPath?.let { p -> val f = File(p); if (f.isFile) return f }
+        val external: File? = appContext.getExternalFilesDir(null)?.let { d -> File(d, "SILVETON_BANK.sv") }
+        val candidates: List<File> = listOfNotNull<File>(
+            File("/storage/emulated/0/SILVETON_BANK.sv"), File("/storage/emulated/0/Download/SILVETON_BANK.sv"),
+            external, File(appContext.filesDir, "SILVETON_BANK.sv"))
+        return candidates.firstOrNull { f: File -> f.isFile && f.canRead() }
+    }
+
+    fun bankInfo(): BankInfo? {
+        val f = bankFile() ?: return null
+        val lines = engine.nativeBankInfo(f.absolutePath).split('\n').filter { it.isNotBlank() }
+        val head = lines.firstOrNull()?.split('\t') ?: return null
+        if (head.size < 5 || head[0] != "TOTAL") return null
+        val list = lines.drop(1).mapNotNull { l ->
+            val c = l.split('\t')
+            if (c.size < 4) null else BankSound(c[0].toIntOrNull() ?: return@mapNotNull null, c[1], c[2].toIntOrNull() ?: 0, c[3].toLongOrNull() ?: 0L)
+        }.sortedBy { it.slot }
+        return BankInfo(f.absolutePath, head[1].toIntOrNull() ?: 0, head[2].toIntOrNull() ?: 0, head[3].toLongOrNull() ?: 0L, head[4].toLongOrNull() ?: 0L, list)
+    }
+
+    /** Deletes the SOUNDs from the bank file and loads the bank again. Null = done, else the reason. */
+    fun deleteBankSounds(slots: List<Int>): String? {
+        val f = bankFile() ?: return "SILVETON_BANK.sv не е намерен"
+        val err = engine.nativeRemoveBankSounds(f.absolutePath, slots.toIntArray())
+        if (err.isNotEmpty()) return err
+        if (!engine.nativeLoadSvBank(f.absolutePath)) return engine.nativeLastTextError().ifBlank { "Банката не се зареди отново" }
+        applyScale()
+        applyTerca()
+        saveUserState()
+        return null
     }
 
     // SILVETON_SET_SAVE_AS_V1: SAVE AS / LOAD of the whole set: every LIST position with

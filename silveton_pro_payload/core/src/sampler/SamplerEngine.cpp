@@ -774,6 +774,12 @@ struct SamplerEngine::Impl {
     std::array<MonoKeys, kUpperCount> mono{};
     std::array<bool, kUpperCount> monoWas{};
     std::atomic<float> portaBalance{11.0F};
+    // SILVETON_PORTA_NEAR_V1: glide time for neighbouring keys (1..3 semitones), ms.
+    std::atomic<float> portaNearMs{90.0F};
+    std::uint64_t frameClock{0U};                                   // frames rendered so far
+    std::array<int, kUpperCount> polyLastKey{};                     // POLY portamento: last key of each Upper
+    std::array<int, kUpperCount> polyAnchorKey{};                   // glide start shared by a chord
+    std::array<std::uint64_t, kUpperCount> polyLastOn{};
     // SILVETON_TERCA_V1 (written by the control thread, read by the audio thread)
     std::atomic<int> tercaConfig{-1};    // -1 off, else upperMask | root << 8 | cell << 12
     std::atomic<int> scaleUppers{0};     // Uppers whose Q key is on
@@ -846,6 +852,7 @@ struct SamplerEngine::Impl {
         for (auto& ch : tercaKey) ch.fill(-1);
         for (auto& ch : tercaRefs) ch.fill(0U);
         tercaApplied = -1;
+        polyLastKey.fill(-1); polyAnchorKey.fill(-1); polyLastOn.fill(0U); frameClock = 0U;
         limiter.reset(sr);
         upperPeakL.fill(0.0F);
         upperPeakR.fill(0.0F);
@@ -934,6 +941,14 @@ void SamplerEngine::setTerca(int upperMask, int root, int cell) noexcept {
 
 void SamplerEngine::setScaleUppers(int upperMask) noexcept {
     impl_->scaleUppers.store(upperMask & 0x7F, std::memory_order_release);
+}
+
+void SamplerEngine::setPortamentoNear(float ms) noexcept {
+    impl_->portaNearMs.store(std::isfinite(ms) ? std::clamp(ms, 0.0F, 400.0F) : 90.0F, std::memory_order_relaxed);
+}
+
+float SamplerEngine::portamentoNear() const noexcept {
+    return impl_->portaNearMs.load(std::memory_order_relaxed);
 }
 
 float SamplerEngine::portamentoBalance() const noexcept {
@@ -1285,9 +1300,21 @@ float portamentoSecFor(const UpperPart& upper) noexcept {
     return std::clamp(upper.portamentoSec, 0.0F, kPortamentoMaxSec);
 }
 
+// SILVETON_POLY_PORTA_V1: POLY stays POLY with portamento ON (chords keep sounding,
+// every new key glides from the key played before it, like Korg Pa).
 UpperVoiceMode effectiveVoiceMode(const UpperPart& upper) noexcept {
-    if (upper.voiceMode == UpperVoiceMode::Poly && portamentoSecFor(upper) > 0.0F) return UpperVoiceMode::Mono;
     return upper.voiceMode;
+}
+
+// SILVETON_PORTA_NEAR_V1: far intervals glide in TIME (as before); neighbouring
+// keys take longer and softer: 1 semitone = NEAR, 2 = 2/3, 3 = 1/3 of the way.
+float glideSecFor(const SamplerEngine::Impl& impl, const UpperPart& upper, double fromKey, double toKey) noexcept {
+    const float base = portamentoSecFor(upper);
+    if (base <= 0.0F || fromKey < 0.0) return base;
+    const double d = std::abs(toKey - fromKey);
+    const double w = d <= 1.0 ? 1.0 : (d >= 4.0 ? 0.0 : (4.0 - d) / 3.0);
+    const float nearSec = impl.portaNearMs.load(std::memory_order_relaxed) / 1000.0F;
+    return nearSec > base ? base + static_cast<float>(w) * (nearSec - base) : base;
 }
 
 // Mode at this event; a key memory never survives a switch between POLY and MONO.
@@ -1357,7 +1384,8 @@ void legatoTo(SamplerEngine::Impl& impl, SamplerEngine::Impl::Voice& v, const Up
 }
 
 void playUpperNote(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineState>& stateOwner, int ui,
-                   const UpperPart& upper, std::uint8_t channel, std::uint8_t key, std::uint8_t velocity) noexcept {
+                   const UpperPart& upper, std::uint8_t channel, std::uint8_t key, std::uint8_t velocity,
+                   double glideFromKey = -1.0, float glideSec = 0.0F) noexcept {
     const auto& global = stateOwner->global;
     const auto& program = *upper.program;
     const UpperVoiceMode mode = effectiveVoiceMode(upper);
@@ -1365,9 +1393,8 @@ void playUpperNote(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
     const bool upperLegato = mode == UpperVoiceMode::Legato;
     bool hadHeldVoice = false;
     float previousAmp = 0.0F;
-    // Portamento ON is played by playPortamentoNote(); here the Upper does not glide.
-    const double glideFromKey = -1.0;
-    const float glideSec = 0.0F;
+    // MONO / LEGATO portamento is played by playPortamentoNote(); POLY portamento
+    // passes glideFromKey / glideSec (SILVETON_POLY_PORTA_V1).
     if (upperMono) {
         for (auto& existing : impl.voices) {
             if (!existing.active || existing.fading || existing.upperIndex != ui) continue;
@@ -1385,7 +1412,7 @@ void playUpperNote(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
                         if (existing.active && !existing.fading && existing.upperIndex == ui && existing.keyHeld &&
                             existing.delayFramesRemaining == 0U && !existing.legatoKeep &&
                             existing.layer == &layer && existing.zone == &zone) {
-                            legatoTo(impl, existing, upper, layer, zone, key, global, glideSec);
+                            legatoTo(impl, existing, upper, layer, zone, key, global, 0.0F);
                             existing.legatoKeep = true;
                             break;
                         }
@@ -1445,7 +1472,7 @@ void playPortamentoNote(SamplerEngine::Impl& impl, const std::shared_ptr<const E
     if (upper.program == nullptr) return;
     const auto& global = stateOwner->global;
     const auto& program = *upper.program;
-    const float glideSec = portamentoSecFor(upper);
+    float glideSec = portamentoSecFor(upper);
     SamplerEngine::Impl::Voice* sounding = nullptr;   // the voice of the held line
     for (auto& v : impl.voices) {
         if (!v.active || v.fading || v.upperIndex != ui || !v.keyHeld || v.delayFramesRemaining > 0U) continue;
@@ -1455,6 +1482,7 @@ void playPortamentoNote(SamplerEngine::Impl& impl, const std::shared_ptr<const E
         // Nothing held: struck normally, no glide (a held line whose recording
         // already ended starts again and glides from the previous key).
         const double fromKey = (keyWasHeld && previousKey >= 0) ? static_cast<double>(previousKey) : -1.0;
+        glideSec = glideSecFor(impl, upper, fromKey, static_cast<double>(key));
         for (const auto& layer : program.layers) {
             if (!layer.matches(playKeyFor(upper, global, key), velocity)) continue;
             for (const auto& zone : layer.multisample->zones) {
@@ -1469,6 +1497,7 @@ void playPortamentoNote(SamplerEngine::Impl& impl, const std::shared_ptr<const E
     }
     // A key is held: one continuous sound glides to the new key in exactly TIME.
     const double fromPitch = static_cast<double>(sounding->key) + 12.0 * std::log2(sounding->ratio / sounding->targetRatio);
+    glideSec = glideSecFor(impl, upper, fromPitch, static_cast<double>(key));
     const float previousAmp = sounding->ampEnv.value;
     for (auto& v : impl.voices) if (v.upperIndex == ui) v.legatoKeep = false;
     for (const auto& layer : program.layers) {
@@ -1633,6 +1662,21 @@ void processEvent(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineS
                         continue;
                     }
                 }
+                if (portamentoSecFor(upper) > 0.0F) {
+                    // SILVETON_POLY_PORTA_V1: glide from the key played before, only while
+                    // a key of this Upper is held; keys of one chord share the same start.
+                    const auto u = static_cast<std::size_t>(ui);
+                    bool held = false;
+                    for (const auto& v : impl.voices) if (v.active && !v.fading && v.upperIndex == ui && v.keyHeld) { held = true; break; }
+                    const bool sameChord = impl.frameClock - impl.polyLastOn[u] < static_cast<std::uint64_t>(0.030 * impl.sampleRate);
+                    if (!sameChord) impl.polyAnchorKey[u] = held ? impl.polyLastKey[u] : -1;
+                    const double from = impl.polyAnchorKey[u];
+                    impl.polyLastKey[u] = key;
+                    impl.polyLastOn[u] = impl.frameClock;
+                    playUpperNote(impl, stateOwner, ui, upper, e.channel, key, e.data2,
+                                  from, glideSecFor(impl, upper, from, static_cast<double>(key)));
+                    continue;
+                }
                 playUpperNote(impl, stateOwner, ui, upper, e.channel, key, e.data2);
             }
             break;
@@ -1789,6 +1833,7 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
 
     RealtimeEvent ev{};
     while (events_.pop(ev)) processEvent(*impl_, current, ev);
+    impl_->frameClock += frames;
 
     // Live TONE values (ADSR times, SUSTAIN, CUTOFF, RESONANCE) of the current Upper
     // state, evaluated once per block for every sounding voice.

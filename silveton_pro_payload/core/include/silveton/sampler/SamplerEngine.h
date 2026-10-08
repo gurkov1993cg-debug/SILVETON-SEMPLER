@@ -101,6 +101,8 @@ public:
     // Third of `key` for a tonality (exactly the processor's rule), -1 = none.
     [[nodiscard]] static int tercaHarmony(int root, int cell, int key) noexcept;
     [[nodiscard]] float portamentoBalance() const noexcept;
+    void setPortamentoNear(float ms) noexcept;            // SILVETON_PORTA_NEAR_V1
+    [[nodiscard]] float portamentoNear() const noexcept;
 
     // Control thread publishes a fully prepared immutable graph. The audio thread
     // adopts it at a block boundary; Direct ALSA is never stopped for SOUND/COMBI changes.

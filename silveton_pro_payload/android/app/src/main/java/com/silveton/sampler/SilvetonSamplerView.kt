@@ -66,7 +66,8 @@ class SilvetonSamplerView(
     private class PairHit(val a: RectF, val b: RectF, val reset: () -> Unit)
     private val pairHits = ArrayList<PairHit>(8)
     private var pairConsumed = false
-    private var settingsTab = 0          // 0 ОБЩИ, 1 MIDI
+    private var settingsTab = 0          // 0 ОБЩИ, 1 MIDI, 2 INFO
+    private var bankInfoCache: SamplerAppController.BankInfo? = null
     private var scanMode = 0             // 0 none, 1 TERCA scan, 2 SCALE scan
     private var copiedUpper: SamplerAppController.UpperState? = null
     private var copiedFrom = -1
@@ -485,7 +486,9 @@ class SilvetonSamplerView(
         listLongHits.clear()
         val telemetryNow = android.os.SystemClock.uptimeMillis()
         if (lastTelemetryMs == 0L || telemetryNow - lastTelemetryMs >= 50L) {
+            val keyScanWas = sampler.keyScanUpper()
             scanMode = sampler.pollScan()
+            if (keyScanWas >= 0 && sampler.keyScanUpper() < 0) refreshUpper(keyScanWas)
             frameAudioStatus = sampler.audioStatus()
             frameUpperMeters = sampler.upperMeters()
             frameMidiStatus = sampler.midiStatus()
@@ -636,7 +639,7 @@ class SilvetonSamplerView(
         // Status LCD.
         val st = RectF(684f, 14f, 1206f, 96f)
         lcd(c, st)
-        val colW = (st.width() - 32f) / 3f
+        val colW = (st.width() - 32f) / 4f
         fun cell(col: Int, row: Int, label: String, value: String, valueColor: Int) {
             val x = st.left + 16f + col * colW
             val ly = st.top + 20f + row * 38f
@@ -652,12 +655,21 @@ class SilvetonSamplerView(
         // SILVETON_PORTA_BALANCE_V2: PORTA BALANCE is back (3..40 ms, whole sampler):
         // how softly the pitch rounds into and out of every glide. Tap = change.
         val bal = sampler.portaBalance()
-        cell(2, 1, "PORTA U${selectedUpper + 1}", (if (porta <= 0f) "OFF" else "${round(porta * 1000f).toInt()}ms") + " B$bal", C_LCD_VALUE)
-        val balR = RectF(st.left + 16f + 2f * colW, st.top + 40f, st.right - 4f, st.bottom - 2f)
+        cell(2, 1, "PORTA U${selectedUpper + 1}", if (porta <= 0f) "OFF" else "${round(porta * 1000f).toInt()} ms", C_LCD_VALUE)
+        // SILVETON_PORTA_NEAR_V1: P.BALANCE and TIME for neighbouring keys - tap to set.
+        cell(3, 0, "P.BALANCE", "$bal ms", C_LCD_VALUE)
+        cell(3, 1, "TIME СЪСЕДНИ", "${sampler.portaNear()} ms", C_LCD_VALUE)
+        val balR = RectF(st.left + 16f + 3f * colW, st.top + 4f, st.right - 4f, st.top + 40f)
         hit(balR, { _, _ ->
             val old = sampler.portaBalance()
             showNumber("PORTA BALANCE (ms)", old.toFloat(), 3f, 40f, 0,
                 restore = { sampler.setPortaBalance(old); invalidate() }) { sampler.setPortaBalance(round(it).toInt()); invalidate() }
+        })
+        val nearR = RectF(st.left + 16f + 3f * colW, st.top + 42f, st.right - 4f, st.bottom - 2f)
+        hit(nearR, { _, _ ->
+            val old = sampler.portaNear()
+            showNumber("TIME СЪСЕДНИ ТОНОВЕ (ms)", old.toFloat(), 0f, 400f, 0,
+                restore = { sampler.setPortaNear(old); invalidate() }) { sampler.setPortaNear(round(it).toInt()); invalidate() }
         })
 
         // SILVETON_LIST_GRID_V1: BLENDS / WRITE / + LIST are gone - a COMBI is stored
@@ -789,8 +801,24 @@ class SilvetonSamplerView(
         hit(tR, { _, _ -> sampler.toggleTerca(i); invalidate() })
         hit(qR, { _, _ -> sampler.toggleQuarter(i); invalidate() })
         val rangeR = RectF(qR.right + 4f, T + 316f, r.right - 8f, T + 354f)
-        lightKey(c, rangeR, "${noteName(s.keyLow)}–${noteName(s.keyHigh)}", size = 10f, radius = 6f)
-        hit(rangeR, { _, _ -> selectedUpper = i; showKeyRange(i, upperStates[i] ?: s) })
+        // SILVETON_KEY_SCAN_V1: tap = SCAN, then press a key: this Upper plays up to it.
+        // Tap again = cancel, double tap = whole keyboard.
+        if (sampler.keyScanUpper() == i) {
+            val blink = (android.os.SystemClock.uptimeMillis() / 300L) % 2L == 0L
+            stripToggle(c, rangeR, "НАТИСНИ…", true, if (blink) C_ORANGE else C_AMBER, size = 10f)
+            postInvalidateDelayed(150L)
+        } else {
+            lightKey(c, rangeR, "${noteName(s.keyLow)}–${noteName(s.keyHigh)}", size = 10f, radius = 6f)
+        }
+        hit(rangeR, { _, _ ->
+            selectedUpper = i
+            if (sampler.keyScanUpper() == i) sampler.cancelKeyScan() else sampler.startKeyScan(i)
+            invalidate()
+        }, {
+            sampler.cancelKeyScan()
+            val cur = upperStates[i] ?: s
+            commitMain(i, cur.copy(keyLow = 0, keyHigh = 127))
+        })
 
         if (!live) {
             // Switched-off / empty UPPER: veil it, controls stay usable.
@@ -1730,14 +1758,15 @@ class SilvetonSamplerView(
 
     private fun drawSettings(c: Canvas) {
         // SILVETON_GUI_V3: ОБЩИ / MIDI / SCALE · ТЕРЦА
-        val tabs = arrayOf("ОБЩИ", "MIDI")
+        val tabs = arrayOf("ОБЩИ", "MIDI", "INFO")
         for (t in tabs.indices) {
             val tr = RectF(112f + t * 226f, 108f, 332f + t * 226f, 146f)
             stripToggle(c, tr, tabs[t], settingsTab == t, C_AMBER, size = 14f)
-            hit(tr, { _, _ -> settingsTab = t })
+            hit(tr, { _, _ -> settingsTab = t; if (t == 2) bankInfoCache = sampler.bankInfo() })
         }
         when (settingsTab) {
             1 -> { drawMidiSettings(c, RectF(112f, 154f, 1326f, 786f)); return }
+            2 -> { drawBankInfo(c, RectF(112f, 154f, 1326f, 786f)); return }
         }
         val g = globalState ?: sampler.globalUiState()?.also { globalState = it } ?: return
         val b = RectF(112f, 154f, 1326f, 786f)
@@ -1775,6 +1804,85 @@ class SilvetonSamplerView(
                 }
             }
         }
+    }
+
+    // SILVETON_BANK_INFO_V1: what is in SILVETON_BANK.sv, DELETE of whole SOUNDs.
+    private fun mb(bytes: Long): String = "%.1f MB".format(bytes / 1048576.0)
+
+    private fun drawBankInfo(c: Canvas, b: RectF) {
+        board(c, b)
+        val info = bankInfoCache ?: sampler.bankInfo()?.also { bankInfoCache = it }
+        val box = RectF(b.left + 24f, b.top + 24f, b.left + 640f, b.top + 300f)
+        lcd(c, box)
+        if (info == null) {
+            text(c, "SILVETON_BANK.sv НЕ Е НАМЕРЕН", box.left + 24f, box.top + 60f, 22f, C_LCD_BAD, face = faceMono)
+            return
+        }
+        val rows = listOf(
+            "ЗВУЦИ (SOUND)" to info.sounds.toString(),
+            "СЕМПЛИ" to info.samples.toString(),
+            "АУДИО" to mb(info.audioBytes),
+            "ФАЙЛ" to mb(info.fileBytes))
+        rows.forEachIndexed { k, (label, value) ->
+            val y = box.top + 56f + k * 56f
+            text(c, label, box.left + 24f, y, 14f, C_LCD_DIM, face = faceMono, spacing = 0.15f)
+            text(c, value, box.right - 24f, y, 26f, C_LCD, right = true, face = faceMono)
+        }
+        text(c, info.path, b.left + 24f, box.bottom + 30f, 12f, C_LABEL_GREY, face = faceMono, maxWidth = b.width() - 48f)
+        val big = info.list.sortedByDescending { it.bytes }.take(8)
+        val side = RectF(b.left + 670f, b.top + 24f, b.right - 24f, b.top + 470f)
+        section(c, side, "НАЙ-ГОЛЕМИ ЗВУЦИ")
+        big.forEachIndexed { k, snd ->
+            val y = side.top + 64f + k * 48f
+            text(c, "%03d  %s".format(snd.slot, snd.name), side.left + 20f, y, 17f, C_INK, face = faceBold, maxWidth = side.width() - 190f)
+            text(c, mb(snd.bytes), side.right - 20f, y, 17f, C_INK_SOFT, right = true, face = faceMonoBold)
+        }
+        val delR = RectF(b.left + 24f, b.bottom - 90f, b.left + 520f, b.bottom - 30f)
+        accentKey(c, delR, "ИЗБЕРИ ЗВУЦИ ЗА ТРИЕНЕ", true)
+        hit(delR, { _, _ -> showDeleteSounds(info) })
+        val refR = RectF(delR.right + 16f, b.bottom - 90f, delR.right + 236f, b.bottom - 30f)
+        lightKey(c, refR, "ОБНОВИ", size = 15f)
+        hit(refR, { _, _ -> bankInfoCache = sampler.bankInfo(); invalidate() })
+    }
+
+    private fun showDeleteSounds(info: SamplerAppController.BankInfo) {
+        if (info.list.isEmpty()) return
+        val labels = info.list.map { "%03d   %s   ·   %d семпъла   ·   %s".format(it.slot, it.name, it.samples, mb(it.bytes)) }.toTypedArray()
+        val checked = BooleanArray(labels.size)
+        AlertDialog.Builder(context)
+            .setTitle("ТРИЕНЕ НА ЗВУЦИ ОТ БАНКАТА")
+            .setMultiChoiceItems(labels, checked) { _, which, isChecked -> checked[which] = isChecked }
+            .setPositiveButton("ИЗТРИЙ") { _, _ ->
+                val chosen = info.list.filterIndexed { k, _ -> checked[k] }
+                if (chosen.isEmpty()) return@setPositiveButton
+                val freed = chosen.sumOf { it.bytes }
+                AlertDialog.Builder(context)
+                    .setTitle("ИЗТРИВАНЕ НА ${chosen.size} ЗВУКА")
+                    .setMessage("Звуците се трият от SILVETON_BANK.sv завинаги (заедно със семплите, които само те ползват, до ${mb(freed)}).\n" +
+                        "Блендите, които ги ползват, остават без тях.\nДа изтрия ли?")
+                    .setPositiveButton("ДА, ИЗТРИЙ") { _, _ -> runDeleteSounds(chosen.map { it.slot }) }
+                    .setNegativeButton("НЕ", null)
+                    .show()
+            }
+            .setNegativeButton("CANCEL", null)
+            .show()
+    }
+
+    private fun runDeleteSounds(slots: List<Int>) {
+        val wait = AlertDialog.Builder(context).setTitle("ТРИЕНЕ…").setMessage("Банката се записва наново. Не изключвай таблета.")
+            .setCancelable(false).create()
+        wait.show()
+        Thread({
+            val err = sampler.deleteBankSounds(slots)
+            post {
+                wait.dismiss()
+                bankInfoCache = sampler.bankInfo()
+                cachedCombiName = sampler.combiName()
+                refreshAllUppers()
+                refreshListCache()
+                flash(if (err == null) "ИЗТРИТИ: ${slots.size} ЗВУКА" else "ГРЕШКА: $err")
+            }
+        }, "SilvetonBankDelete").start()
     }
 
     private fun globalStep(i: Int): Float = when (i) { 1, 8, 9, 10, 11 -> 1f; else -> 0.1f }

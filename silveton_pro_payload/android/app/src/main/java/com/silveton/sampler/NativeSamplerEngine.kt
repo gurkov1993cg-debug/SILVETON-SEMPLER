@@ -18,6 +18,9 @@ class NativeSamplerEngine {
     external fun nativeEnforceOutputRoute(): Boolean
     /** PORTA BALANCE of the SILVETON keyboard processor (3..40, default 11). */
     external fun nativeSetPortaBalance(balance: Int)
+    external fun nativeSetPortaNear(ms: Int)
+    external fun nativeBankInfo(path: String): String
+    external fun nativeRemoveBankSounds(path: String, slots: IntArray): String
     /** SILVETON_SCAN_V1: 1 = TERCA scan, 2 = SCALE scan, 0 = cancel. */
     external fun nativeStartScan(mode: Int)
     /** [scanMode, tercaRoot, tercaCell, tercaSerial, scaleMask, scaleSerial]. */

@@ -79,16 +79,11 @@ jobs:
           python3 "$CM_BUILD_DIR/codemagic_live_midi_visual_skin.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_final_stability_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_force_keyboard_test_patch.py" "$PROJECT_DIR"
-          # Remove obsolete TEST EP / stage-piano UI after the keyboard test patch.
-          python3 "$CM_BUILD_DIR/codemagic_remove_test_piano.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_gui_contract_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_kotlin_compile_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_48khz_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_live_performance_indicators.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_xrun_stability_fix.py" "$PROJECT_DIR"
-          # Apply remaining note-to-audio/output latency fixes before the final crackle pass.
-          python3 "$CM_BUILD_DIR/codemagic_live_note_latency_fix.py" "$PROJECT_DIR"
-          python3 "$CM_BUILD_DIR/codemagic_ultra_low_latency_output_fix.py" "$PROJECT_DIR"
           # Crackle fix works on the fully generated tree; PRO SOUND follows it and must stay LAST.
           python3 "$CM_BUILD_DIR/codemagic_crackle_fix.py" "$PROJECT_DIR"
           # PRO SOUND (MONO/LEGATO, ADSR, CUTOFF, quick re-enter) works on the crackle-fixed tree.

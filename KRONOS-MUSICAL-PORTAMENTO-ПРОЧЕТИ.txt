@@ -1,0 +1,36 @@
+SILVETON SAMPLER — KRONOS MUSICAL PORTAMENTO (12 October 2026)
+
+FULL SOURCE PACKAGE based on SILVETON-SEMPLER-PORTAMENTO-TIME-FIX-FULL.zip.
+
+KRONOS MODE: musical/controlled glide, not the former constant-speed pitch line:
+ * smooth but firm start and arrival, softer still for intervals 1..3 semitones;
+ * glide is in musical semitones and reaches its precise target at the chosen TIME;
+ * mid-glide note switches preserve bounded momentum without pitch overshoot;
+ * TIME remains one duration per interval; RATE remains duration-per-octave,
+   with an up-to-55ms minimum for near-note glides, not exceeding base TIME;
+ * FINGERED and non-FINGERED behaviors, MONO/LEGATO/POLY modes are preserved;
+ * new regression coverage for 1-semitone changes, first note, TIME/RATE,
+   FINGERED, and eventual exact pitch.
+
+SILVETON mode, SILVETON TIME GUI routing, 96k/96x2 Direct ALSA, MIDI,
+PRO SOUND, all sound/sample banks, and automatic Release APK workflow remain.
+
+INSTALL: unzip THIS outer package; upload the contained files and folders
+into your existing project repository root, replacing same-named files.
+The two inner SILVETON-SEMPLER-source*.zip files must remain ZIPs.
+Do not delete other repo files.
+
+STARTING SOUND CHECK (not hardcoded defaults): KRONOS -> MONO or LEGATO,
+TIME ~26..38, TIME mode, FINGERED ON for glide only when two keys overlap.
+Hold C4, then press D4: sound should glide softly and land in tune.
+In RATE mode adjacent keys take at least up to 55 ms with regular TIME values.
+
+LOCAL VERIFICATION
+ * Patch-chain preflight on extracted source ZIP: PASS (all source guards).
+ * CMake + C++ tests with Debug assertions: 3/3 PASS, including KRONOS cases.
+ * GitHub workflow/Codemagic YAML syntax parse: PASS.
+ * Full Android APK build and device listening test: NOT performed.
+ * No internet, GitHub writes or repository modifications were performed.
+
+NOTE: this is a custom KRONOS-named mode in SILVETON, not a claim to reproduce
+Korg proprietary software exactly.

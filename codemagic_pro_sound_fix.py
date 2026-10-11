@@ -140,6 +140,29 @@ def main():
             print("ERROR: " + rel + " is not the file this patch was made for (hash differs)", file=sys.stderr); return 1
         open(target, "wb").write(new)
         print("patched: " + rel)
+    # Regression guard: a GUI-only TIME update previously showed the new value
+    # but never reached the sampler engine (commitTone ignores portamentoSec).
+    view_file = os.path.join(project, "android/app/src/main/java/com/silveton/sampler/SilvetonSamplerView.kt")
+    with open(view_file, encoding="utf-8") as f:
+        text = f.read()
+    porta_view = text.split("private fun drawPorta(", 1)[-1].split("// PORTAMENTO TIME like", 1)[0]
+    if ("SILVETON_PORTA_UI_ROUTE_V2" not in porta_view
+            or porta_view.count("commitTune(currentUpper(s).copy(portamentoSec =") != 3
+            or "commitTone(currentUpper(s).copy(portamentoSec =" in porta_view):
+        print("ERROR: SILVETON PORTA TIME GUI is disconnected from nativeUpdateUpperTune", file=sys.stderr)
+        return 1
+    print("PASS: SILVETON PORTA TIME onChange/exact/reset all reach nativeUpdateUpperTune")
+    # KRONOS mode must use the musical curve in the *generated* audio engine.
+    engine_file = os.path.join(project, "core/src/sampler/SamplerEngine.cpp")
+    with open(engine_file, encoding="utf-8") as f:
+        engine_text = f.read()
+    if ("SILVETON_KRONOS_MUSICAL_PORTA_V2" not in engine_text
+            or "if (v.glideKronos)" not in engine_text
+            or "const double progress = t + ease * (smooth - t);" not in engine_text
+            or "const float scaled = base *" not in engine_text):
+        print("ERROR: KRONOS musical portamento missing from generated audio engine", file=sys.stderr)
+        return 1
+    print("PASS: KRONOS musical TIME/RATE easing installed in native engine")
     print("SILVETON_PRO_SOUND_V1 applied")
     return 0
 

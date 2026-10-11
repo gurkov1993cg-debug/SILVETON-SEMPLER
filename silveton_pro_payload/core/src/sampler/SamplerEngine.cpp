@@ -1373,7 +1373,7 @@ struct SamplerEngine::Impl {
         double glideStartVelocity{0.0}; // initial semitone movement over whole glide
         double glideLastStep{0.0};      // last audible semitone change per sample
         bool pitchGliding{false};
-        bool glideLinear{false};       // SILVETON_PORTA_MODES_V1: KRONOS = straight line, no rounding
+        bool glideKronos{false};       // SILVETON_KRONOS_MUSICAL_PORTA_V2: controlled smooth pitch shape
         // SILVETON_TONE_V2
         float velNorm{1.0F};
         float filterEnvValue{0.0F};    // 1 at note on, decays to 0 in FILTER ENV time
@@ -2087,8 +2087,13 @@ float glideSecFor(const SamplerEngine::Impl& impl, const UpperPart& upper, doubl
     if (base <= 0.0F || fromKey < 0.0) return base;
     const double d = std::abs(toKey - fromKey);
     if (upper.portaMode == PortamentoMode::Kronos) {
-        // TIME: the same time for every interval; RATE: the time is per octave.
-        return upper.portaRateMode ? base * static_cast<float>(std::max(d, 0.05) / 12.0) : base;
+        // TIME: one duration for every interval. RATE: duration per octave.
+        // A small, bounded near-note floor avoids almost instantaneous jumps
+        // when using RATE with one or two semitones. Never extend a very short
+        // user TIME setting beyond that setting, and never affect TIME mode.
+        if (!upper.portaRateMode) return base;
+        const float scaled = base * static_cast<float>(std::max(d, 0.05) / 12.0);
+        return std::max(scaled, std::min(base, 0.055F));
     }
     const double w = d <= 1.0 ? 1.0 : (d >= 4.0 ? 0.0 : (4.0 - d) / 3.0);
     const float nearSec = impl.portaNearMs.load(std::memory_order_relaxed) / 1000.0F;
@@ -2122,7 +2127,9 @@ void beginGlide(SamplerEngine::Impl::Voice& v, double newTargetRatio, std::uint3
     // during very fast legato runs.
     const double carried = v.pitchGliding ? v.glideLastStep * static_cast<double>(total) : 0.0;
     const double desiredDirection = -start;
-    const double maxCarry = 2.0 * std::abs(start);
+    // KRONOS changes keep the audible slope but never let a fast interruption
+    // overshoot the target. SILVETON retains its existing wider momentum bound.
+    const double maxCarry = (v.glideKronos ? 0.45 : 2.0) * std::abs(start);
     const double velocity = (carried * desiredDirection > 0.0)
         ? std::copysign(std::min(std::abs(carried), maxCarry), desiredDirection) : 0.0;
     v.glideStartVelocity = velocity;
@@ -2239,7 +2246,7 @@ void playUpperNote(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
             }
         }
     }
-    const bool linear = upper.portaMode == PortamentoMode::Kronos;
+    const bool kronos = upper.portaMode == PortamentoMode::Kronos;
     forEachSoundZone(upper, global, key, velocity, [&](int s, const ProgramLayer& layer, const SampleZone& zone) noexcept {
         if (upperLegato && hadHeldVoice) {
             for (const auto& existing : impl.voices) {
@@ -2250,7 +2257,7 @@ void playUpperNote(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
         auto* v = chooseVoice(impl);
         startVoice(impl, *v, upper, layer, zone, ui, channel, key, velocity, global, stateOwner, s);
         v->mono = upperMono;
-        v->glideLinear = linear;
+        v->glideKronos = kronos;
         startPortamentoGlide(impl, *v, glideFromKey, glideSec);
         if (upperLegato && hadHeldVoice) {
             v->ampEnv.value = previousAmp;
@@ -2276,19 +2283,19 @@ void playPortamentoNote(SamplerEngine::Impl& impl, const std::shared_ptr<const E
         if (!v.active || v.fading || v.upperIndex != ui || !v.keyHeld || v.delayFramesRemaining > 0U) continue;
         if (sounding == nullptr || v.age > sounding->age) sounding = &v;
     }
-    const bool linear = upper.portaMode == PortamentoMode::Kronos;
+    const bool kronos = upper.portaMode == PortamentoMode::Kronos;
     if (!keyWasHeld || sounding == nullptr) {
         // Nothing held: struck normally, no glide (a held line whose recording
         // already ended starts again and glides from the previous key).
         // KRONOS (not Fingered): glides from the last key even when nothing is held.
         double fromKey = (keyWasHeld && previousKey >= 0) ? static_cast<double>(previousKey) : -1.0;
-        if (linear && !upper.portaFingered && fromKey < 0.0) fromKey = static_cast<double>(impl.polyLastKey[static_cast<std::size_t>(ui)]);
+        if (kronos && !upper.portaFingered && fromKey < 0.0) fromKey = static_cast<double>(impl.polyLastKey[static_cast<std::size_t>(ui)]);
         glideSec = glideSecFor(impl, upper, fromKey, static_cast<double>(key));
         forEachSoundZone(upper, global, key, velocity, [&](int s, const ProgramLayer& layer, const SampleZone& zone) noexcept {
             auto* v = chooseVoice(impl);
             startVoice(impl, *v, upper, layer, zone, ui, channel, key, velocity, global, stateOwner, s);
             v->mono = true;
-            v->glideLinear = linear;
+            v->glideKronos = kronos;
             startPortamentoGlide(impl, *v, fromKey, glideSec);
         });
         impl.polyLastKey[static_cast<std::size_t>(ui)] = key;
@@ -2307,7 +2314,7 @@ void playPortamentoNote(SamplerEngine::Impl& impl, const std::shared_ptr<const E
         }
         if (keep != nullptr) {
             // the same recording keeps sounding and only moves its pitch
-            keep->glideLinear = linear;
+            keep->glideKronos = kronos;
             legatoTo(impl, *keep, upper, layer, zone, key, global, glideSec);
             keep->legatoKeep = true;
             return;
@@ -2316,7 +2323,7 @@ void playPortamentoNote(SamplerEngine::Impl& impl, const std::shared_ptr<const E
         auto* v = chooseVoice(impl);
         startVoice(impl, *v, upper, layer, zone, ui, channel, key, velocity, global, stateOwner, s);
         v->mono = true;
-        v->glideLinear = linear;
+        v->glideKronos = kronos;
         startPortamentoGlide(impl, *v, fromPitch, glideSec);
         v->ampEnv.value = previousAmp;
         v->ampEnv.stage = AmpEnv::Stage::Decay;
@@ -2882,9 +2889,22 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
                 if (v.glideFramesRemaining > 0U) {
                     --v.glideFramesRemaining;
                     const double t = 1.0 - static_cast<double>(v.glideFramesRemaining) / static_cast<double>(v.glideTotalFrames);
-                    if (v.glideLinear) {
-                        // Preserve the intentional straight-line KRONOS glide.
-                        raw = v.glideStartSemis * (1.0 - t);
+                    if (v.glideKronos) {
+                        // SILVETON_KRONOS_MUSICAL_PORTA_V2: a firmer, more natural
+                        // ease than SILVETON's velvet S-shape, with especially
+                        // gentle starts/arrivals on adjacent keys. Use semitones
+                        // (not Hz), no low-pass delay and EXACT arrival in TIME.
+                        const double near = std::clamp(
+                            (5.0 - std::abs(v.glideStartSemis)) / 4.0, 0.0, 1.0);
+                        const double ease = 0.66 + 0.22 * near;
+                        const double smooth = t * t * (3.0 - 2.0 * t);
+                        const double progress = t + ease * (smooth - t);
+                        // C1 continuity during overlapping, rapid legato notes.
+                        // End-slope is independent of inherited movement.
+                        const double inv = 1.0 - t;
+                        const double velocityBasis = t * inv * inv;
+                        raw = v.glideStartSemis * (1.0 - progress)
+                            + v.glideStartVelocity * velocityBasis;
                     } else {
                         // Closer keys get the gentlest curve, with softer entrance
                         // and a musically clean, exactly timed arrival. Quintic

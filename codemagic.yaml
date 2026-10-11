@@ -141,6 +141,7 @@ workflows:
           require_source 'SILVETON_ALL_MIDI_PORTS_V1' "$BRIDGE"
           require_source 'SILVETON_SOFT_GLIDE_V1' "$ENGINE"
           require_source 'SILVETON_SILK_PORTA_V1' "$ENGINE"
+          require_source 'SILVETON_KRONOS_MUSICAL_PORTA_V2' "$ENGINE"
           require_source 'sampler.setPortaBalance(round(nv).toInt())' "$VIEW"
           require_source 'impl_->portaBalance.store' "$ENGINE"
           require_source 'impl_->portaBalance.load' "$ENGINE"

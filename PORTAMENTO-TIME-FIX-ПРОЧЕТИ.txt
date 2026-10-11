@@ -1,0 +1,33 @@
+SILVETON SAMPLER — PORTAMENTO TIME FIX (12.10.2026)
+
+ROOT CAUSE (verified from actual source):
+The SILVETON PORTAMENTO TIME knob in SilvetonSamplerView.kt
+called commitTone(), which invokes nativeUpdateUpperTone() and does NOT
+send portamentoSec. The number on the GUI changed but the real engine
+never received the new portamento TIME. This explains the unresponsive
+SILVETON mode.
+
+FIX:
+All three SILVETON PORTA TIME paths (drag, exact number, reset) now use
+commitTune() -> SamplerAppController.updateUpperTune() ->
+nativeUpdateUpperTune() -> SamplerAudioBridge.updateUpperTune() ->
+UpperPart.portamentoSec.
+
+A regression guard in codemagic_pro_sound_fix.py fails the build
+if any of these three paths are disconnected again.
+The SILK easing algorithm, KRONOS, BALANCE, TIME СЪСЕДНИ, Direct ALSA, MIDI,
+and the direct-download APK GitHub Releases workflow are left untouched.
+
+HOW TO INSTALL:
+Extract this outer ZIP and upload its CONTENTS to the repository root,
+replacing identically named files. Do not extract the internal
+SILVETON-SEMPLER-source-fixed.zip or source.zip archives.
+
+TEST ON TABLET:
+1. Load a playable SOUND on the intended UPPER.
+2. Select PORTA -> SILVETON and set TIME to 60 ms (not OFF).
+3. Hold C4 while pressing D4: pitch should glide; try TIME 10 then 100 ms.
+4. When keys do not overlap SILVETON does NOT glide by current design.
+
+Verified: the actual Kotlin->JNI update chain, source patch and guard logic.
+No physical Android APK/test or GitHub changes performed here.

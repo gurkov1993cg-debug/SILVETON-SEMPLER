@@ -2303,9 +2303,18 @@ void testUpperEq5() {
     }
 }
 
+// KRONOS frequency probes use >= 18 ms windows, because an octave glide
+// starting near 220 Hz cannot yield two upward zero crossings in 5 ms.
+double kronosHzAt(const std::vector<float>& x, double ms) {
+    const auto center=static_cast<std::size_t>(ms*96.0);
+    const auto lo=center>900U ? center-900U : 0U;
+    const auto hi=std::min(x.size(), center+900U);
+    return measureHz(x,lo,hi,96000.0);
+}
+
 // ---------------------------------------------------------------- SILVETON_PORTA_MODES_V1
 void testKronosPortamento() {
-    // TIME mode, POLY, nothing held: the new note still glides from the last key, in a straight line
+    // TIME mode, POLY, nothing held: the new note glides musically from the previous key
     auto st=makeToneState(UpperVoiceMode::Poly);
     st->combi.uppers[0].portaMode=PortamentoMode::Kronos; st->combi.uppers[0].portaTime=40U;   // ~0.39 s
     const double t=5.0*std::pow(40.0/127.0,2.2);
@@ -2315,8 +2324,16 @@ void testKronosPortamento() {
     const double half=12.0*std::log2(glideHzAt(x,t*500.0)/220.0);
     assert(half>5.0 && half<7.0);                       // linear: half way at half time
     assert(std::abs(glideHzAt(x,t*1000.0+60.0)-440.0)<5.0);
-    const double q=12.0*std::log2(glideHzAt(x,t*250.0)/220.0);
-    assert(q>2.2 && q<3.8);                             // and a quarter of the way at a quarter of the time
+    const double q=12.0*std::log2(kronosHzAt(x,t*250.0)/220.0);
+    assert(q>1.9 && q<2.8);                             // eased at quarter-time, not mechanically linear
+    // First note after reset must begin AT its own pitch (no false previous key).
+    SamplerEngine first; first.prepare(96000.0, 96U); first.setState(st);
+    first.postNoteOn(0U, 69U, 100U);
+    const auto initial = renderLeft(first, 35);
+    assert(std::abs(kronosHzAt(initial, 18.0)-440.0)<5.0);
+    // Curve genuinely differs from the previous constant-speed ramp while
+    // reaching the exact target without a drifting filter tail.
+    assert(q < 2.8);
     // Fingered: with nothing held there is no glide
     auto fing=std::make_shared<EngineState>(*st); fing->combi.uppers[0].portaFingered=true;
     SamplerEngine f; f.prepare(96000.0,96U); f.setState(fing);
@@ -2326,23 +2343,39 @@ void testKronosPortamento() {
     // Fingered with a key held: glides
     f.postNoteOn(0U,57U,100U); auto y2=renderLeft(f,100);
     assert(glideHzAt(y2,40.0)>240.0);   // still above 220 Hz on the way down
-    // RATE mode: an octave takes TIME, a semitone takes TIME/12
+    // RATE mode: an octave takes TIME, short notes have a musical 55 ms floor
     auto rate=std::make_shared<EngineState>(*st); rate->combi.uppers[0].portaRateMode=true;
     SamplerEngine g; g.prepare(96000.0,96U); g.setState(rate);
     g.postNoteOn(0U,69U,100U); renderLeft(g,30); g.postNoteOff(0U,69U); renderLeft(g,30);
     g.postNoteOn(0U,70U,100U); auto z=renderLeft(g,200);
-    assert(std::abs(glideHzAt(z,t/12.0*1000.0+40.0)-466.16)<4.0);   // arrived after TIME/12
+    assert(kronosHzAt(z,18.0)<460.0);                  // still gliding at 18ms (not abrupt)
+    assert(std::abs(kronosHzAt(z,95.0)-466.16)<4.0); // finished cleanly after 55ms
     // POLY stays POLY in KRONOS mode
     SamplerEngine h; h.prepare(96000.0,96U); h.setState(st);
     h.postNoteOn(0U,60U,100U); renderLeft(h,10); h.postNoteOn(0U,64U,100U); renderLeft(h,10); h.postNoteOn(0U,67U,100U); renderLeft(h,10);
     assert(h.activeVoiceCount()==3U);
-    // MONO in KRONOS mode: a held line glides in a straight line
+    // MONO in KRONOS mode: a held line glides smoothly
     auto mono=std::make_shared<EngineState>(*st); mono->combi.uppers[0].voiceMode=UpperVoiceMode::Mono;
     SamplerEngine m; m.prepare(96000.0,96U); m.setState(mono);
     m.postNoteOn(0U,57U,100U); renderLeft(m,30); m.postNoteOn(0U,69U,100U); auto w=renderLeft(m,600);
-    const double halfM=12.0*std::log2(glideHzAt(w,t*500.0)/220.0);
+    const double halfM=12.0*std::log2(kronosHzAt(w,t*500.0)/220.0);
     assert(halfM>5.0 && halfM<7.0);
     assert(m.activeVoiceCount()==1U);
+    // KRONOS near legato in MONO: gentle entry/arrival; repeated rapid playing
+    // never produces NaNs or stuck pitch after finishing the glide.
+    auto nearSt=std::make_shared<EngineState>(*mono);
+    nearSt->combi.uppers[0].portaTime=40U;
+    nearSt->combi.uppers[0].portaRateMode=true;
+    SamplerEngine nearEngine; nearEngine.prepare(96000.0,96U); nearEngine.setState(nearSt);
+    nearEngine.postNoteOn(0U,69U,100U); renderLeft(nearEngine,25);
+    nearEngine.postNoteOn(0U,70U,100U);
+    const auto nearGlide=renderLeft(nearEngine,130);
+    assert(kronosHzAt(nearGlide,12.0)<458.0);
+    assert(std::abs(kronosHzAt(nearGlide,100.0)-466.164)<5.0);
+    nearEngine.postNoteOn(0U,72U,100U);
+    auto rapid=renderLeft(nearEngine,100);
+    for(float v : rapid) assert(std::isfinite(v));
+    assert(std::abs(kronosHzAt(rapid,85.0)-523.25)<6.0);
     // SILVETON mode is untouched: TIME 50 ms S-curve (see the other tests), KRONOS TIME 0 = off
     auto off=std::make_shared<EngineState>(*st); off->combi.uppers[0].portaTime=0U;
     SamplerEngine o; o.prepare(96000.0,96U); o.setState(off);

@@ -1194,11 +1194,12 @@ class SilvetonSamplerView(
         hit(mA, { _, _ -> setUParam(u, 42, 0f) }); hit(mB, { _, _ -> setUParam(u, 42, 1f) })
         val cy = 672f
         if (!kronos) {
+            // SILVETON_PORTA_UI_ROUTE_V2: TIME is a TUNE parameter, not a TONE parameter.
             val porta = portamentoUiValue(s.portamentoSec)
             knobControl(c, sec.left + 115f, cy, 30f, porta, 0f, 100f, 1f, 300f, false, if (porta <= 0f) "OFF" else "${round(porta).toInt()} ms", "TIME", hitW = 200f,
-                onChange = { nv -> commitTone(currentUpper(s).copy(portamentoSec = portamentoSecondsFromUi(nv))) },
-                exact = { showNumber("PORTAMENTO TIME ms (0 = OFF)", porta, 0f, 100f, 0) { commitTone(currentUpper(s).copy(portamentoSec = portamentoSecondsFromUi(it))) } },
-                reset = { commitTone(currentUpper(s).copy(portamentoSec = 0f)) })
+                onChange = { nv -> commitTune(currentUpper(s).copy(portamentoSec = portamentoSecondsFromUi(nv))) },
+                exact = { showNumber("PORTAMENTO TIME ms (0 = OFF)", porta, 0f, 100f, 0) { commitTune(currentUpper(s).copy(portamentoSec = portamentoSecondsFromUi(it))) } },
+                reset = { commitTune(currentUpper(s).copy(portamentoSec = 0f)) })
             val bal = sampler.portaBalance().toFloat()
             knobControl(c, sec.left + 345f, cy, 30f, bal, 3f, 40f, 1f, 300f, false, "${bal.toInt()}", "BALANCE", hitW = 200f,
                 onChange = { nv -> sampler.setPortaBalance(round(nv).toInt()) }, exact = { showNumber("PORTA BALANCE (мекота)", bal, 3f, 40f, 0) { sampler.setPortaBalance(round(it).toInt()) } }, reset = { sampler.setPortaBalance(11) })
@@ -1220,7 +1221,7 @@ class SilvetonSamplerView(
             stripToggle(c, rA, "TIME", !rate, C_AMBER, size = 13f); stripToggle(c, rB, "RATE", rate, C_AMBER, size = 13f)
             hit(rA, { _, _ -> setUParam(u, 44, 0f) }); hit(rB, { _, _ -> setUParam(u, 44, 1f) })
             text(c, if (rate) "RATE: времето е за една октава" else "TIME: едно и също време за всеки интервал", sec.left + 553f, cy + 48f, 10f, C_KNOB_LABEL, center = true)
-            text(c, "Права линия, винаги плъзга от последния тон (и в POLY)", sec.left + 16f, sec.bottom - 12f, 11f, C_HINT, maxWidth = 700f)
+            text(c, "Меко, стегнато преливане · TIME / RATE · POLY / MONO", sec.left + 16f, sec.bottom - 12f, 11f, C_HINT, maxWidth = 700f)
         }
         // BEND RANGE of this Upper
         val bend = p.getOrElse(48) { s.pitchBendRange.toFloat() }

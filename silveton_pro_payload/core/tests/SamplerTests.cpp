@@ -1594,7 +1594,7 @@ void testLegatoPortamentoGlide() {
         auto st=makeToneState(mode);
         st->combi.uppers[0].portamentoSec=0.1F;
         SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
-        e.postNoteOn(0U,69U,100U); renderLeft(e,40);
+        e.postNoteOn(0U,69U,100U); renderLeft(e,200);   // SILVETON_PORTA_TEMPO_V1: a slow line, TIME applies in full
         e.postNoteOn(0U,81U,100U);
         auto x=renderLeft(e,400); // 400 ms
         const double early=measureHz(x,300U,1500U,96000.0);
@@ -1619,7 +1619,7 @@ void testPortamentoSameTimeEveryInterval() {
         auto st=makeToneState(UpperVoiceMode::Mono);
         st->combi.uppers[0].portamentoSec=0.05F; // 50 ms
         SamplerEngine e; e.prepare(96000.0,96U); e.setPortamentoNear(0.0F); e.setState(st);
-        e.postNoteOn(0U,69U,100U); renderLeft(e,40);
+        e.postNoteOn(0U,69U,100U); renderLeft(e,200);   // SILVETON_PORTA_TEMPO_V1: a slow line, TIME applies in full
         e.postNoteOn(0U,static_cast<std::uint8_t>(target),100U);
         auto x=renderLeft(e,120);
         const double goal=440.0*std::pow(2.0,(target-69)/12.0);
@@ -1641,7 +1641,7 @@ void testPortamentoPolyFromLastNote() {   // (MONO now: POLY stays POLY, see tes
     auto st=makeToneState(UpperVoiceMode::Mono);
     st->combi.uppers[0].portamentoSec=0.08F;
     SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
-    e.postNoteOn(0U,69U,100U); renderLeft(e,40);               // 69 held
+    e.postNoteOn(0U,69U,100U); renderLeft(e,200);   // SILVETON_PORTA_TEMPO_V1: a slow line, TIME applies in full               // 69 held
     e.postNoteOn(0U,81U,100U);                                  // glides from 69
     auto x=renderLeft(e,150);
     assert(e.activeVoiceCount()==1U);                           // one line
@@ -1680,7 +1680,7 @@ void testPortamentoFromLastNoteMono() {
         auto st=makeToneState(mode);
         st->combi.uppers[0].portamentoSec=0.06F;
         SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
-        e.postNoteOn(0U,69U,100U); renderLeft(e,40);
+        e.postNoteOn(0U,69U,100U); renderLeft(e,200);   // SILVETON_PORTA_TEMPO_V1: a slow line, TIME applies in full
         e.postNoteOff(0U,69U,0U); renderLeft(e,200);            // gone completely
         e.postNoteOn(0U,81U,100U);                              // detached: struck, no glide
         auto x=renderLeft(e,100);
@@ -1846,7 +1846,7 @@ void testPortamentoBalance() {
         auto st=makeToneState(UpperVoiceMode::Legato);
         st->combi.uppers[0].portamentoSec=0.05F;
         SamplerEngine e; e.prepare(96000.0,96U); e.setPortamentoBalance(bal); e.setState(st);
-        e.postNoteOn(0U,69U,100U); renderLeft(e,40);
+        e.postNoteOn(0U,69U,100U); renderLeft(e,200);   // SILVETON_PORTA_TEMPO_V1: a slow line, TIME applies in full
         e.postNoteOn(0U,81U,100U);
         auto x=renderLeft(e,160);
         // SILVETON_SOFT_GLIDE_V1: BALANCE rounds the glide; a bigger BALANCE is softer
@@ -1902,7 +1902,7 @@ void testPortamentoTimeLimit() {
     auto st=makeToneState(UpperVoiceMode::Legato);
     st->combi.uppers[0].portamentoSec=2.0F;
     SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
-    e.postNoteOn(0U,69U,100U); renderLeft(e,40);
+    e.postNoteOn(0U,69U,100U); renderLeft(e,200);   // SILVETON_PORTA_TEMPO_V1: a slow line, TIME applies in full
     e.postNoteOn(0U,81U,100U);
     auto x=renderLeft(e,200);
     assert(std::abs(glideHzAt(x,130.0)-880.0)<880.0*0.006);
@@ -1918,7 +1918,7 @@ void testPortamentoAcrossRecordings() {
     SampleZone hi=ms->zones[0]; hi.sample=makeLoopedSine(880.0,81U); hi.rootKey=81U; hi.keyLow=76U; hi.keyHigh=127U;
     ms->zones[0].keyHigh=75U; ms->zones.push_back(hi);
     SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
-    e.postNoteOn(0U,69U,100U); renderLeft(e,40);
+    e.postNoteOn(0U,69U,100U); renderLeft(e,200);   // SILVETON_PORTA_TEMPO_V1: a slow line, TIME applies in full
     e.postNoteOn(0U,79U,100U);                                  // other recording
     auto x=renderLeft(e,120);
     const double start=glideHzAt(x,4.0);
@@ -2319,7 +2319,7 @@ void testKronosPortamento() {
     st->combi.uppers[0].portaMode=PortamentoMode::Kronos; st->combi.uppers[0].portaTime=40U;   // ~0.39 s
     const double t=5.0*std::pow(40.0/127.0,2.2);
     SamplerEngine e; e.prepare(96000.0,96U); e.setState(st);
-    e.postNoteOn(0U,57U,100U); renderLeft(e,30); e.postNoteOff(0U,57U); renderLeft(e,30);   // released: nothing held
+    e.postNoteOn(0U,57U,100U); renderLeft(e,30); e.postNoteOff(0U,57U); renderLeft(e,600);   // released: nothing held
     e.postNoteOn(0U,69U,100U); auto x=renderLeft(e,600);
     const double half=12.0*std::log2(glideHzAt(x,t*500.0)/220.0);
     assert(half>5.0 && half<7.0);                       // linear: half way at half time
@@ -2337,7 +2337,7 @@ void testKronosPortamento() {
     // Fingered: with nothing held there is no glide
     auto fing=std::make_shared<EngineState>(*st); fing->combi.uppers[0].portaFingered=true;
     SamplerEngine f; f.prepare(96000.0,96U); f.setState(fing);
-    f.postNoteOn(0U,57U,100U); renderLeft(f,30); f.postNoteOff(0U,57U); renderLeft(f,30);
+    f.postNoteOn(0U,57U,100U); renderLeft(f,30); f.postNoteOff(0U,57U); renderLeft(f,600);
     f.postNoteOn(0U,69U,100U); auto y=renderLeft(f,60);
     assert(std::abs(glideHzAt(y,20.0)-440.0)<5.0);
     // Fingered with a key held: glides
@@ -2346,7 +2346,7 @@ void testKronosPortamento() {
     // RATE mode: an octave takes TIME, short notes have a musical 55 ms floor
     auto rate=std::make_shared<EngineState>(*st); rate->combi.uppers[0].portaRateMode=true;
     SamplerEngine g; g.prepare(96000.0,96U); g.setState(rate);
-    g.postNoteOn(0U,69U,100U); renderLeft(g,30); g.postNoteOff(0U,69U); renderLeft(g,30);
+    g.postNoteOn(0U,69U,100U); renderLeft(g,30); g.postNoteOff(0U,69U); renderLeft(g,600);
     g.postNoteOn(0U,70U,100U); auto z=renderLeft(g,200);
     assert(kronosHzAt(z,18.0)<460.0);                  // still gliding at 18ms (not abrupt)
     assert(std::abs(kronosHzAt(z,95.0)-466.16)<4.0); // finished cleanly after 55ms
@@ -2357,7 +2357,7 @@ void testKronosPortamento() {
     // MONO in KRONOS mode: a held line glides smoothly
     auto mono=std::make_shared<EngineState>(*st); mono->combi.uppers[0].voiceMode=UpperVoiceMode::Mono;
     SamplerEngine m; m.prepare(96000.0,96U); m.setState(mono);
-    m.postNoteOn(0U,57U,100U); renderLeft(m,30); m.postNoteOn(0U,69U,100U); auto w=renderLeft(m,600);
+    m.postNoteOn(0U,57U,100U); renderLeft(m,600); m.postNoteOn(0U,69U,100U); auto w=renderLeft(m,600);
     const double halfM=12.0*std::log2(kronosHzAt(w,t*500.0)/220.0);
     assert(halfM>5.0 && halfM<7.0);
     assert(m.activeVoiceCount()==1U);
@@ -2479,6 +2479,23 @@ void testCpuMeter() {
     renderLeft(e,50); assert(e.meters().cpuLoadPercent>0.0F);
 }
 
+// SILVETON_PORTA_TEMPO_V1: notes faster than TIME still arrive one by one.
+// A 2-semitone step every 60 ms with TIME 50 and TIME СЪСЕДНИ 90 must reach
+// each note (before: one smeared slide from the first key to the last).
+void testPortamentoTempoCap() {
+    auto st=makeToneState(UpperVoiceMode::Mono); st->combi.uppers[0].portamentoSec=0.05F;
+    SamplerEngine e; e.prepare(96000.0,96U); e.setPortamentoNear(90.0F); e.setState(st);
+    e.postNoteOn(0U,69U,100U); renderLeft(e,60);
+    e.postNoteOn(0U,71U,100U); auto a=renderLeft(e,60);
+    e.postNoteOn(0U,73U,100U); auto b=renderLeft(e,60);
+    e.postNoteOn(0U,74U,100U); auto c=renderLeft(e,120);
+    const double hz71=440.0*std::pow(2.0,2.0/12.0), hz73=440.0*std::pow(2.0,4.0/12.0), hz74=440.0*std::pow(2.0,5.0/12.0);
+    assert(std::abs(glideHzAt(a,55.0)-hz71)<hz71*0.004);   // arrived before the next key
+    assert(std::abs(glideHzAt(b,55.0)-hz73)<hz73*0.004);
+    assert(std::abs(glideHzAt(c,100.0)-hz74)<hz74*0.004);
+    assert(glideHzAt(b,15.0)>hz71*1.003 && glideHzAt(b,15.0)<hz73*0.997);   // and it still glides, not jumps
+}
+
 int main() {
     testWavAiffLoaders();
     testEnginePlaybackAndControls();
@@ -2529,6 +2546,7 @@ int main() {
     testUpperCutoffResonance();
     testLiveEditsOnHeldNote();
     testFxSlotsDelayReverb();
+    testPortamentoTempoCap();
     testUpperLayers(); testToneV2(); testUpperEq5(); testKronosPortamento(); testEffectsV3(); testSetV12RoundTrip(); testVoiceGuardQuietestStops(); testCpuMeter();
     std::puts("SILVETON sampler tests passed");
     return 0;

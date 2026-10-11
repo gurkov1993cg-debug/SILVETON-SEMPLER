@@ -1861,6 +1861,42 @@ void testPortamentoBalance() {
     }
 }
 
+// SILVETON_SILK_PORTA_V1: BALANCE gives a softer TIME curve, but never a
+// lingering low-pass detune after landing. Interruptions carry the audible
+// pitch rather than restarting from the original key.
+void testSilkPortamentoNearArrivalAndRestart() {
+    auto st = makeToneState(UpperVoiceMode::Legato);
+    st->combi.uppers[0].portamentoSec = 0.06F;
+    SamplerEngine e; e.prepare(96000.0, 96U);
+    e.setPortamentoNear(120.0F);
+    e.setPortamentoBalance(35.0F);
+    e.setState(st);
+    e.postNoteOn(0U, 69U, 100U); renderLeft(e, 60);
+    e.postNoteOn(0U, 70U, 100U);
+    auto first = renderLeft(e, 150);
+    const double target70 = 440.0 * std::pow(2.0, 1.0 / 12.0);
+    const double early = glideHzAt(first, 15.0);
+    const double middle = glideHzAt(first, 60.0);
+    assert(early > 438.0 && early < middle);
+    assert(middle < target70);
+    // By 120 ms the note has arrived: the last 30 ms cannot be drifting.
+    assert(std::abs(glideHzAt(first, 135.0) - target70) < target70 * 0.006);
+    e.postNoteOn(0U, 71U, 100U);
+    auto second = renderLeft(e, 145);
+    const double target71 = 440.0 * std::pow(2.0, 2.0 / 12.0);
+    assert(glideHzAt(second, 12.0) > target70 * 0.99);
+    assert(glideHzAt(second, 50.0) < target71);
+    assert(std::abs(glideHzAt(second, 135.0) - target71) < target71 * 0.006);
+    // Interrupt during a moving glide: no hard pitch reset to either key.
+    e.postNoteOn(0U, 69U, 100U);
+    auto goingBack = renderLeft(e, 50);
+    const double at40 = glideHzAt(goingBack, 40.0);
+    assert(at40 > 440.0 && at40 < target71);
+    e.postNoteOn(0U, 70U, 100U);
+    auto interrupted = renderLeft(e, 150);
+    assert(std::abs(glideHzAt(interrupted, 135.0) - target70) < target70 * 0.006);
+}
+
 // TIME is 1..100 ms: an older SET with a longer time still glides in 100 ms.
 void testPortamentoTimeLimit() {
     auto st=makeToneState(UpperVoiceMode::Legato);
@@ -2451,6 +2487,7 @@ int main() {
     testOctaveChoosesRecordedSample(); testTercaOnAnyUpper(); testFxTailOnBlendChange(); testPolyPortamentoAndNear(); testPortamentoNewSoundStartsFresh();
     testPortamentoAutoMonoReleaseTail();
     testPortamentoBalance();
+    testSilkPortamentoNearArrivalAndRestart();
     testPortamentoTimeLimit();
     testPortamentoAcrossRecordings();
     testMonoSplitUppersIndependent();

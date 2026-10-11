@@ -1,0 +1,33 @@
+SILVETON SAMPLER — SILK PORTAMENTO v1 (12.10.2026)
+
+This is a COMPLETE source repository package assembled from the available
+SILVETON-SEMPLER-main(1).zip baseline and the later v8 BUILD-FIX PRO SOUND
+payload. The existing Base ZIP and all existing codemagic_* scripts are present.
+The audio driver, MIDI routing and 96k / 96x2 settings are unchanged.
+
+WHAT CHANGED
+- SILVETON portamento: musical eased semitone glide, with smooth entrance
+  and precise arrival at the set TIME. No trailing post-time filter drift.
+- Close intervals receive the softest easing; intermediate-legato switches
+  preserve pitch and bounded momentum to avoid an audible corner.
+- BALANCE (3..40) now controls glide softness instead of adding milliseconds
+  of pitch lag. The UI does not label BALANCE as milliseconds anymore.
+- TIME / TIME СЪСЕДНИ and their numeric ranges are unchanged.
+- KRONOS intentionally preserves its existing linear glide/time/rate contract.
+- New native regression test, and both workflow checks updated.
+
+BUILD
+Place the contents of this ZIP into the existing project, replacing matching
+files. Avoid deleting other pre-existing files that are not in the ZIP.
+GitHub Actions: .github/workflows/silveton-apk.yml ; Codemagic: codemagic.yaml.
+Do not upload the ZIP as a single source file unless the import tool can unpack
+it at repository root. Required source archive remains:
+SILVETON-SEMPLER-source-fixed.zip
+
+TESTED LOCALLY
+- Native core compiled on Linux in Debug and Release configuration.
+- CTest: 3/3 passed, including the new glide regression with asserts enabled.
+- Android APK or physical hardware not built or tested in this environment.
+
+CAUTION
+No repository or network operations have been performed.

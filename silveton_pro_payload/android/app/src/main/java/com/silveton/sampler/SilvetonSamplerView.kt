@@ -1200,12 +1200,12 @@ class SilvetonSamplerView(
                 exact = { showNumber("PORTAMENTO TIME ms (0 = OFF)", porta, 0f, 100f, 0) { commitTone(currentUpper(s).copy(portamentoSec = portamentoSecondsFromUi(it))) } },
                 reset = { commitTone(currentUpper(s).copy(portamentoSec = 0f)) })
             val bal = sampler.portaBalance().toFloat()
-            knobControl(c, sec.left + 345f, cy, 30f, bal, 3f, 40f, 1f, 300f, false, "${bal.toInt()} ms", "BALANCE", hitW = 200f,
-                onChange = { nv -> sampler.setPortaBalance(round(nv).toInt()) }, exact = { showNumber("PORTA BALANCE ms", bal, 3f, 40f, 0) { sampler.setPortaBalance(round(it).toInt()) } }, reset = { sampler.setPortaBalance(11) })
+            knobControl(c, sec.left + 345f, cy, 30f, bal, 3f, 40f, 1f, 300f, false, "${bal.toInt()}", "BALANCE", hitW = 200f,
+                onChange = { nv -> sampler.setPortaBalance(round(nv).toInt()) }, exact = { showNumber("PORTA BALANCE (мекота)", bal, 3f, 40f, 0) { sampler.setPortaBalance(round(it).toInt()) } }, reset = { sampler.setPortaBalance(11) })
             val near = sampler.portaNear().toFloat()
             knobControl(c, sec.left + 575f, cy, 30f, near, 0f, 400f, 1f, 300f, false, "${near.toInt()} ms", "TIME СЪСЕДНИ", hitW = 200f,
                 onChange = { nv -> sampler.setPortaNear(round(nv).toInt()) }, exact = { showNumber("TIME СЪСЕДНИ ТОНОВЕ ms", near, 0f, 400f, 0) { sampler.setPortaNear(round(it).toInt()) } }, reset = { sampler.setPortaNear(90) })
-            text(c, "Мека S-крива, BALANCE заобля, съседните тонове плъзгат по-бавно", sec.left + 16f, sec.bottom - 12f, 11f, C_HINT, maxWidth = 700f)
+            text(c, "Меко влизане · чисто достигане точно в TIME · BALANCE задава мекотата", sec.left + 16f, sec.bottom - 12f, 11f, C_HINT, maxWidth = 700f)
         } else {
             val t = p.getOrElse(45) { 40f }
             knobControl(c, sec.left + 115f, cy, 30f, t, 0f, 127f, 1f, 300f, false, if (t <= 0f) "OFF" else "${t.toInt()}", "TIME 0–127", hitW = 200f,

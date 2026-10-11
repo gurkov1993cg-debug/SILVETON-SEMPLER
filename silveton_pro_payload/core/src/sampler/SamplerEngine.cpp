@@ -1367,7 +1367,11 @@ struct SamplerEngine::Impl {
         double glideStartSemis{0.0};   // offset when the glide started
         double glideRawSemis{0.0};     // S-curve offset now (before BALANCE rounding)
         double glideSmooth1{0.0};      // BALANCE rounding, stage 1
-        double glideSmooth2{0.0};      // BALANCE rounding, stage 2 = what is heard
+        double glideSmooth2{0.0};      // actual continuous pitch offset (semitones)
+        // SILVETON_SILK_PORTA_V1: remember the audible slope on interrupted glides.
+        // Offsets/velocity are in semitones, not Hertz: even musical motion.
+        double glideStartVelocity{0.0}; // initial semitone movement over whole glide
+        double glideLastStep{0.0};      // last audible semitone change per sample
         bool pitchGliding{false};
         bool glideLinear{false};       // SILVETON_PORTA_MODES_V1: KRONOS = straight line, no rounding
         // SILVETON_TONE_V2
@@ -1882,6 +1886,7 @@ void startVoice(SamplerEngine::Impl& impl,
     v.pitchGliding = false;
     v.glideFramesRemaining = 0U;
     v.glideRawSemis = v.glideSmooth1 = v.glideSmooth2 = 0.0;
+    v.glideLastStep = v.glideStartVelocity = 0.0;
 
     const float velocityNorm = std::max(0.0F, static_cast<float>(velocity) * kInv127);
     v.velNorm = velocityNorm;
@@ -2102,26 +2107,33 @@ UpperVoiceMode voiceModeNow(SamplerEngine::Impl& impl, int ui, const UpperPart& 
     return mode;
 }
 
-// SILVETON_SOFT_GLIDE_V1: every glide moves on a soft S-curve (slow start, slow
-// end) in exactly TIME, and PORTA BALANCE (3..40 ms) rounds the pitch further, so
-// neighbouring notes slide smoothly and a new glide that starts mid-glide carries
-// on without a corner. The pitch is a continuous offset from the new key.
+// SILVETON_SOFT_GLIDE_V1 / SILVETON_SILK_PORTA_V1
+// The pitch starts at exactly the audible previous pitch, then follows a C2
+// eased semitone-space path and reaches its target ON TIME (no lagging low-pass
+// tail). When a key interrupts a moving glide, carry its velocity into the new
+// path, bounded to keep the result monotonic / free of pitch overshoot.
 void beginGlide(SamplerEngine::Impl::Voice& v, double newTargetRatio, std::uint32_t frames) noexcept {
-    const double oldTarget = v.targetRatio > 0.0 ? v.targetRatio : newTargetRatio;
-    if (!v.pitchGliding) {
-        const double now = (v.ratio > 0.0 && oldTarget > 0.0) ? 12.0 * std::log2(v.ratio / oldTarget) : 0.0;
-        v.glideRawSemis = v.glideSmooth1 = v.glideSmooth2 = now;
-    }
-    const double shift = 12.0 * std::log2(oldTarget / newTargetRatio);
-    v.glideRawSemis += shift;
-    v.glideSmooth1 += shift;
-    v.glideSmooth2 += shift;
-    v.glideStartSemis = v.glideRawSemis;
-    v.glideTotalFrames = std::max<std::uint32_t>(1U, frames);
-    v.glideFramesRemaining = v.glideTotalFrames;
+    if (!(newTargetRatio > 0.0) || !std::isfinite(newTargetRatio)) return;
+    const double start = v.ratio > 0.0 && std::isfinite(v.ratio)
+        ? 12.0 * std::log2(v.ratio / newTargetRatio) : 0.0;
+    const auto total = std::max<std::uint32_t>(1U, frames);
+    // A reversal of direction brakes at the actual sounding pitch. Otherwise
+    // preserve a limited amount of momentum, avoiding the characteristic corner
+    // during very fast legato runs.
+    const double carried = v.pitchGliding ? v.glideLastStep * static_cast<double>(total) : 0.0;
+    const double desiredDirection = -start;
+    const double maxCarry = 2.0 * std::abs(start);
+    const double velocity = (carried * desiredDirection > 0.0)
+        ? std::copysign(std::min(std::abs(carried), maxCarry), desiredDirection) : 0.0;
+    v.glideStartVelocity = velocity;
+    v.glideStartSemis = start;
+    v.glideRawSemis = v.glideSmooth1 = v.glideSmooth2 = start;
+    v.glideTotalFrames = total;
+    v.glideFramesRemaining = total;
     v.targetRatio = newTargetRatio;
     v.pitchGliding = true;
-    v.ratio = v.targetRatio * std::exp2(v.glideSmooth2 / 12.0);
+    // Do not recalculate ratio here: preserve exactly the currently audible
+    // floating-point value until the next generated sample.
 }
 
 void startPortamentoGlide(const SamplerEngine::Impl& impl, SamplerEngine::Impl::Voice& v, double fromKey, float seconds) noexcept {
@@ -2131,6 +2143,7 @@ void startPortamentoGlide(const SamplerEngine::Impl& impl, SamplerEngine::Impl::
     if (std::abs(semitones) < 1.0e-6) return;
     v.targetRatio = v.ratio;
     v.glideRawSemis = v.glideSmooth1 = v.glideSmooth2 = semitones;   // starts on the old key
+    v.glideLastStep = 0.0; // a newly struck voice has no inherited motion
     v.pitchGliding = true;
     v.ratio = v.targetRatio * std::exp2(semitones / 12.0);
     const auto frames = static_cast<std::uint32_t>(std::max(1.0, static_cast<double>(seconds) * impl.sampleRate));
@@ -2173,6 +2186,7 @@ void legatoTo(SamplerEngine::Impl& impl, SamplerEngine::Impl::Voice& v, const Up
         v.targetRatio = target;
         v.ratio = target;
         v.glideFramesRemaining = 0U;
+        v.glideLastStep = v.glideStartVelocity = 0.0;
         v.pitchGliding = false;
     }
 }
@@ -2707,9 +2721,11 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
     std::array<float, kUpperCount> upperPeakR{};
     const float masterGain = dbToGain(current->global.masterGainDb);
     const float mixSmooth = static_cast<float>(1.0 - std::exp(-1.0 / (kLiveMixSmoothSec * impl_->sampleRate)));
-    // PORTA BALANCE (ms) -> two rounding stages, each half the balance time.
-    const double glideRound = 1.0 - std::exp(-1.0 / (std::max(0.0005, 0.0005 * static_cast<double>(
-        impl_->portaBalance.load(std::memory_order_relaxed))) * impl_->sampleRate));
+    // SILVETON_SILK_PORTA_V1: BALANCE 3..40 controls the softness / skew of
+    // the time-normalized curve instead of delaying its arrival with filters.
+    // Loaded once per block, no expensive filter or allocation on audio thread.
+    const double glideVelvet = std::clamp(
+        (static_cast<double>(impl_->portaBalance.load(std::memory_order_relaxed)) - 3.0) / 37.0, 0.0, 1.0);
 
     const int tapUpperNow = impl_->tapUpper.load(std::memory_order_acquire);
     const bool tapAfterNow = impl_->tapAfter.load(std::memory_order_relaxed);
@@ -2862,25 +2878,45 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
 
             if (v.pitchGliding) {
                 double raw = 0.0;
+                const double previous = v.glideRawSemis;
                 if (v.glideFramesRemaining > 0U) {
                     --v.glideFramesRemaining;
                     const double t = 1.0 - static_cast<double>(v.glideFramesRemaining) / static_cast<double>(v.glideTotalFrames);
-                    // SILVETON: soft S-curve; KRONOS: a straight line, evenly in semitones.
-                    raw = v.glideLinear ? v.glideStartSemis * (1.0 - t) : v.glideStartSemis * (1.0 - t * t * (3.0 - 2.0 * t));
+                    if (v.glideLinear) {
+                        // Preserve the intentional straight-line KRONOS glide.
+                        raw = v.glideStartSemis * (1.0 - t);
+                    } else {
+                        // Closer keys get the gentlest curve, with softer entrance
+                        // and a musically clean, exactly timed arrival. Quintic
+                        // smoothstep has zero velocity AND acceleration at the ends.
+                        const double near = std::clamp((4.0 - std::abs(v.glideStartSemis)) / 3.0, 0.0, 1.0);
+                        const double softness = (0.30 + 0.70 * glideVelvet) * (0.55 + 0.45 * near);
+                        const double u = t * (1.0 - 0.32 * softness * (1.0 - t));
+                        const double u2 = u * u;
+                        const double u3 = u2 * u;
+                        const double smooth3 = u2 * (3.0 - 2.0 * u);
+                        const double smooth5 = u3 * (10.0 + u * (-15.0 + 6.0 * u));
+                        const double curve = smooth3 + 0.75 * softness * (smooth5 - smooth3);
+                        // Quintic Hermite start-velocity basis: C1 continuity
+                        // when interrupting a legato glide. Decays smoothly to
+                        // zero at the destination; no overshoot from the cap.
+                        const double t2 = t * t;
+                        const double t3 = t2 * t;
+                        const double velocityBasis = t + t3 * (-6.0 + t * (8.0 - 3.0 * t));
+                        raw = v.glideStartSemis * (1.0 - curve) + v.glideStartVelocity * velocityBasis;
+                    }
                 }
-                v.glideRawSemis = raw;
-                if (v.glideLinear) {
-                    v.glideSmooth1 = v.glideSmooth2 = raw;
-                } else {
-                    v.glideSmooth1 += (raw - v.glideSmooth1) * glideRound;
-                    v.glideSmooth2 += (v.glideSmooth1 - v.glideSmooth2) * glideRound;
-                }
-                if (v.glideFramesRemaining == 0U && std::abs(v.glideSmooth2) < 1.0e-6 && std::abs(v.glideSmooth1) < 1.0e-6) {
+                v.glideRawSemis = v.glideSmooth1 = v.glideSmooth2 = raw;
+                v.glideLastStep = raw - previous;
+                if (v.glideFramesRemaining == 0U) {
+                    // No low-pass tail: destination is exact at TIME (including
+                    // 1 ms changes). No lingering pitch drift after landing.
                     v.pitchGliding = false;
-                    v.glideSmooth1 = v.glideSmooth2 = 0.0;
+                    v.glideStartVelocity = v.glideLastStep = 0.0;
+                    v.glideRawSemis = v.glideSmooth1 = v.glideSmooth2 = 0.0;
                     v.ratio = v.targetRatio;
                 } else {
-                    v.ratio = v.targetRatio * std::exp2(v.glideSmooth2 / 12.0);
+                    v.ratio = v.targetRatio * std::exp2(raw / 12.0);
                 }
             }
 

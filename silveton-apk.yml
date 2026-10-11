@@ -1,0 +1,404 @@
+name: SILVETON Sampler APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "silveton_pro_payload/**"
+      - "codemagic_pro_sound_fix.py"
+      - ".github/workflows/silveton-apk.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    env:
+      CM_BUILD_DIR: ${{ github.workspace }}
+      SILVETON_ZIP: SILVETON-SEMPLER-source-fixed.zip
+      GRADLE_VERSION: "8.9"
+      ANDROID_BUILD_TOOLS_VERSION: "35.0.0"
+      ANDROID_NDK_VERSION: "27.2.12479018"
+      ANDROID_CMAKE_VERSION: "3.22.1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Prepare SILVETON rooted APK source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$CM_BUILD_DIR/$SILVETON_ZIP"
+          test -f "$CM_BUILD_DIR/codemagic_runtime_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_root_apk_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_resume_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_live_dsp_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_test_instrument_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_stability_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_audio_driver_hardening.py"
+          test -f "$CM_BUILD_DIR/codemagic_final_stability_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_gui_sampler3.py"
+          test -f "$CM_BUILD_DIR/codemagic_live_midi_visual_skin.py"
+          test -f "$CM_BUILD_DIR/codemagic_force_keyboard_test_patch.py"
+          test -f "$CM_BUILD_DIR/codemagic_gui_contract_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_kotlin_compile_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_48khz_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_live_performance_indicators.py"
+          test -f "$CM_BUILD_DIR/codemagic_xrun_stability_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_remove_test_piano.py"
+          test -f "$CM_BUILD_DIR/codemagic_live_note_latency_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_ultra_low_latency_output_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_crackle_fix.py"
+          test -f "$CM_BUILD_DIR/codemagic_pro_sound_fix.py"
+          test -d "$CM_BUILD_DIR/silveton_pro_payload"
+          
+          rm -rf "$CM_BUILD_DIR/_silveton_src"
+          mkdir -p "$CM_BUILD_DIR/_silveton_src"
+          unzip -q "$CM_BUILD_DIR/$SILVETON_ZIP" -d "$CM_BUILD_DIR/_silveton_src"
+          
+          SETTINGS="$(find "$CM_BUILD_DIR/_silveton_src" -type f -path '*/android/settings.gradle.kts' -print -quit)"
+          test -n "$SETTINGS"
+          PROJECT_DIR="$(dirname "$(dirname "$SETTINGS")")"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          
+          python3 "$CM_BUILD_DIR/codemagic_runtime_fix.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_root_apk_fix.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_resume_fix.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_live_dsp_fix.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_test_instrument_fix.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_stability_fix.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_audio_driver_hardening.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_gui_sampler3.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_live_midi_visual_skin.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_final_stability_fix.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_force_keyboard_test_patch.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_gui_contract_fix.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_kotlin_compile_fix.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_48khz_fix.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_live_performance_indicators.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_xrun_stability_fix.py" "$PROJECT_DIR"
+          # Crackle fix works on the fully generated tree; PRO SOUND follows it and must stay LAST.
+          python3 "$CM_BUILD_DIR/codemagic_crackle_fix.py" "$PROJECT_DIR"
+          # PRO SOUND (MONO/LEGATO, ADSR, CUTOFF, quick re-enter) works on the crackle-fixed tree.
+          python3 "$CM_BUILD_DIR/codemagic_pro_sound_fix.py" "$PROJECT_DIR"
+          
+          BRIDGE="$PROJECT_DIR/android/app/src/main/cpp/SamplerAudioBridge.cpp"
+          RUNTIME="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SamplerRuntime.kt"
+          ROOTMODE="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SilvetonRootRuntime.kt"
+          MIDICTRL="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SamplerMidiController.kt"
+          ACTIVITY="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/MainActivity.kt"
+          ENGINE="$PROJECT_DIR/core/src/sampler/SamplerEngine.cpp"
+          SINC="$PROJECT_DIR/core/include/silveton/sampler/SincInterpolator.h"
+          SINC_CPP="$PROJECT_DIR/core/src/sampler/SincInterpolator.cpp"
+          VIEW="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SilvetonSamplerView.kt"
+          CONTROLLER="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SamplerAppController.kt"
+          SAMPLER_TESTS="$PROJECT_DIR/core/tests/SamplerTests.cpp"
+          BANK_RUNTIME="$PROJECT_DIR/core/src/sampler/SvBankRuntime.cpp"
+          PREFETCH_H="$PROJECT_DIR/core/include/silveton/sampler/SampleStreamPrefetcher.h"
+          
+          test -f "$SAMPLER_TESTS"
+          grep -F 'constexpr unsigned kRate = 96000U;' "$BRIDGE"
+          grep -F 'constexpr unsigned kPeriods = 2U;' "$BRIDGE"
+          grep -F 'kPreferredMinimumPeriodFrames = 96U;' "$BRIDGE"
+          grep -F 'config.bufferFrames - config.periodFrames' "$BRIDGE"
+          grep -F 'configureRealtimeThread("SilvAudioRT", 7, 7, 80);' "$BRIDGE"
+          grep -F 'configureRealtimeThread("SilvMidiRT", 0, 5, 70);' "$BRIDGE"
+          grep -F '::poll(pollFds.data(), static_cast<nfds_t>(count), 1)' "$BRIDGE"
+          grep -F 'class BuiltinTestInstrument' "$BRIDGE"
+          grep -F 'testInstrument_.render(renderBuffer_.data(), frames, sampleRate());' "$BRIDGE"
+          grep -F 'testInstrument_.setEnabled(false);' "$BRIDGE"
+          grep -F 'testInstrument_.noteOn(data1, data2);' "$BRIDGE"
+          grep -F 'const bool midiOk = startDirectMidiLocked();' "$BRIDGE"
+          grep -F 'kControlDevice = "/dev/snd/controlC0"' "$BRIDGE"
+          grep -F 'ADDA_DL_CH1 DL1_CH1' "$BRIDGE"
+          grep -F 'ADDA_DL_CH2 DL1_CH2' "$BRIDGE"
+          grep -F 'DAC In Mux' "$BRIDGE"
+          grep -F 'HPL Mux' "$BRIDGE"
+          grep -F 'HPR Mux' "$BRIDGE"
+          grep -F 'sw.xfer_align = 1U;' "$BRIDGE"
+          grep -F 'AUDIO DRIVER: PCM open/config failed' "$BRIDGE"
+          grep -F 'SilvetonRootRuntime.enter()' "$RUNTIME"
+          grep -F 'Audio reopen failed' "$RUNTIME"
+          grep -F 'SilvetonAudioRecovery' "$RUNTIME"
+          grep -F 'refreshAudioPermissions' "$RUNTIME"
+          grep -F 'refreshAudioPermissions' "$ROOTMODE"
+          grep -F 'refreshMidiPermissions' "$ROOTMODE"
+          grep -F 'return runSu(script, 5)' "$ROOTMODE"
+          grep -F 'refreshMidiPermissions' "$MIDICTRL"
+          grep -F 'SilvetonAudioLifecycle' "$ACTIVITY"
+          grep -F 'magiskpolicy' "$ROOTMODE"
+          grep -F '0x0000-0xffff' "$ROOTMODE"
+          grep -F 'taskset -p 3f' "$ROOTMODE"
+          grep -F 'promote SilvAudioRT 80 85' "$ROOTMODE"
+          grep -F 'promote SilvMidiRT 40 75' "$ROOTMODE"
+          grep -F 'LiveCubic4 = 4' "$SINC"
+          grep -F 'std::abs(playbackRatio - 0.5) < 1.0e-12' "$SINC_CPP"
+          grep -F 'interpolator_(InterpolationQuality::Studio)' "$ENGINE"
+          grep -F 'SILVETON_STUDIO_INTERP_V1' "$SINC_CPP"
+          grep -F 'SILVETON_MASTER_6DB_V1' "$ENGINE"
+          grep -F 'SILVETON_TPDF_DITHER_V1' "$BRIDGE"
+          grep -F 'SILVETON_ALL_MIDI_PORTS_V1' "$BRIDGE"
+          grep -F 'SILVETON_SOFT_GLIDE_V1' "$ENGINE"
+          grep -F 'sampler.setPortaBalance(' "$VIEW"
+          grep -F 'SILVETON_LIST_BACKUP_V1' "$CONTROLLER"
+          grep -F 'SILVETON_OCTAVE_KEY_V1' "$ENGINE"
+          grep -F 'SILVETON_TERCA_V1' "$ENGINE"
+          grep -F 'SILVETON_SCAN_V1' "$BRIDGE"
+          grep -F 'SILVETON_MIDI_FULL_V1' "$BRIDGE"
+          grep -F 'SILVETON_GUI_V3' "$VIEW"
+          grep -F 'SILVETON_TUNE_RANGES_V1' "$BRIDGE"
+          grep -F 'SILVETON_SCALE_V1' "$CONTROLLER"
+          grep -F 'SILVETON_TQ_TRANSPOSE_V1' "$ENGINE"
+          grep -F 'SILVETON_FX_TAIL_V1' "$ENGINE"
+          grep -F 'SILVETON_SET_SAVE_AS_V1' "$BRIDGE"
+          grep -F 'SILVETON_TQ_LIST_V1' "$CONTROLLER"
+          grep -F 'SILVETON_LIST_GRID_V1' "$VIEW"
+          grep -F 'SILVETON_SIMPLE_NUMBER_V1' "$VIEW"
+          grep -F 'SILVETON_SLOW_DRAG_V1' "$VIEW"
+          grep -F 'SILVETON_POLY_PORTA_V1' "$ENGINE"
+          grep -F 'SILVETON_PORTA_NEAR_V1' "$ENGINE"
+          grep -F 'SILVETON_KEY_SCAN_V1' "$BRIDGE"
+          grep -F 'SILVETON_BANK_INFO_V1' "$BRIDGE"
+          grep -F 'SILVETON_BANK_INFO_V1' "$VIEW"
+          grep -F 'SILVETON_LAYERS_V1' "$ENGINE"
+          grep -F 'SILVETON_TONE_V2' "$ENGINE"
+          grep -F 'SILVETON_EQ5_V1' "$ENGINE"
+          grep -F 'SILVETON_PORTA_MODES_V1' "$ENGINE"
+          grep -F 'SILVETON_FX_V3' "$ENGINE"
+          grep -F 'SILVETON_CPU_METER_V1' "$ENGINE"
+          grep -F 'SILVETON_VOICE_GUARD_V1' "$ENGINE"
+          grep -F 'SILVETON_PARAMS_V1' "$BRIDGE"
+          grep -F 'SILVETON_START_REFRESH_V1' "$BRIDGE"
+          grep -F 'SILVETON_SET_V12' "$PROJECT_DIR/core/src/sampler/SetPackage.cpp"
+          grep -F 'SILVETON_GUI_V4' "$VIEW"
+          grep -F 'SILVETON_LOOK_V2' "$VIEW"
+          grep -F 'SILVETON_PICKER_V1' "$VIEW"
+          grep -F 'SILVETON_ANALYZER_V1' "$ENGINE"
+          grep -F 'SILVETON_LIST_V2' "$VIEW"
+          grep -F 'SILVETON_SETS_FIX_V1' "$CONTROLLER"
+          grep -F 'Studio = 1' "$SINC"
+          grep -F 'upperRouteMask' "$ENGINE"
+          grep -F 'SILVETON LIVE MIDI native Canvas renderer' "$VIEW"
+          grep -F 'RadialGradient(' "$VIEW"
+          grep -F 'Color.rgb(252,253,255)' "$VIEW"
+          grep -F 'DESIGN_W = 1340f' "$VIEW"
+          grep -F 'val keyFlash = midiRx' "$VIEW"
+          grep -F 'val audioSignal = a.activeVoices > 0' "$VIEW"
+          grep -F '"96k 96x2"' "$VIEW"
+          grep -F 'a.bufferSizeFrames == 192' "$VIEW"
+          grep -F '48 kHz SAMPLE must play through 96 kHz engine' "$SAMPLER_TESTS"
+          grep -F 'data class MidiStatus(' "$CONTROLLER"
+          grep -F 'private val statusChanged: (String?) -> Unit = {},' "$CONTROLLER"
+          grep -F 'SILVETON_CRACKLE_FIX_V1' "$ENGINE"
+          grep -F 'softKill(impl, tail);' "$ENGINE"
+          grep -F 'softKill(impl, existing, ' "$ENGINE"
+          grep -F 'SILVETON_PRO_SOUND_V1' "$ENGINE"
+          grep -F 'SILVETON_ROUTE_FALLBACK_V1' "$BRIDGE"
+          grep -F 'SILVETON_PORTA_PAGE_V1' "$ENGINE"
+          grep -F 'void playPortamentoNote(' "$ENGINE"
+          grep -F 'testPortamentoBalance();' "$SAMPLER_TESTS"
+          grep -F 'PORTA U${selectedUpper + 1}' "$VIEW"
+          grep -F 'lastPickedSound' "$VIEW"
+          grep -F 'SILVETON_GUI_V2' "$VIEW"
+          grep -F 'e.transform(touchMatrix)' "$VIEW"
+          grep -F 'SILVETON_KORG_WRITE_V1' "$CONTROLLER"
+          grep -F 'fun writeCombiToList(' "$CONTROLLER"
+          grep -F 'sampler.writeCombiToList(' "$VIEW"
+          grep -F 'SILVETON_LIVE_EDIT_V1' "$ENGINE"
+          grep -F 'v.tuneSemis = tune;' "$ENGINE"
+          grep -F 'testLiveEditsOnHeldNote();' "$SAMPLER_TESTS"
+          grep -F 'SILVETON_LIVE_EDIT_V1' "$VIEW"
+          grep -F 'SILVETON_FX_V2' "$ENGINE"
+          grep -F 'std::unique_ptr<ReverbFx> plate;' "$ENGINE"
+          grep -F 'testFxSlotsDelayReverb();' "$SAMPLER_TESTS"
+          grep -F 'nativeUpdateCombiFx(slot - 1,' "$CONTROLLER"
+          grep -F 'SILVETON_LIST_POSITIONS_V1' "$BRIDGE"
+          grep -F 'nativeSetActiveListEntry' "$BRIDGE"
+          grep -F 'fun copyListEntryTo(' "$CONTROLLER"
+          grep -F 'fun moveListEntryTo(' "$CONTROLLER"
+          grep -F 'openPositionPicker(WriteMode.COPY' "$VIEW"
+          grep -F 'nativeSetPortaBalance' "$BRIDGE"
+          grep -F 'SILVETON_HEADPHONE_LOCK_V1' "$BRIDGE"
+          grep -F 'SILVETON_RENDER_SPEED_V1' "$ENGINE"
+          grep -F 'nativeEnforceOutputRoute' "$RUNTIME"
+          grep -F 'KEYCODE_VOLUME_UP' "$ACTIVITY"
+          grep -F 'testPortamentoFromLastNoteMono();' "$SAMPLER_TESTS"
+          grep -F 'testPortamentoAutoMonoReleaseTail();' "$SAMPLER_TESTS"
+          grep -F 'testPortamentoPolyFromLastNote();' "$SAMPLER_TESTS"
+          grep -F 'withRootNote(' "$RUNTIME"
+          grep -F 'struct AmpEnv' "$ENGINE"
+          grep -F 'void playUpperNote(' "$ENGINE"
+          grep -F 'void handleNoteOff(' "$ENGINE"
+          grep -F 'testLegatoHeldKeyGlissando();' "$SAMPLER_TESTS"
+          grep -F 'testUpperAdsrAbsolute();' "$SAMPLER_TESTS"
+          grep -F 'nativeSetUpperToneParam' "$BRIDGE"
+          grep -F 'publishVoiceWindows(*impl_, vi);' "$ENGINE"
+          grep -F 'void readStereo(' "$SINC"
+          grep -F 'class SampleStreamPrefetcher' "$PREFETCH_H"
+          grep -F 'prefetcher_.start()' "$BRIDGE"
+          grep -F 'MADV_NORMAL' "$BANK_RUNTIME"
+          grep -F 'testLoopedSampleKeepsAttack();' "$SAMPLER_TESTS"
+          
+          if grep -Fq 'if (resolved < loopStart && frame >= 0)' "$SINC_CPP"; then
+            echo "ERROR: looped samples would lose their attack again (loop-start clamp returned)" >&2
+            exit 1
+          fi
+          if grep -Fq 'MADV_SEQUENTIAL' "$BANK_RUNTIME"; then
+            echo "ERROR: bank mapping returned to MADV_SEQUENTIAL (Android drops loop pages first)" >&2
+            exit 1
+          fi
+          if grep -Fq 'existing.active = false;' "$ENGINE"; then
+            echo "ERROR: MONO/LEGATO note change cuts the previous note in one sample again" >&2
+            exit 1
+          fi
+          if grep -Fq 'constexpr unsigned kRate = 48000U;' "$BRIDGE"; then
+            echo "ERROR: stale 48 kHz final output target remains" >&2
+            exit 1
+          fi
+          if grep -Fq 'constexpr unsigned kPeriods = 3U;' "$BRIDGE"; then
+            echo "ERROR: stale 96x3 high-latency queue remains" >&2
+            exit 1
+          fi
+          if grep -Fq '::poll(pollFds.data(), static_cast<nfds_t>(count), 20)' "$BRIDGE"; then
+            echo "ERROR: stale 20 ms MIDI poll remains" >&2
+            exit 1
+          fi
+          if grep -Fq '#include <aaudio/AAudio.h>' "$BRIDGE"; then
+            echo "ERROR: AAudio returned to Direct ALSA runtime" >&2
+            exit 1
+          fi
+          if grep -Fq 'cmd activity kill-all' "$ROOTMODE"; then
+            echo "ERROR: live mode must not kill cached apps" >&2
+            exit 1
+          fi
+          if grep -Fq 'Handler(Looper.getMainLooper())' "$RUNTIME"; then
+            echo "ERROR: audio recovery returned to UI looper" >&2
+            exit 1
+          fi
+          if grep -Fq 'testInstrument_.setEnabled(true);' "$BRIDGE" || grep -Fq 'testInstrument_.setEnabled(!hasPlayableProgram);' "$BRIDGE"; then
+            echo "ERROR: obsolete TEST EP enable path remains" >&2
+            exit 1
+          fi
+          if grep -Fq 'STAGE PIANO' "$VIEW" || grep -Fq 'BUILT-IN  •  RAW MIDI' "$VIEW" || grep -Fq 'text(c,"PIANO"' "$VIEW" || grep -Fq 'text(c, "TEST EP"' "$VIEW"; then
+            echo "ERROR: obsolete TEST EP / Stage Piano UI remains" >&2
+            exit 1
+          fi
+      - name: Install Android toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          ANDROID_SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Library/Android/sdk}}"
+          SDKMANAGER="$ANDROID_SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$ANDROID_SDK/cmdline-tools" -type f -path '*/bin/sdkmanager' -perm +111 2>/dev/null | tail -1 || true)"
+          fi
+          test -x "$SDKMANAGER"
+          yes | "$SDKMANAGER" --sdk_root="$ANDROID_SDK" --licenses >/dev/null || true
+          "$SDKMANAGER" --sdk_root="$ANDROID_SDK" \
+            "platforms;android-35" \
+            "build-tools;$ANDROID_BUILD_TOOLS_VERSION" \
+            "ndk;$ANDROID_NDK_VERSION" \
+            "cmake;$ANDROID_CMAKE_VERSION"
+          
+          NDK_HOME="$ANDROID_SDK/ndk/$ANDROID_NDK_VERSION"
+          echo "ANDROID_HOME=$ANDROID_SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK_HOME" >> "$GITHUB_ENV"
+      - name: Install Gradle 8.9
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOOLS="$CM_BUILD_DIR/.silveton-tools"
+          mkdir -p "$TOOLS"
+          if [ ! -x "$TOOLS/gradle-$GRADLE_VERSION/bin/gradle" ]; then
+            curl -fL --retry 3 "https://services.gradle.org/distributions/gradle-$GRADLE_VERSION-bin.zip" -o "$TOOLS/gradle.zip"
+            unzip -q -o "$TOOLS/gradle.zip" -d "$TOOLS"
+          fi
+          GRADLE_BIN="$TOOLS/gradle-$GRADLE_VERSION/bin/gradle"
+          test -x "$GRADLE_BIN"
+          echo "GRADLE_BIN=$GRADLE_BIN" >> "$GITHUB_ENV"
+      - name: Audit sampler contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          python3 ci/audit_direct_alsa.py
+          python3 ci/audit_direct_midi.py
+          python3 ci/audit_gui_contract.py
+      - name: Build and test native core
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          rm -rf build-core
+          cmake -S core -B build-core \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_STANDARD=17 \
+            -DSILVETON_LIVE_BUILD_TESTS=ON
+          cmake --build build-core --parallel "$(sysctl -n hw.ncpu)"
+          ctest --test-dir build-core --output-on-failure
+      - name: Build rooted release APK
+        shell: bash
+        run: |
+          set -uo pipefail
+          cd "$PROJECT_DIR/android"
+          LOG="$CM_BUILD_DIR/gradle-build.log"
+          set +e
+          CI=true "$GRADLE_BIN" --no-daemon --console=plain clean assembleRelease 2>&1 | tee "$LOG"
+          STATUS=${PIPESTATUS[0]}
+          set -e
+          if [ "$STATUS" -ne 0 ]; then
+            echo "===== EXACT COMPILER ERRORS ====="
+            grep -E '(^e: |^w: | error: |: error:|Compilation error|Unresolved reference|Type mismatch|No value passed|Too many arguments|Cannot infer|Overload resolution ambiguity)' "$LOG" | tail -n 160 || true
+            echo "===== END COMPILER ERRORS ====="
+            exit "$STATUS"
+          fi
+      - name: Verify and publish one APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          
+          APK="$(find android/app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          test -f "$APK"
+          
+          AAPT="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION/aapt"
+          APKSIGNER="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION/apksigner"
+          ZIPALIGN="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION/zipalign"
+          test -x "$AAPT"
+          test -x "$APKSIGNER"
+          test -x "$ZIPALIGN"
+          
+          BADGING="$("$AAPT" dump badging "$APK")"
+          case "$BADGING" in
+            *"package: name='com.silveton.sampler'"*) ;;
+            *) echo "Wrong package id" >&2; exit 1 ;;
+          esac
+          case "$BADGING" in
+            *"targetSdkVersion:'35'"*) ;;
+            *) echo "Wrong targetSdk" >&2; exit 1 ;;
+          esac
+          
+          "$ZIPALIGN" -c -P 16 -v 4 "$APK"
+          "$APKSIGNER" verify --verbose --print-certs "$APK"
+          
+          mkdir -p "$CM_BUILD_DIR/artifacts"
+          OUT="$CM_BUILD_DIR/artifacts/SILVETON-SAMPLER-SM-X130.apk"
+          cp -f "$APK" "$OUT"
+          shasum -a 256 "$OUT" > "$OUT.sha256.txt"
+      - name: Upload APK and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SILVETON-SAMPLER-APK-and-logs
+          path: |
+            artifacts/*.apk
+            artifacts/*.txt
+            gradle-build.log
+          if-no-files-found: warn
+          retention-days: 14

@@ -1232,6 +1232,8 @@ public:
         u.eqLowDb = std::clamp(eqLowDb, -18.0F, 18.0F);
         u.eqMidDb = std::clamp(eqMidDb, -18.0F, 18.0F);
         u.eqHighDb = std::clamp(eqHighDb, -18.0F, 18.0F);
+        // SILVETON_EQ5_V1: LOW / MID / HIGH are bands 1 / 3 / 5 of the common EQ
+        u.eq.band[0].gainDb = u.eqLowDb; u.eq.band[2].gainDb = u.eqMidDb; u.eq.band[4].gainDb = u.eqHighDb;
         return installState(std::move(next));
     }
 
@@ -1252,6 +1254,207 @@ public:
             default: u.toneResonance = v < 0.0F ? v : std::min(v, 1.0F); break;
         }
         return installState(std::move(next));
+    }
+
+
+    // ---------------------------------------------------------------- SILVETON_PARAMS_V1
+    // Generic access to the new Upper settings (one id, one value), so every
+    // page talks to the engine the same way. Ids of setUpperParam / upperParams:
+    //   0..14  TONE of the basic sound: startMs, endMs, filterEnvOct, filterEnvMs, velToLevel, velToCutoff,
+    //          highPassHz, lfoRateHz, lfoDepthCents, lfoDelayMs, lfoFadeMs, lfoModWheel, eqLow, eqMid, eqHigh
+    //   15     EQ on; 16..35 bands 1..5 x (on, freq, gain, q); 36 hpOn 37 hpHz 38 hpSlope 39 lpOn 40 lpHz 41 lpSlope
+    //   42 portaMode (0 SILVETON 1 KRONOS) 43 fingered 44 rateMode 45 portaTime 0..127
+    //   46 fxSend3 47 fxSend4 48 pitchBendRange
+    static constexpr int kUpperParamCount = 49;
+
+    static void applyToneExtra(ToneExtra& x, int id, float v) {
+        switch (id) {
+            case 0: x.startMs = std::clamp(v, 0.0F, kToneMaxStartMs); break;
+            case 1: x.endMs = std::clamp(v, 0.0F, 600000.0F); break;
+            case 2: x.filterEnvOctaves = std::clamp(v, -8.0F, 8.0F); break;
+            case 3: x.filterEnvMs = std::clamp(v, 1.0F, 20000.0F); break;
+            case 4: x.velToLevel = std::clamp(v, 0.0F, 1.0F); break;
+            case 5: x.velToCutoff = std::clamp(v, 0.0F, 8.0F); break;
+            case 6: x.highPassHz = std::clamp(v, 0.0F, 4000.0F); break;
+            case 7: x.lfoRateHz = std::clamp(v, 0.1F, 20.0F); break;
+            case 8: x.lfoDepthCents = std::clamp(v, 0.0F, 1200.0F); break;
+            case 9: x.lfoDelayMs = std::clamp(v, 0.0F, 10000.0F); break;
+            case 10: x.lfoFadeMs = std::clamp(v, 0.0F, 10000.0F); break;
+            case 11: x.lfoModWheel = v >= 0.5F; break;
+            case 12: x.eqLowDb = std::clamp(v, -18.0F, 18.0F); break;
+            case 13: x.eqMidDb = std::clamp(v, -18.0F, 18.0F); break;
+            case 14: x.eqHighDb = std::clamp(v, -18.0F, 18.0F); break;
+            default: break;
+        }
+    }
+    static void readToneExtra(const ToneExtra& x, std::vector<float>& out) {
+        out.insert(out.end(), {x.startMs, x.endMs, x.filterEnvOctaves, x.filterEnvMs, x.velToLevel, x.velToCutoff, x.highPassHz,
+                               x.lfoRateHz, x.lfoDepthCents, x.lfoDelayMs, x.lfoFadeMs, x.lfoModWheel ? 1.0F : 0.0F, x.eqLowDb, x.eqMidDb, x.eqHighDb});
+    }
+
+    bool setUpperParam(int upperIndex, int id, float v) {
+        if (upperIndex < 0 || upperIndex >= kUpperCount || id < 0 || id >= kUpperParamCount || !std::isfinite(v)) { setTextError("Invalid Upper parameter"); return false; }
+        auto next = std::make_shared<EngineState>(state_ != nullptr ? *state_ : EngineState{});
+        auto& u = next->combi.uppers[static_cast<std::size_t>(upperIndex)];
+        if (id <= 14) applyToneExtra(u.toneExtra, id, v);
+        else if (id == 15) u.eq.on = v >= 0.5F;
+        else if (id <= 35) {
+            auto& b = u.eq.band[static_cast<std::size_t>((id - 16) / 4)];
+            switch ((id - 16) % 4) {
+                case 0: b.on = v >= 0.5F; break;
+                case 1: b.freqHz = std::clamp(v, 20.0F, 20000.0F); break;
+                case 2: b.gainDb = std::clamp(v, -18.0F, 18.0F); break;
+                default: b.q = std::clamp(v, 0.1F, 10.0F); break;
+            }
+            u.eqLowDb = u.eq.band[0].gainDb; u.eqMidDb = u.eq.band[2].gainDb; u.eqHighDb = u.eq.band[4].gainDb;
+        }
+        else if (id == 36) u.eq.hpOn = v >= 0.5F;
+        else if (id == 37) u.eq.hpHz = std::clamp(v, 10.0F, 2000.0F);
+        else if (id == 38) u.eq.hpSlopeDb = v >= 18.0F ? 24U : 12U;
+        else if (id == 39) u.eq.lpOn = v >= 0.5F;
+        else if (id == 40) u.eq.lpHz = std::clamp(v, 1000.0F, 20000.0F);
+        else if (id == 41) u.eq.lpSlopeDb = v >= 18.0F ? 24U : 12U;
+        else if (id == 42) u.portaMode = v >= 0.5F ? PortamentoMode::Kronos : PortamentoMode::Silveton;
+        else if (id == 43) u.portaFingered = v >= 0.5F;
+        else if (id == 44) u.portaRateMode = v >= 0.5F;
+        else if (id == 45) u.portaTime = static_cast<std::uint8_t>(std::clamp(static_cast<int>(std::lround(v)), 0, 127));
+        else if (id == 46) u.fxSend3 = std::clamp(v, 0.0F, 1.0F);
+        else if (id == 47) u.fxSend4 = std::clamp(v, 0.0F, 1.0F);
+        else if (id == 48) u.pitchBendRange = static_cast<std::int8_t>(std::clamp(static_cast<int>(std::lround(v)), 0, 24));
+        return installState(std::move(next));
+    }
+
+    std::vector<float> upperParams(int upperIndex) const {
+        std::vector<float> out;
+        if (upperIndex < 0 || upperIndex >= kUpperCount || state_ == nullptr) return out;
+        const auto& u = state_->combi.uppers[static_cast<std::size_t>(upperIndex)];
+        readToneExtra(u.toneExtra, out);
+        out.push_back(u.eq.on ? 1.0F : 0.0F);
+        for (const auto& b : u.eq.band) out.insert(out.end(), {b.on ? 1.0F : 0.0F, b.freqHz, b.gainDb, b.q});
+        out.insert(out.end(), {u.eq.hpOn ? 1.0F : 0.0F, u.eq.hpHz, static_cast<float>(u.eq.hpSlopeDb), u.eq.lpOn ? 1.0F : 0.0F, u.eq.lpHz, static_cast<float>(u.eq.lpSlopeDb)});
+        out.insert(out.end(), {u.portaMode == PortamentoMode::Kronos ? 1.0F : 0.0F, u.portaFingered ? 1.0F : 0.0F, u.portaRateMode ? 1.0F : 0.0F, static_cast<float>(u.portaTime)});
+        out.insert(out.end(), {u.fxSend3, u.fxSend4, static_cast<float>(u.pitchBendRange)});
+        return out;
+    }
+
+    // SILVETON_LAYERS_V1. Ids of setLayerParam / layerParams (layer 0..3):
+    //   0 enabled 1 levelDb 2 pan 3 transpose 4 octave 5 tuneCents 6 keyLow 7 keyHigh 8 velLow 9 velHigh
+    //   10..15 TONE attackMs decayMs sustain releaseMs cutoffHz resonance (-1 = PROGRAM default)
+    //   16..30 TONE extra (same order as the Upper ids 0..14)
+    //   layerParams adds 31 = soundSlotId
+    static constexpr int kLayerParamCount = 31;
+
+    bool setLayerParam(int upperIndex, int layer, int id, float v) {
+        if (upperIndex < 0 || upperIndex >= kUpperCount || layer < 0 || layer >= kUpperLayers || id < 0 || id >= kLayerParamCount || !std::isfinite(v)) { setTextError("Invalid layer parameter"); return false; }
+        auto next = std::make_shared<EngineState>(state_ != nullptr ? *state_ : EngineState{});
+        auto& l = next->combi.uppers[static_cast<std::size_t>(upperIndex)].layers[static_cast<std::size_t>(layer)];
+        const auto i8 = [](float x, int lo, int hi) { return static_cast<std::int8_t>(std::clamp(static_cast<int>(std::lround(x)), lo, hi)); };
+        const auto u8 = [](float x, int lo, int hi) { return static_cast<std::uint8_t>(std::clamp(static_cast<int>(std::lround(x)), lo, hi)); };
+        const auto tone = [](float x, float hi) { return x < 0.0F ? -1.0F : std::min(x, hi); };
+        switch (id) {
+            case 0: l.enabled = v >= 0.5F; break;
+            case 1: l.levelDb = std::clamp(v, -60.0F, 12.0F); break;
+            case 2: l.pan = std::clamp(v, -1.0F, 1.0F); break;
+            case 3: l.transposeSemitones = i8(v, -12, 12); break;
+            case 4: l.octave = i8(v, -3, 3); break;
+            case 5: l.tuneCents = std::clamp(v, -1200.0F, 1200.0F); break;
+            case 6: l.keyLow = u8(v, 0, 127); break;
+            case 7: l.keyHigh = u8(v, 0, 127); break;
+            case 8: l.velocityLow = u8(v, 1, 127); break;
+            case 9: l.velocityHigh = u8(v, 1, 127); break;
+            case 10: l.tone.attackMs = tone(v, kToneMaxTimeMs); break;
+            case 11: l.tone.decayMs = tone(v, kToneMaxTimeMs); break;
+            case 12: l.tone.sustain = tone(v, 1.0F); break;
+            case 13: l.tone.releaseMs = tone(v, kToneMaxTimeMs); break;
+            case 14: l.tone.cutoffHz = v < 0.0F ? -1.0F : std::clamp(v, 20.0F, kToneCutoffOpenHz); break;
+            case 15: l.tone.resonance = tone(v, 1.0F); break;
+            default: applyToneExtra(l.tone.x, id - 16, v); break;
+        }
+        return installState(std::move(next));
+    }
+
+    // The SOUND of a layer: 1..500 = bank SOUND, 0 = none (the layer is turned off).
+    bool setLayerSound(int upperIndex, int layer, int slot) {
+        if (upperIndex < 0 || upperIndex >= kUpperCount || layer < 0 || layer >= kUpperLayers) { setTextError("Invalid layer"); return false; }
+        auto next = std::make_shared<EngineState>(state_ != nullptr ? *state_ : EngineState{});
+        auto& l = next->combi.uppers[static_cast<std::size_t>(upperIndex)].layers[static_cast<std::size_t>(layer)];
+        if (slot <= 0 || slot > static_cast<int>(kFixedSoundSlotCount)) { l.program.reset(); l.soundSlotId = kNoSoundSlot; l.enabled = false; l.name.clear(); return installState(std::move(next)); }
+        auto program = library_.program(SlotAddress{0U, 0U, static_cast<std::uint16_t>(slot)});
+        if (program == nullptr) { setTextError("SOUND slot is empty"); return false; }
+        l.program = program; l.soundSlotId = static_cast<std::uint16_t>(slot); l.name = program->name; l.enabled = true;
+        return installState(std::move(next));
+    }
+
+    std::vector<float> layerParams(int upperIndex, int layer) const {
+        std::vector<float> out;
+        if (upperIndex < 0 || upperIndex >= kUpperCount || layer < 0 || layer >= kUpperLayers || state_ == nullptr) return out;
+        const auto& l = state_->combi.uppers[static_cast<std::size_t>(upperIndex)].layers[static_cast<std::size_t>(layer)];
+        out.insert(out.end(), {l.enabled ? 1.0F : 0.0F, l.levelDb, l.pan, static_cast<float>(l.transposeSemitones), static_cast<float>(l.octave), l.tuneCents,
+                               static_cast<float>(l.keyLow), static_cast<float>(l.keyHigh), static_cast<float>(l.velocityLow), static_cast<float>(l.velocityHigh),
+                               l.tone.attackMs, l.tone.decayMs, l.tone.sustain, l.tone.releaseMs, l.tone.cutoffHz, l.tone.resonance});
+        readToneExtra(l.tone.x, out);
+        out.push_back(static_cast<float>(l.soundSlotId));
+        return out;
+    }
+
+    std::string layerName(int upperIndex, int layer) const {
+        if (upperIndex < 0 || upperIndex >= kUpperCount || layer < 0 || layer >= kUpperLayers || state_ == nullptr) return {};
+        return state_->combi.uppers[static_cast<std::size_t>(upperIndex)].layers[static_cast<std::size_t>(layer)].name;
+    }
+
+    // SILVETON_FX_V3: unit 0..3 = send slot, 4..10 = INSERT of Upper 1..7. Ids:
+    //   0 type 1 wet 2 timeMs 3 feedback 4 rateHz 5 depth 6 tone 7 preDelayMs 8 damping 9 size 10 mod
+    //   11 tempoSync 12 tempoBpm 13 division 14 param1 15 param2 16 param3
+    static constexpr int kFxParamCount = 17;
+    static EffectSlot* fxUnitOf(Combi& c, int unit) {
+        if (unit >= 0 && unit < kFxSendSlots) return &c.fx[static_cast<std::size_t>(unit)];
+        if (unit >= kFxSendSlots && unit < kFxSendSlots + kUpperCount) return &c.insert[static_cast<std::size_t>(unit - kFxSendSlots)];
+        return nullptr;
+    }
+    bool setFxParam(int unit, int id, float v) {
+        if (id < 0 || id >= kFxParamCount || !std::isfinite(v)) { setTextError("Invalid FX parameter"); return false; }
+        auto next = std::make_shared<EngineState>(state_ != nullptr ? *state_ : EngineState{});
+        EffectSlot* f = fxUnitOf(next->combi, unit);
+        if (f == nullptr) { setTextError("Invalid FX unit"); return false; }
+        switch (id) {
+            case 0: { const int t = static_cast<int>(std::lround(v)); f->type = (t >= 0 && t < kEffectTypeCount) ? static_cast<EffectType>(t) : EffectType::Off; break; }
+            case 1: f->wet = std::clamp(v, 0.0F, 1.0F); break;
+            case 2: f->timeMs = std::clamp(v, 0.1F, 2500.0F); break;
+            case 3: f->feedback = std::clamp(v, -0.95F, 0.95F); break;
+            case 4: f->rateHz = std::clamp(v, 0.02F, 12.0F); break;
+            case 5: f->depth = std::clamp(v, 0.0F, 1.0F); break;
+            case 6: f->tone = std::clamp(v, 0.0F, 24.0F); break;
+            case 7: f->preDelayMs = std::clamp(v, 0.0F, 200.0F); break;
+            case 8: f->damping = std::clamp(v, 0.0F, 1.0F); break;
+            case 9: f->size = std::clamp(v, 0.0F, 1.0F); break;
+            case 10: f->mod = std::clamp(v, 0.0F, 1.0F); break;
+            case 11: f->tempoSync = v >= 0.5F; break;
+            case 12: f->tempoBpm = std::clamp(v, 30.0F, 300.0F); break;
+            case 13: f->division = std::clamp(v, 1.0F / 64.0F, 1.0F); break;
+            case 14: f->param1 = std::clamp(v, -60.0F, 60.0F); break;
+            case 15: f->param2 = std::clamp(v, -60.0F, 60.0F); break;
+            default: f->param3 = std::clamp(v, -60.0F, 10000.0F); break;
+        }
+        return installState(std::move(next));
+    }
+    std::vector<float> fxParams(int unit) const {
+        std::vector<float> out;
+        if (state_ == nullptr) return out;
+        Combi c = state_->combi;   // a copy only for the lookup helper
+        const EffectSlot* f = fxUnitOf(c, unit);
+        if (f == nullptr) return out;
+        out = {static_cast<float>(f->type), f->wet, f->timeMs, f->feedback, f->rateHz, f->depth, f->tone, f->preDelayMs, f->damping, f->size, f->mod,
+               f->tempoSync ? 1.0F : 0.0F, f->tempoBpm, f->division, f->param1, f->param2, f->param3};
+        return out;
+    }
+
+    // SILVETON_ANALYZER_V1
+    std::vector<float> analyzerFrame(int upper, bool afterEq) {
+        if (upper < 0 || upper >= kUpperCount) { engine_.setAnalyzerTap(-1, true); return {}; }
+        engine_.setAnalyzerTap(upper, afterEq);
+        std::vector<float> out(8192U);
+        engine_.readAnalyzer(out.data(), out.size());
+        return out;
     }
 
     std::vector<float> upperState(int upperIndex) const {
@@ -1358,15 +1561,15 @@ public:
 
     bool updateCombiFx(int slot, int type, float wet, float timeMs, float feedback,
                        float rateHz, float depth, float tone) {
-        if (slot < 0 || slot > 1) { setTextError("Invalid COMBI FX slot"); return false; }
-        if (type < static_cast<int>(EffectType::Off) || type > static_cast<int>(EffectType::Reverb)) { setTextError("Invalid COMBI FX type"); return false; }
+        if (slot < 0 || slot >= kFxSendSlots) { setTextError("Invalid COMBI FX slot"); return false; }
+        if (type < static_cast<int>(EffectType::Off) || type >= kEffectTypeCount) { setTextError("Invalid COMBI FX type"); return false; }
         auto next = std::make_shared<EngineState>(state_ != nullptr ? *state_ : EngineState{});
-        auto& fx = slot == 0 ? next->combi.fx1 : next->combi.fx2;
+        auto& fx = next->combi.fx[static_cast<std::size_t>(slot)];
         fx.type = static_cast<EffectType>(type);
         fx.wet = std::clamp(wet, 0.0F, 1.0F);
         fx.timeMs = std::clamp(timeMs, 1.0F, 2500.0F);
         fx.feedback = std::clamp(feedback, 0.0F, 0.95F);
-        fx.rateHz = std::clamp(rateHz, 0.05F, 8.0F);
+        fx.rateHz = std::clamp(rateHz, 0.02F, 12.0F);
         fx.depth = std::clamp(depth, 0.0F, 1.0F);
         fx.tone = std::clamp(tone, 0.0F, 1.0F);
         return installState(std::move(next));
@@ -1387,7 +1590,7 @@ public:
             out.push_back(fx.wet); out.push_back(fx.timeMs); out.push_back(fx.feedback);
             out.push_back(fx.rateHz); out.push_back(fx.depth); out.push_back(fx.tone);
         };
-        append(state_->combi.fx1); append(state_->combi.fx2);
+        for (const auto& f : state_->combi.fx) append(f);
         out.push_back(static_cast<float>(state_->combi.fxRouting));
         return out;
     }
@@ -1437,7 +1640,8 @@ public:
         g.eqLowDb = std::clamp(eqLowDb, -18.0F, 18.0F);
         g.eqMidDb = std::clamp(eqMidDb, -18.0F, 18.0F);
         g.eqHighDb = std::clamp(eqHighDb, -18.0F, 18.0F);
-        g.limiterEnabled = limiterEnabled;
+        g.limiterEnabled = false;  // SILVETON_MASTER_6DB_V1: no limiter in the sound
+        (void)limiterEnabled;
         g.limiterCeilingDb = std::clamp(limiterCeilingDb, -12.0F, 0.0F);
         g.velocityCurve = static_cast<std::uint8_t>(std::clamp(velocityCurve, 0, 4));
         g.breathCc = static_cast<std::uint8_t>(std::clamp(breathCc, 0, 127));
@@ -2560,6 +2764,18 @@ private:
         engine_.prepare(
             static_cast<double>(std::max(8000, sr)),
             static_cast<std::uint32_t>(std::max(64, period)));
+        // SILVETON_START_REFRESH_V1: every start of the program begins clean - the
+        // headphone route was just re-applied, the PCM is freshly opened, the engine
+        // is rebuilt for this rate, the Studio interpolation is set again and the
+        // MASTER starts at -6 dB (no limiter).
+        engine_.setInterpolationQuality(InterpolationQuality::Studio);
+        if (state_ != nullptr) {
+            auto fresh = std::make_shared<EngineState>(*state_);
+            fresh->global.masterGainDb = -6.0F;
+            fresh->global.limiterEnabled = false;
+            state_ = fresh;
+            library_.setGlobal(fresh->global);
+        }
         if (state_ != nullptr) engine_.setState(state_);
 
         xrunCount_.store(0, std::memory_order_relaxed);
@@ -2907,7 +3123,7 @@ SlotAddress makeAddress(jint bank, jint page, jint slot) noexcept {
 }
 
 jfloatArray metersArray(JNIEnv* env, const MeterSnapshot& m) {
-    std::array<jfloat, 5 + kUpperCount * 2> v{};
+    std::array<jfloat, 6 + kUpperCount * 2> v{};
     v[0]=m.peakLeft; v[1]=m.peakRight; v[2]=m.limiterGainReductionDb;
     v[3]=static_cast<jfloat>(m.activeVoices); v[4]=static_cast<jfloat>(m.droppedEvents);
     for (std::size_t i = 0; i < static_cast<std::size_t>(kUpperCount); ++i) {
@@ -2915,6 +3131,7 @@ jfloatArray metersArray(JNIEnv* env, const MeterSnapshot& m) {
         v[base] = m.upperPeakLeft[i];
         v[base + 1U] = m.upperPeakRight[i];
     }
+    v[5U + static_cast<std::size_t>(kUpperCount) * 2U] = m.cpuLoadPercent;   // SILVETON_CPU_METER_V1 (last value)
     jfloatArray a=env->NewFloatArray(static_cast<jsize>(v.size()));
     if(a!=nullptr)env->SetFloatArrayRegion(a,0,static_cast<jsize>(v.size()),v.data());
     return a;
@@ -3064,6 +3281,15 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEng
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeUpdateUpperControllerRoute(JNIEnv*,jobject,jint upper,jint route,jint source,jint destination,jint cc,jfloat amount,jboolean bipolar){return sampler().updateUpperControllerRoute(upper,route,source,destination,cc,amount,bipolar==JNI_TRUE)?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeUpdateCombiFx(JNIEnv*,jobject,jint slot,jint type,jfloat wet,jfloat timeMs,jfloat feedback,jfloat rateHz,jfloat depth,jfloat tone){return sampler().updateCombiFx(slot,type,wet,timeMs,feedback,rateHz,depth,tone)?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeUpdateCombiFxRouting(JNIEnv*,jobject,jint routing){return sampler().updateCombiFxRouting(routing)?JNI_TRUE:JNI_FALSE;}
+extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeSetUpperParam(JNIEnv*,jobject,jint upper,jint id,jfloat value){return sampler().setUpperParam(upper,id,value)?JNI_TRUE:JNI_FALSE;}
+extern "C" JNIEXPORT jfloatArray JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeUpperParams(JNIEnv* env,jobject,jint upper){return floatVectorArray(env,sampler().upperParams(upper));}
+extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeSetLayerParam(JNIEnv*,jobject,jint upper,jint layer,jint id,jfloat value){return sampler().setLayerParam(upper,layer,id,value)?JNI_TRUE:JNI_FALSE;}
+extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeSetLayerSound(JNIEnv*,jobject,jint upper,jint layer,jint slot){return sampler().setLayerSound(upper,layer,slot)?JNI_TRUE:JNI_FALSE;}
+extern "C" JNIEXPORT jfloatArray JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeLayerParams(JNIEnv* env,jobject,jint upper,jint layer){return floatVectorArray(env,sampler().layerParams(upper,layer));}
+extern "C" JNIEXPORT jstring JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeLayerName(JNIEnv* env,jobject,jint upper,jint layer){return env->NewStringUTF(sampler().layerName(upper,layer).c_str());}
+extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeSetFxParam(JNIEnv*,jobject,jint unit,jint id,jfloat value){return sampler().setFxParam(unit,id,value)?JNI_TRUE:JNI_FALSE;}
+extern "C" JNIEXPORT jfloatArray JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeFxParams(JNIEnv* env,jobject,jint unit){return floatVectorArray(env,sampler().fxParams(unit));}
+extern "C" JNIEXPORT jfloatArray JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeAnalyzerFrame(JNIEnv* env,jobject,jint upper,jboolean after){return floatVectorArray(env,sampler().analyzerFrame(upper,after==JNI_TRUE));}
 extern "C" JNIEXPORT jfloatArray JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeCombiFxState(JNIEnv* env,jobject){return floatVectorArray(env,sampler().combiFxState());}
 extern "C" JNIEXPORT void JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeStartScan(JNIEnv*,jobject,jint mode){sampler().startScan(static_cast<int>(mode));}
 extern "C" JNIEXPORT jintArray JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeScanInfo(JNIEnv* env,jobject){const auto v=sampler().scanInfo();jintArray a=env->NewIntArray(static_cast<jsize>(v.size()));if(a!=nullptr){std::vector<jint> j(v.begin(),v.end());env->SetIntArrayRegion(a,0,static_cast<jsize>(j.size()),j.data());}return a;}

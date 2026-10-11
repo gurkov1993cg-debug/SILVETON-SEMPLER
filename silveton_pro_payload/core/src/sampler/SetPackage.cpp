@@ -18,7 +18,7 @@
 namespace silveton::sampler {
 namespace {
 
-constexpr std::uint32_t kVersion = 11U;
+constexpr std::uint32_t kVersion = 12U;   // SILVETON_SET_V12: layers, TONE v2, EQ5, porta modes, FX v3
 constexpr std::array<char,8> kMagic{{'S','I','L','V','S','E','T','1'}};
 
 struct Writer {
@@ -53,8 +53,21 @@ void writeFilter(Writer& w,const FilterParams& p){w.u8(static_cast<std::uint8_t>
 FilterParams readFilter(Reader& r){FilterParams p; p.mode=static_cast<FilterMode>(r.u8());p.cutoffHz=r.f32();p.resonance=r.f32();p.keyTrack=r.f32();p.velocityAmount=r.f32();p.envelopeAmount=r.f32();p.lfoAmount=r.f32();return p;}
 void writeLfo(Writer&w,const LfoParams&p){w.u8(static_cast<std::uint8_t>(p.wave));w.f32(p.frequencyHz);w.f32(p.delaySec);w.f32(p.fadeSec);w.u8(p.keySync?1U:0U);w.f32(p.pitchCents);w.f32(p.filterOctaves);w.f32(p.ampDepth);} 
 LfoParams readLfo(Reader&r){LfoParams p;p.wave=static_cast<LfoWave>(r.u8());p.frequencyHz=r.f32();p.delaySec=r.f32();p.fadeSec=r.f32();p.keySync=r.u8()!=0U;p.pitchCents=r.f32();p.filterOctaves=r.f32();p.ampDepth=r.f32();return p;}
-void writeFx(Writer&w,const EffectSlot&p){w.u8(static_cast<std::uint8_t>(p.type));w.f32(p.wet);w.f32(p.timeMs);w.f32(p.feedback);w.f32(p.rateHz);w.f32(p.depth);w.f32(p.tone);} 
-EffectSlot readFx(Reader&r){EffectSlot p;p.type=static_cast<EffectType>(r.u8());p.wet=r.f32();p.timeMs=r.f32();p.feedback=r.f32();p.rateHz=r.f32();p.depth=r.f32();p.tone=r.f32();return p;}
+void writeFx(Writer&w,const EffectSlot&p){w.u8(static_cast<std::uint8_t>(p.type));w.f32(p.wet);w.f32(p.timeMs);w.f32(p.feedback);w.f32(p.rateHz);w.f32(p.depth);w.f32(p.tone);
+    w.f32(p.preDelayMs);w.f32(p.damping);w.f32(p.size);w.f32(p.mod);w.u8(p.tempoSync?1U:0U);w.f32(p.tempoBpm);w.f32(p.division);w.f32(p.param1);w.f32(p.param2);w.f32(p.param3);}
+EffectSlot readFx(Reader&r,std::uint32_t version){EffectSlot p;const auto t=r.u8();p.type=t<static_cast<std::uint8_t>(kEffectTypeCount)?static_cast<EffectType>(t):EffectType::Off;p.wet=r.f32();p.timeMs=r.f32();p.feedback=r.f32();p.rateHz=r.f32();p.depth=r.f32();p.tone=r.f32();
+    if(version>=12U){p.preDelayMs=r.f32();p.damping=r.f32();p.size=r.f32();p.mod=r.f32();p.tempoSync=r.u8()!=0U;p.tempoBpm=r.f32();p.division=r.f32();p.param1=r.f32();p.param2=r.f32();p.param3=r.f32();}
+    else if(p.type==EffectType::Reverb){p.damping=1.0F-std::clamp(p.tone,0.0F,1.0F);p.tone=0.6F;}   // the old PLATE used TONE as damping
+    return p;}
+void writeToneExtra(Writer&w,const ToneExtra&x){w.f32(x.startMs);w.f32(x.endMs);w.f32(x.filterEnvOctaves);w.f32(x.filterEnvMs);w.f32(x.velToLevel);w.f32(x.velToCutoff);w.f32(x.highPassHz);w.f32(x.lfoRateHz);w.f32(x.lfoDepthCents);w.f32(x.lfoDelayMs);w.f32(x.lfoFadeMs);w.u8(x.lfoModWheel?1U:0U);w.f32(x.eqLowDb);w.f32(x.eqMidDb);w.f32(x.eqHighDb);}
+ToneExtra readToneExtra(Reader&r){ToneExtra x;x.startMs=r.f32();x.endMs=r.f32();x.filterEnvOctaves=r.f32();x.filterEnvMs=r.f32();x.velToLevel=r.f32();x.velToCutoff=r.f32();x.highPassHz=r.f32();x.lfoRateHz=r.f32();x.lfoDepthCents=r.f32();x.lfoDelayMs=r.f32();x.lfoFadeMs=r.f32();x.lfoModWheel=r.u8()!=0U;x.eqLowDb=r.f32();x.eqMidDb=r.f32();x.eqHighDb=r.f32();
+    const auto fin=[](float&v,float d){if(!std::isfinite(v))v=d;};fin(x.startMs,0.0F);fin(x.endMs,0.0F);fin(x.filterEnvOctaves,0.0F);fin(x.filterEnvMs,120.0F);fin(x.velToLevel,1.0F);fin(x.velToCutoff,0.0F);fin(x.highPassHz,0.0F);fin(x.lfoRateHz,5.5F);fin(x.lfoDepthCents,0.0F);fin(x.lfoDelayMs,0.0F);fin(x.lfoFadeMs,300.0F);fin(x.eqLowDb,0.0F);fin(x.eqMidDb,0.0F);fin(x.eqHighDb,0.0F);return x;}
+void writeSoundTone(Writer&w,const SoundTone&t){w.f32(t.attackMs);w.f32(t.decayMs);w.f32(t.sustain);w.f32(t.releaseMs);w.f32(t.cutoffHz);w.f32(t.resonance);writeToneExtra(w,t.x);}
+SoundTone readSoundTone(Reader&r){SoundTone t;const auto tone=[&r](float hi){const float v=r.f32();return(std::isfinite(v)&&v>=0.0F)?std::min(v,hi):-1.0F;};
+    t.attackMs=tone(kToneMaxTimeMs);t.decayMs=tone(kToneMaxTimeMs);t.sustain=tone(1.0F);t.releaseMs=tone(kToneMaxTimeMs);t.cutoffHz=tone(kToneCutoffOpenHz);t.resonance=tone(1.0F);t.x=readToneExtra(r);return t;}
+void writeEq(Writer&w,const UpperEq&e){w.u8(e.on?1U:0U);for(const auto&b:e.band){w.u8(b.on?1U:0U);w.f32(b.freqHz);w.f32(b.gainDb);w.f32(b.q);}w.u8(e.hpOn?1U:0U);w.f32(e.hpHz);w.u8(e.hpSlopeDb);w.u8(e.lpOn?1U:0U);w.f32(e.lpHz);w.u8(e.lpSlopeDb);}
+UpperEq readEq(Reader&r){UpperEq e;e.on=r.u8()!=0U;for(auto&b:e.band){b.on=r.u8()!=0U;b.freqHz=std::clamp(r.f32(),20.0F,20000.0F);b.gainDb=std::clamp(r.f32(),-18.0F,18.0F);b.q=std::clamp(r.f32(),0.1F,10.0F);}
+    e.hpOn=r.u8()!=0U;e.hpHz=std::clamp(r.f32(),10.0F,2000.0F);e.hpSlopeDb=r.u8()>=24U?24U:12U;e.lpOn=r.u8()!=0U;e.lpHz=std::clamp(r.f32(),1000.0F,20000.0F);e.lpSlopeDb=r.u8()>=24U?24U:12U;return e;}
 void writeAddress(Writer&w,const SlotAddress&a){w.u16(a.bank);w.u16(a.page);w.u16(a.slot);} 
 SlotAddress readAddress(Reader&r){return {r.u16(),r.u16(),r.u16()};}
 
@@ -126,6 +139,12 @@ void writeUpper(Writer&w,const UpperPart&u,const Graph&g){
     w.f32(u.ampSustainScale);w.u8(static_cast<std::uint8_t>(u.voiceMode));
     w.f32(u.toneAttackMs);w.f32(u.toneDecayMs);w.f32(u.toneSustain);w.f32(u.toneReleaseMs);w.f32(u.toneCutoffHz);w.f32(u.toneResonance);
     for(const auto&route:u.controllerRoutes){w.u8(static_cast<std::uint8_t>(route.source));w.u8(static_cast<std::uint8_t>(route.destination));w.u8(route.cc);w.f32(route.amount);w.u8(route.bipolar?1U:0U);}
+    // SILVETON_SET_V12
+    writeToneExtra(w,u.toneExtra);
+    for(const auto&l:u.layers){w.u8(l.enabled?1U:0U);w.str(l.name);const auto lit=g.programIds.find(l.program.get());w.u32(lit==g.programIds.end()?0xFFFFFFFFU:lit->second);w.u16(l.soundSlotId);
+        w.f32(l.levelDb);w.f32(l.pan);w.i8(l.transposeSemitones);w.i8(l.octave);w.f32(l.tuneCents);w.u8(l.keyLow);w.u8(l.keyHigh);w.u8(l.velocityLow);w.u8(l.velocityHigh);writeSoundTone(w,l.tone);}
+    writeEq(w,u.eq);
+    w.u8(static_cast<std::uint8_t>(u.portaMode));w.u8(u.portaFingered?1U:0U);w.u8(u.portaRateMode?1U:0U);w.u8(u.portaTime);w.f32(u.fxSend3);w.f32(u.fxSend4);
 }
 
 UpperPart readUpper(Reader&r,const std::vector<ProgramPtr>&p,std::uint32_t version){
@@ -143,11 +162,24 @@ UpperPart readUpper(Reader&r,const std::vector<ProgramPtr>&p,std::uint32_t versi
         u.toneCutoffHz=tone(kToneCutoffOpenHz);u.toneResonance=tone(1.0F);
     }
     if(version>=6U){for(auto&route:u.controllerRoutes){route.source=static_cast<ControllerSource>(r.u8());route.destination=static_cast<ModDestination>(r.u8());route.cc=static_cast<std::uint8_t>(r.u8()&0x7FU);route.amount=r.f32();route.bipolar=r.u8()!=0U;}}
+    if(version>=12U){
+        u.toneExtra=readToneExtra(r);
+        for(auto&l:u.layers){l.enabled=r.u8()!=0U;l.name=r.str();const auto lid=r.u32();if(lid<p.size())l.program=p[lid];l.soundSlotId=r.u16();
+            l.levelDb=std::clamp(r.f32(),-60.0F,24.0F);l.pan=std::clamp(r.f32(),-1.0F,1.0F);l.transposeSemitones=r.i8();l.octave=r.i8();l.tuneCents=r.f32();l.keyLow=r.u8();l.keyHigh=r.u8();l.velocityLow=r.u8();l.velocityHigh=r.u8();l.tone=readSoundTone(r);}
+        u.eq=readEq(r);
+        const auto pm=r.u8();u.portaMode=pm==1U?PortamentoMode::Kronos:PortamentoMode::Silveton;u.portaFingered=r.u8()!=0U;u.portaRateMode=r.u8()!=0U;u.portaTime=static_cast<std::uint8_t>(std::min<unsigned>(r.u8(),127U));
+        u.fxSend3=std::clamp(r.f32(),0.0F,1.0F);u.fxSend4=std::clamp(r.f32(),0.0F,1.0F);
+    } else {
+        // an old BLEND: its LOW / MID / HIGH become bands 1 / 3 / 5 of the new EQ
+        u.eq.band[0].gainDb=std::clamp(u.eqLowDb,-18.0F,18.0F);u.eq.band[2].gainDb=std::clamp(u.eqMidDb,-18.0F,18.0F);u.eq.band[4].gainDb=std::clamp(u.eqHighDb,-18.0F,18.0F);
+    }
     return u;
 }
 
-void writeCombi(Writer&w,const Combi&c,const Graph&g){w.str(c.name);for(const auto&u:c.uppers)writeUpper(w,u,g);writeFx(w,c.fx1);writeFx(w,c.fx2);w.u8(static_cast<std::uint8_t>(c.fxRouting));}
-Combi readCombi(Reader&r,const std::vector<ProgramPtr>&p,std::uint32_t version){Combi c;c.name=r.str();for(auto&u:c.uppers)u=readUpper(r,p,version);c.fx1=readFx(r);c.fx2=readFx(r);if(version>=6U)c.fxRouting=static_cast<EffectRouting>(r.u8());return c;}
+void writeCombi(Writer&w,const Combi&c,const Graph&g){w.str(c.name);for(const auto&u:c.uppers)writeUpper(w,u,g);writeFx(w,c.fx[0]);writeFx(w,c.fx[1]);w.u8(static_cast<std::uint8_t>(c.fxRouting));
+    writeFx(w,c.fx[2]);writeFx(w,c.fx[3]);for(const auto&ins:c.insert)writeFx(w,ins);}   // SILVETON_SET_V12
+Combi readCombi(Reader&r,const std::vector<ProgramPtr>&p,std::uint32_t version){Combi c;c.name=r.str();for(auto&u:c.uppers)u=readUpper(r,p,version);c.fx[0]=readFx(r,version);c.fx[1]=readFx(r,version);if(version>=6U)c.fxRouting=static_cast<EffectRouting>(r.u8());
+    if(version>=12U){c.fx[2]=readFx(r,version);c.fx[3]=readFx(r,version);for(auto&ins:c.insert)ins=readFx(r,version);}return c;}
 
 } // namespace
 
@@ -156,7 +188,7 @@ SetPackageResult savePackageDirectory(const std::string& packageDirectory,const 
     namespace fs=std::filesystem;
     try{
         fs::path root(packageDirectory);fs::remove_all(root);fs::create_directories(root/"audio");
-        Graph g;for(const auto&s:data.samples)g.addSample(s.sample);for(const auto&m:data.multisamples)g.addMs(m.multisample);for(const auto&s:data.programs)g.addProgram(s.program);for(const auto&cs:data.combis)for(const auto&u:cs.combi.uppers)g.addProgram(u.program);
+        Graph g;for(const auto&s:data.samples)g.addSample(s.sample);for(const auto&m:data.multisamples)g.addMs(m.multisample);for(const auto&s:data.programs)g.addProgram(s.program);for(const auto&cs:data.combis)for(const auto&u:cs.combi.uppers){g.addProgram(u.program);for(const auto&l:u.layers)g.addProgram(l.program);}
         Writer w(root/"manifest.svs");if(!w.ok())return{false,"Cannot create SET manifest"};w.bytes(kMagic.data(),kMagic.size());w.u32(kVersion);w.str(data.name);writeGlobal(w,data.global);
         w.u32(static_cast<std::uint32_t>(g.samples.size()));
         for(std::uint32_t i=0U;i<g.samples.size();++i){const auto&s=*g.samples[i];w.str(s.name);w.str(s.sourceIdentity);w.u8(s.rootKey);w.f32(s.fineTuneCents);w.u8(s.loop.enabled?1U:0U);w.u32(static_cast<std::uint32_t>(s.loop.startFrame));w.u32(static_cast<std::uint32_t>(s.loop.endFrame));w.u32(s.loop.crossfadeFrames);

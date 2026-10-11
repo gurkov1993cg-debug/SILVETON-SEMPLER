@@ -8,6 +8,17 @@ class NativeSamplerEngine {
 
     external fun nativeSamplerInit()
     external fun nativeSetUpperToneParam(upper: Int, param: Int, value: Float): Boolean
+    // SILVETON_PARAMS_V1 / SILVETON_LAYERS_V1 / SILVETON_FX_V3 (ids: see SamplerAudioBridge.cpp)
+    external fun nativeSetUpperParam(upper: Int, id: Int, value: Float): Boolean
+    external fun nativeUpperParams(upper: Int): FloatArray
+    external fun nativeSetLayerParam(upper: Int, layer: Int, id: Int, value: Float): Boolean
+    external fun nativeSetLayerSound(upper: Int, layer: Int, slot: Int): Boolean
+    external fun nativeLayerParams(upper: Int, layer: Int): FloatArray
+    external fun nativeLayerName(upper: Int, layer: Int): String
+    external fun nativeSetFxParam(unit: Int, id: Int, value: Float): Boolean
+    external fun nativeFxParams(unit: Int): FloatArray
+    // SILVETON_ANALYZER_V1: the last 8192 mono samples of an Upper (before or after its EQ); empty = none
+    external fun nativeAnalyzerFrame(upper: Int, afterEq: Boolean): FloatArray
     external fun nativeAudioOpen(): Boolean
     external fun nativeAudioStart(): Boolean
     external fun nativeAudioStop()

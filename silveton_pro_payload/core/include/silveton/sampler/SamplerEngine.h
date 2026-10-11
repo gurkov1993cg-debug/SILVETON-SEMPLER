@@ -52,6 +52,9 @@ struct MeterSnapshot {
     std::uint64_t droppedEvents{0U};
     std::array<float, kUpperCount> upperPeakLeft{};
     std::array<float, kUpperCount> upperPeakRight{};
+    // SILVETON_CPU_METER_V1: DSP time of the last block / block length, percent
+    // (set by the caller of render() that measures the time; the engine keeps it).
+    float cpuLoadPercent{0.0F};
 };
 
 // Values the TONE page shows for an Upper (its own or the PROGRAM default).
@@ -64,6 +67,11 @@ struct UpperToneValues {
     float resonance{0.0F};
 };
 [[nodiscard]] UpperToneValues effectiveUpperTone(const UpperPart& upper) noexcept;
+// Same for a layer of an Upper (0..3).
+[[nodiscard]] UpperToneValues effectiveLayerTone(const UpperLayer& layer) noexcept;
+// SILVETON_TONE_V2: the basic sound of an Upper as one SoundTone (its six legacy
+// values plus toneExtra), so the engine treats it exactly like a layer.
+[[nodiscard]] SoundTone basicSoundTone(const UpperPart& upper) noexcept;
 
 class SamplerEngine {
 public:
@@ -132,6 +140,12 @@ public:
     bool readStreamWindow(std::size_t slot, StreamWindow& out) const noexcept;
     // How far ahead of each voice the bank is brought into memory (seconds).
     void setStreamLookaheadSeconds(double seconds) noexcept;
+    // SILVETON_ANALYZER_V1: the screen analyzer taps one Upper (mono, before or
+    // after its common EQ). upper < 0 = off (costs nothing). readAnalyzer copies
+    // the newest `frames` samples (oldest first); display only, no locks.
+    void setAnalyzerTap(int upper, bool afterEq) noexcept;
+    void readAnalyzer(float* out, std::size_t frames) const noexcept;
+    static constexpr std::size_t kAnalyzerRing = 16384U;
 
 public:
     struct Impl; // internal DSP state; exposed only for translation-unit helpers

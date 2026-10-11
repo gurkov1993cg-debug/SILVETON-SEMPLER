@@ -52,7 +52,8 @@ class SamplerAppController(
         val peakRight: Float,
         val limiterGainReductionDb: Float,
         val activeVoices: Int,
-        val droppedRealtimeEvents: Int
+        val droppedRealtimeEvents: Int,
+        val cpuLoadPercent: Float = 0f   // SILVETON_CPU_METER_V1
     )
 
 
@@ -509,40 +510,84 @@ class SamplerAppController(
     // SILVETON_SET_SAVE_AS_V1: SAVE AS / LOAD of the whole set: every LIST position with
     // its BLEND, all COMBI settings, GLOBAL settings and the T / Q choice.
     // Files: /storage/emulated/0/SILVETON/SETS/<name>.SVSET (+ <name>.TQ).
-    private val setsDir: File get() = File(backupDir, "SETS")
+    // SILVETON_SETS_FIX_V1: the sets live in the app's own folder (always readable and
+    // writable) AND a copy goes to /storage/emulated/0/SILVETON/SETS (survives an
+    // uninstall). LOAD shows both, so a saved set is always found.
+    private val setsDirPrivate: File get() = File(appContext.filesDir, "SETS")
+    private val setsDirShared: File get() = File(backupDir, "SETS")
+    private fun setsDirs(): List<File> = listOf(setsDirPrivate, setsDirShared)
+    fun setsFolders(): String = setsDirs().joinToString("  и  ") { it.absolutePath }
+
+    // SILVETON_LIST_V2: favourite LIST positions
+
+    // ---------------------------------------------------------------- SILVETON_PARAMS_V1
+    // Generic engine settings (ids: SamplerAudioBridge.cpp). Values come back as float arrays.
+    fun setUpperParam(upper: Int, id: Int, value: Float): Boolean = nativeResult(engine.nativeSetUpperParam(upper, id, value))
+    fun upperParams(upper: Int): FloatArray = engine.nativeUpperParams(upper)
+    fun setLayerParam(upper: Int, layer: Int, id: Int, value: Float): Boolean = nativeResult(engine.nativeSetLayerParam(upper, layer, id, value))
+    fun setLayerSound(upper: Int, layer: Int, slot: Int): Boolean = nativeResult(engine.nativeSetLayerSound(upper, layer, slot))
+    fun layerParams(upper: Int, layer: Int): FloatArray = engine.nativeLayerParams(upper, layer)
+    fun layerName(upper: Int, layer: Int): String = engine.nativeLayerName(upper, layer)
+    fun setFxParam(unit: Int, id: Int, value: Float): Boolean = nativeResult(engine.nativeSetFxParam(unit, id, value))
+    fun fxParams(unit: Int): FloatArray = engine.nativeFxParams(unit)
+    // Sound picker memory: favourite SOUND slots and the last picked ones (SILVETON_PICKER_V1)
+    fun soundFavourites(): Set<Int> = portaPrefs.getString("sound_favs", "")!!.split(',').mapNotNull { it.toIntOrNull() }.toSet()
+    fun saveSoundFavourites(favs: Set<Int>) { portaPrefs.edit().putString("sound_favs", favs.sorted().joinToString(",")).apply() }
+    fun recentSounds(): List<Int> = portaPrefs.getString("sound_recent", "")!!.split(',').mapNotNull { it.toIntOrNull() }
+    fun rememberRecentSound(slot: Int) {
+        val list = (listOf(slot) + recentSounds().filter { it != slot }).take(40)
+        portaPrefs.edit().putString("sound_recent", list.joinToString(",")).apply()
+    }
+    fun analyzerFrame(upper: Int, afterEq: Boolean): FloatArray = engine.nativeAnalyzerFrame(upper, afterEq)
+
+    fun listFavourites(): Set<Int> = portaPrefs.getString("list_favs", "")!!.split(',').mapNotNull { it.toIntOrNull() }.toSet()
+    fun saveListFavourites(favs: Set<Int>) { portaPrefs.edit().putString("list_favs", favs.sorted().joinToString(",")).apply() }
 
     private fun setFileName(name: String): String =
         name.trim().replace(Regex("[^A-Za-z0-9 _\\-\\u0400-\\u04FF]"), "_").take(40).trim().ifBlank { "SET" }
 
     fun savedSets(): List<String> = try {
-        (setsDir.listFiles { f -> f.isFile && f.name.endsWith(".SVSET") } ?: emptyArray())
-            .sortedByDescending { it.lastModified() }.map { it.name.removeSuffix(".SVSET") }
+        val all = ArrayList<File>()
+        for (dir in setsDirs()) {
+            val files: Array<File> = dir.listFiles { f: File -> f.isFile && f.name.endsWith(".SVSET") } ?: emptyArray()
+            all.addAll(files)
+        }
+        all.sortedByDescending { f: File -> f.lastModified() }.map { f: File -> f.name.removeSuffix(".SVSET") }.distinct()
     } catch (_: Exception) { emptyList() }
 
-    fun setExists(name: String): Boolean = File(setsDir, setFileName(name) + ".SVSET").isFile
+    private fun setFile(name: String): File? {
+        val base = setFileName(name) + ".SVSET"
+        return setsDirs().map { d: File -> File(d, base) }.firstOrNull { f: File -> f.isFile }
+    }
+
+    fun setExists(name: String): Boolean = setFile(name) != null
 
     /** Returns null when saved, else a short reason. */
     fun saveSetAs(name: String): String? {
         if (!saveUserState()) return engine.nativeLastTextError().ifBlank { "Записът не успя" }
-        return try {
-            if (!setsDir.isDirectory && !setsDir.mkdirs()) return "Няма достъп до папка SILVETON/SETS"
-            val base = setFileName(name)
-            userStateFile.copyTo(File(setsDir, "$base.SVSET"), overwrite = true)
-            File(setsDir, "$base.TQ").writeText(
-                "terca_uppers=$tercaUppers\nscale_uppers=$scaleUppers\nterca_root=$tercaRoot\nterca_cell=$tercaCell\n" +
-                "scale_mask=$scaleMask\nterca_master=$tercaMaster\nscale_master=$scaleMaster\n")
-            null
-        } catch (e: Exception) { e.message ?: "Записът не успя" }
+        val base = setFileName(name)
+        val tq = "terca_uppers=$tercaUppers\nscale_uppers=$scaleUppers\nterca_root=$tercaRoot\nterca_cell=$tercaCell\n" +
+            "scale_mask=$scaleMask\nterca_master=$tercaMaster\nscale_master=$scaleMaster\n"
+        var saved = 0
+        var lastError: String? = null
+        for (dir in setsDirs()) {
+            try {
+                if (!dir.isDirectory && !dir.mkdirs()) { lastError = "Няма достъп до ${dir.absolutePath}"; continue }
+                userStateFile.copyTo(File(dir, "$base.SVSET"), overwrite = true)
+                File(dir, "$base.TQ").writeText(tq)
+                saved++
+            } catch (e: Exception) { lastError = e.message ?: "Записът не успя" }
+        }
+        return if (saved > 0) null else (lastError ?: "Записът не успя")
     }
 
     /** Returns null when loaded, else a short reason. The current LIST / BLENDS are replaced. */
     fun loadSavedSet(name: String): String? {
-        val file = File(setsDir, setFileName(name) + ".SVSET")
-        if (!file.isFile) return "Файлът го няма"
+        val file = setFile(name) ?: return "Файлът го няма"
         if (!nativeResult(engine.nativeReplaceUserPerformanceState(file.absolutePath)))
             return engine.nativeLastTextError().ifBlank { "Зареждането не успя" }
         try {
-            val tq = File(setsDir, setFileName(name) + ".TQ")
+            val tq = File(file.parentFile, setFileName(name) + ".TQ")
             if (tq.isFile) {
                 val m = tq.readLines().mapNotNull { l -> l.split('=', limit = 2).takeIf { it.size == 2 }?.let { it[0] to it[1] } }.toMap()
                 m["terca_uppers"]?.toIntOrNull()?.let { tercaUppers = it and 0x7F }
@@ -821,7 +866,8 @@ class SamplerAppController(
             peakRight = meters.getOrElse(1) { 0f },
             limiterGainReductionDb = meters.getOrElse(2) { 0f },
             activeVoices = meters.getOrElse(3) { 0f }.toInt(),
-            droppedRealtimeEvents = meters.getOrElse(4) { 0f }.toInt()
+            droppedRealtimeEvents = meters.getOrElse(4) { 0f }.toInt(),
+            cpuLoadPercent = meters.getOrElse(5 + 7 * 2) { 0f }
         )
     }
 
@@ -907,7 +953,7 @@ class SamplerAppController(
         val v = engine.nativeCombiFxState()
         if (v.size < 15) return null
         fun fx(base: Int) = FxState(v[base].toInt(), v[base+1], v[base+2], v[base+3], v[base+4], v[base+5], v[base+6])
-        return CombiFxState(fx(0), fx(7), v[14].toInt())
+        return CombiFxState(fx(0), fx(7), v[28].toInt())   // SILVETON_FX_V3: 4 slots x 7 values, then the routing
     }
 
     /** FX slot 1 = FX1, 2 = FX2 (SILVETON_FX_V2: the native engine counts them 0 and 1). */

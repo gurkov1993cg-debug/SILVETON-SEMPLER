@@ -5,8 +5,10 @@ on:
   push:
     branches: [main]
     paths:
+      # Rebuild when the source ZIP, any patch, the PRO payload, or this workflow changes.
+      - "SILVETON-SEMPLER-source-fixed.zip"
+      - "codemagic_*.py"
       - "silveton_pro_payload/**"
-      - "codemagic_pro_sound_fix.py"
       - ".github/workflows/silveton-apk.yml"
 
 permissions:
@@ -77,11 +79,16 @@ jobs:
           python3 "$CM_BUILD_DIR/codemagic_live_midi_visual_skin.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_final_stability_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_force_keyboard_test_patch.py" "$PROJECT_DIR"
+          # Remove obsolete TEST EP / stage-piano UI after the keyboard test patch.
+          python3 "$CM_BUILD_DIR/codemagic_remove_test_piano.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_gui_contract_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_kotlin_compile_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_48khz_fix.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_live_performance_indicators.py" "$PROJECT_DIR"
           python3 "$CM_BUILD_DIR/codemagic_xrun_stability_fix.py" "$PROJECT_DIR"
+          # Apply remaining note-to-audio/output latency fixes before the final crackle pass.
+          python3 "$CM_BUILD_DIR/codemagic_live_note_latency_fix.py" "$PROJECT_DIR"
+          python3 "$CM_BUILD_DIR/codemagic_ultra_low_latency_output_fix.py" "$PROJECT_DIR"
           # Crackle fix works on the fully generated tree; PRO SOUND follows it and must stay LAST.
           python3 "$CM_BUILD_DIR/codemagic_crackle_fix.py" "$PROJECT_DIR"
           # PRO SOUND (MONO/LEGATO, ADSR, CUTOFF, quick re-enter) works on the crackle-fixed tree.
@@ -144,7 +151,7 @@ jobs:
           grep -F 'SILVETON_TPDF_DITHER_V1' "$BRIDGE"
           grep -F 'SILVETON_ALL_MIDI_PORTS_V1' "$BRIDGE"
           grep -F 'SILVETON_SOFT_GLIDE_V1' "$ENGINE"
-          grep -F 'SILVETON_PORTA_BALANCE_V2' "$VIEW"
+          grep -F 'sampler.setPortaBalance(' "$VIEW"
           grep -F 'SILVETON_LIST_BACKUP_V1' "$CONTROLLER"
           grep -F 'SILVETON_OCTAVE_KEY_V1' "$ENGINE"
           grep -F 'SILVETON_TERCA_V1' "$ENGINE"
@@ -214,7 +221,7 @@ jobs:
           grep -F 'testLiveEditsOnHeldNote();' "$SAMPLER_TESTS"
           grep -F 'SILVETON_LIVE_EDIT_V1' "$VIEW"
           grep -F 'SILVETON_FX_V2' "$ENGINE"
-          grep -F 'std::array<ReverbFx, 2U> reverb{};' "$ENGINE"
+          grep -F 'std::unique_ptr<ReverbFx> plate;' "$ENGINE"
           grep -F 'testFxSlotsDelayReverb();' "$SAMPLER_TESTS"
           grep -F 'nativeUpdateCombiFx(slot - 1,' "$CONTROLLER"
           grep -F 'SILVETON_LIST_POSITIONS_V1' "$BRIDGE"
@@ -345,7 +352,7 @@ jobs:
       - name: Build rooted release APK
         shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
           cd "$PROJECT_DIR/android"
           LOG="$CM_BUILD_DIR/gradle-build.log"
           set +e

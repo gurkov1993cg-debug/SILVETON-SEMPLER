@@ -1552,11 +1552,6 @@ struct SamplerEngine::Impl {
     std::array<int, kUpperCount> polyLastKey{};                     // POLY portamento: last key of each Upper
     std::array<int, kUpperCount> polyAnchorKey{};                   // glide start shared by a chord
     std::array<std::uint64_t, kUpperCount> polyLastOn{};
-    // SILVETON_LEGATO_WINDOW_V1: when the last key of an Upper is let go, the line it played
-    // (frame + 1, 0 = never) and its key. A new key within kLegatoWindowSec continues that
-    // line as legato - fast playing where the fingers do not overlap is still one line.
-    std::array<std::uint64_t, kUpperCount> lineEndFrame{};
-    std::array<int, kUpperCount> lineEndKey{};
     // SILVETON_TERCA_V1 (written by the control thread, read by the audio thread)
     std::atomic<int> tercaConfig{-1};    // -1 off, else upperMask | root << 8 | cell << 12
     std::atomic<int> scaleUppers{0};     // Uppers whose Q key is on
@@ -1631,7 +1626,7 @@ struct SamplerEngine::Impl {
         for (auto& ch : tercaKey) ch.fill(-1);
         for (auto& ch : tercaRefs) ch.fill(0U);
         tercaApplied = -1;
-        polyLastKey.fill(-1); polyAnchorKey.fill(-1); polyLastOn.fill(0U); lineEndFrame.fill(0U); lineEndKey.fill(-1); frameClock = 0U;
+        polyLastKey.fill(-1); polyAnchorKey.fill(-1); polyLastOn.fill(0U); frameClock = 0U;
         upperPeakL.fill(0.0F);
         upperPeakR.fill(0.0F);
         upperRouteMask.fill(0U);
@@ -2299,7 +2294,6 @@ void panic(SamplerEngine::Impl& impl) noexcept {
 }
 
 constexpr float kLegatoCrossfadeSec = 0.030F; // equal-power, only between two different recordings
-constexpr double kLegatoWindowSec = 0.100;    // SILVETON_LEGATO_WINDOW_V1: a key up to 100 ms after the last one was let go continues the line
 
 void monoRemoveAt(SamplerEngine::Impl::MonoKeys& m, std::size_t index) noexcept {
     for (std::size_t i = index + 1U; i < m.count; ++i) { m.key[i - 1U] = m.key[i]; m.vel[i - 1U] = m.vel[i]; }
@@ -2361,9 +2355,17 @@ float glideSecFor(const SamplerEngine::Impl& impl, const UpperPart& upper, doubl
         const float scaled = base * static_cast<float>(std::max(d, 0.05) / 12.0);
         return capped(std::max(scaled, std::min(base, 0.055F)));
     }
+    // SILVETON_PROCESSOR_PORTA_V1: the glide of the SILVETON keyboard processor on the Korg.
+    // The processor picks the Korg's rate (CC#5) for every interval so that it lasts TIME;
+    // PORTA BALANCE (11 = the player's keyboard) decides how the real time grows with the
+    // interval: t(I) = TIME x I^((11 - BALANCE) / 11), bounded. At 11 every interval takes
+    // TIME; below 11 a big jump takes longer than a step, above 11 a big jump is quicker.
+    const double bal = static_cast<double>(impl.portaBalance.load(std::memory_order_relaxed));
+    const double expo = std::clamp((11.0 - bal) / 11.0, -1.0, 1.0);
+    const float baseB = std::clamp(static_cast<float>(static_cast<double>(base) * std::pow(std::max(1.0, d), expo)), 0.001F, 10.0F);
     const double w = d <= 1.0 ? 1.0 : (d >= 4.0 ? 0.0 : (4.0 - d) / 3.0);
     const float nearSec = impl.portaNearMs.load(std::memory_order_relaxed) / 1000.0F;
-    return capped(nearSec > base ? base + static_cast<float>(w) * (nearSec - base) : base);
+    return capped(nearSec > baseB ? baseB + static_cast<float>(w) * (nearSec - baseB) : baseB);
 }
 
 // Mode at this event; a key memory never survives a switch between POLY and MONO.
@@ -2581,28 +2583,6 @@ void playUpperNote(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
     if (upperMono) for (auto& existing : impl.voices) if (existing.upperIndex == ui) existing.legatoKeep = false;
 }
 
-// SILVETON_LEGATO_WINDOW_V1: the line of this Upper ended less than kLegatoWindowSec ago and the
-// new key is another one: its voices (still ringing in their release) become held again, so the
-// new key continues them as legato instead of striking a new note. Returns the key they play.
-int reviveRecentLine(SamplerEngine::Impl& impl, int ui, std::uint8_t newKey) noexcept {
-    const auto u = static_cast<std::size_t>(ui);
-    if (impl.lineEndFrame[u] == 0U || impl.lineEndKey[u] < 0 || impl.lineEndKey[u] == static_cast<int>(newKey)) return -1;
-    if (impl.frameClock + 1U - impl.lineEndFrame[u] > static_cast<std::uint64_t>(kLegatoWindowSec * impl.sampleRate)) return -1;
-    bool revived = false;
-    for (auto& v : impl.voices) {
-        if (!v.active || v.fading || v.upperIndex != ui || v.keyHeld || v.delayFramesRemaining > 0U) continue;
-        if (static_cast<int>(v.key) != impl.lineEndKey[u]) continue;
-        if (v.ampEnv.stage != AmpEnv::Stage::Release && !v.sustained) continue;
-        v.keyHeld = true;
-        v.sustained = false;
-        v.ampEnv.stage = AmpEnv::Stage::Sustain;   // back to its level in ~10 ms, no new attack
-        revived = true;
-    }
-    if (!revived) return -1;
-    impl.lineEndFrame[u] = 0U;
-    return impl.lineEndKey[u];
-}
-
 // SILVETON_PORTA_PAGE_V1: one note of an Upper whose portamento is ON.
 // keyWasHeld = another key of this Upper was held before this note;
 // previousKey = that key (used only if its recording already ended).
@@ -2638,6 +2618,17 @@ void playPortamentoNote(SamplerEngine::Impl& impl, const std::shared_ptr<const E
     // A key is held: one continuous sound glides to the new key in exactly TIME.
     const double fromPitch = static_cast<double>(sounding->key) + 12.0 * std::log2(sounding->ratio / sounding->targetRatio);
     glideSec = glideSecFor(impl, upper, fromPitch, static_cast<double>(key), ui);
+    if (!kronos) {
+        // SILVETON_PROCESSOR_PORTA_V1: like the Korg under the processor - the rate is the one
+        // for the interval between the two KEYS; interrupted mid-glide, the rest of the way
+        // is covered at that rate (so it arrives sooner, never slower).
+        const double keyInterval = std::abs(static_cast<double>(key) - static_cast<double>(sounding->key));
+        const double pitchInterval = std::abs(static_cast<double>(key) - fromPitch);
+        if (keyInterval >= 0.5 && pitchInterval > 1.0e-6) {
+            const float keyTime = glideSecFor(impl, upper, static_cast<double>(sounding->key), static_cast<double>(key), ui);
+            glideSec = std::clamp(static_cast<float>(keyTime * pitchInterval / keyInterval), 0.001F, 10.0F);
+        }
+    }
     const float previousAmp = sounding->ampEnv.value;
     // SILVETON_XFADE_PORTA_V1 - crossfade portamento: when the new key needs
     // another recording, both recordings play the SAME pitch glide - the old one
@@ -2649,6 +2640,14 @@ void playPortamentoNote(SamplerEngine::Impl& impl, const std::shared_ptr<const E
     // earlier note glides along to the newest key, so nothing lags behind in pitch.
     const float xfadeSec = std::clamp(glideSec, kLegatoCrossfadeSec, 0.300F);
     for (auto& v : impl.voices) if (v.upperIndex == ui) v.legatoKeep = false;
+    // First every held voice of the line gets its new glide (same rate, same arrival), so a
+    // recording that takes over below copies the glide as it is NOW - not the one it was
+    // interrupting (that left the two recordings out of tune for a moment).
+    for (auto& v : impl.voices) {
+        if (v.active && !v.fading && v.upperIndex == ui && v.keyHeld && v.delayFramesRemaining == 0U && v.layer != nullptr && v.zone != nullptr) {
+            v.glideKronos = kronos; legatoTo(impl, v, upper, *v.layer, *v.zone, key, global, glideSec);
+        }
+    }
     forEachSoundZone(upper, global, key, velocity, [&](int s, const ProgramLayer& layer, const SampleZone& zone, int un) noexcept {
         SamplerEngine::Impl::Voice* keep = nullptr;
         for (auto& v : impl.voices) {
@@ -2741,15 +2740,7 @@ void handleNoteOff(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
             }
         } else {
             releaseUpperVoices(impl, ui, channel);
-            impl.lineEndFrame[static_cast<std::size_t>(ui)] = impl.frameClock + 1U;   // SILVETON_LEGATO_WINDOW_V1
-            impl.lineEndKey[static_cast<std::size_t>(ui)] = static_cast<int>(keyHere);
         }
-    }
-    for (int ui = 0; ui < kUpperCount; ++ui) {   // SILVETON_LEGATO_WINDOW_V1: POLY Uppers too
-        const auto& upper = stateOwner->combi.uppers[static_cast<std::size_t>(ui)];
-        if (upper.midiChannel != (channel & 0x0FU) || voiceModeNow(impl, ui, upper) != UpperVoiceMode::Poly) continue;
-        impl.lineEndFrame[static_cast<std::size_t>(ui)] = impl.frameClock + 1U;
-        impl.lineEndKey[static_cast<std::size_t>(ui)] = static_cast<int>(key);
     }
     if (tmask != 0) {
         const auto tBits = static_cast<std::uint16_t>(tmask);
@@ -2825,12 +2816,8 @@ void processEvent(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineS
                 }
                 if (voiceModeNow(impl, ui, upper) != UpperVoiceMode::Poly) {
                     auto& mk = impl.mono[static_cast<std::size_t>(ui)];
-                    bool keyWasHeld = mk.count > 0U;
-                    int previousKey = keyWasHeld ? static_cast<int>(mk.key[mk.count - 1U]) : -1;
-                    if (!keyWasHeld) {   // SILVETON_LEGATO_WINDOW_V1
-                        const int revivedKey = reviveRecentLine(impl, ui, key);
-                        if (revivedKey >= 0) { keyWasHeld = true; previousKey = revivedKey; }
-                    }
+                    const bool keyWasHeld = mk.count > 0U;
+                    const int previousKey = keyWasHeld ? static_cast<int>(mk.key[mk.count - 1U]) : -1;
                     monoPush(mk, key, e.data2);
                     if (portamentoSecFor(upper) > 0.0F) {
                         // SILVETON_PORTA_PAGE_V1: the note that already sounds changes nothing
@@ -2846,8 +2833,6 @@ void processEvent(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineS
                     const auto u = static_cast<std::size_t>(ui);
                     bool held = false;
                     for (const auto& v : impl.voices) if (v.active && !v.fading && v.upperIndex == ui && v.keyHeld) { held = true; break; }
-                    // SILVETON_LEGATO_WINDOW_V1: a key let go less than the window ago still counts as held
-                    if (!held && impl.lineEndFrame[u] != 0U && impl.frameClock + 1U - impl.lineEndFrame[u] <= static_cast<std::uint64_t>(kLegatoWindowSec * impl.sampleRate)) held = true;
                     const bool sameChord = impl.frameClock - impl.polyLastOn[u] < static_cast<std::uint64_t>(0.050 * impl.sampleRate);   // a rolled chord is one chord
                     // KRONOS (not Fingered): always from the last key, held or not.
                     const bool always = upper.portaMode == PortamentoMode::Kronos && !upper.portaFingered;
@@ -3170,8 +3155,6 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
     // SILVETON_SILK_PORTA_V1: BALANCE 3..40 controls the softness / skew of
     // the time-normalized curve instead of delaying its arrival with filters.
     // Loaded once per block, no expensive filter or allocation on audio thread.
-    const double glideVelvet = std::clamp(
-        (static_cast<double>(impl_->portaBalance.load(std::memory_order_relaxed)) - 3.0) / 37.0, 0.0, 1.0);
 
     const int tapUpperNow = impl_->tapUpper.load(std::memory_order_acquire);
     const bool tapAfterNow = impl_->tapAfter.load(std::memory_order_relaxed);
@@ -3360,24 +3343,11 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
                         raw = v.glideStartSemis * (1.0 - progress)
                             + v.glideStartVelocity * velocityBasis;
                     } else {
-                        // Closer keys get the gentlest curve, with softer entrance
-                        // and a musically clean, exactly timed arrival. Quintic
-                        // smoothstep has zero velocity AND acceleration at the ends.
-                        const double near = std::clamp((4.0 - std::abs(v.glideStartSemis)) / 3.0, 0.0, 1.0);
-                        const double softness = (0.30 + 0.70 * glideVelvet) * (0.55 + 0.45 * near);
-                        const double u = t * (1.0 - 0.32 * softness * (1.0 - t));
-                        const double u2 = u * u;
-                        const double u3 = u2 * u;
-                        const double smooth3 = u2 * (3.0 - 2.0 * u);
-                        const double smooth5 = u3 * (10.0 + u * (-15.0 + 6.0 * u));
-                        const double curve = smooth3 + 0.75 * softness * (smooth5 - smooth3);
-                        // Quintic Hermite start-velocity basis: C1 continuity
-                        // when interrupting a legato glide. Decays smoothly to
-                        // zero at the destination; no overshoot from the cap.
-                        const double t2 = t * t;
-                        const double t3 = t2 * t;
-                        const double velocityBasis = t + t3 * (-6.0 + t * (8.0 - 3.0 * t));
-                        raw = v.glideStartSemis * (1.0 - curve) + v.glideStartVelocity * velocityBasis;
+                        // SILVETON_PROCESSOR_PORTA_V1: the glide of the SILVETON keyboard processor on
+                        // the Korg - a straight line at constant rate, from the pitch that sounds to the
+                        // new key, arriving exactly in time. No S-curve, no carried momentum
+                        // (the SILVETON_SILK_PORTA_V1 shape is retired).
+                        raw = v.glideStartSemis * (1.0 - t);
                     }
                 }
                 v.glideRawSemis = v.glideSmooth1 = v.glideSmooth2 = raw;

@@ -1842,23 +1842,17 @@ void testPortamentoAutoMonoReleaseTail() {
 
 // PORTA BALANCE does not change the sound: every interval glides in exactly TIME.
 void testPortamentoBalance() {
-    for(float bal : {11.0F, 5.0F, 30.0F}) {
-        auto st=makeToneState(UpperVoiceMode::Legato);
-        st->combi.uppers[0].portamentoSec=0.05F;
-        SamplerEngine e; e.prepare(96000.0,96U); e.setPortamentoBalance(bal); e.setState(st);
-        e.postNoteOn(0U,69U,100U); renderLeft(e,200);   // SILVETON_PORTA_TEMPO_V1: a slow line, TIME applies in full
-        e.postNoteOn(0U,81U,100U);
-        auto x=renderLeft(e,160);
-        // SILVETON_SOFT_GLIDE_V1: BALANCE rounds the glide; a bigger BALANCE is softer
-        // (a little later at the same moment), every BALANCE still arrives.
-        const double h=glideHzAt(x,30.0);
-        static double prevH=0.0; static float prevBal=0.0F;
-        assert(h>460.0 && h<840.0);
-        if(prevBal>0.0F && bal>prevBal) assert(h<prevH);
-        if(prevBal>0.0F && bal<prevBal) assert(h>prevH);
-        prevH=h; prevBal=bal;
-        assert(std::abs(glideHzAt(x,150.0)-880.0)<880.0*0.006);
-    }
+    // SILVETON_PROCESSOR_PORTA_V1: BALANCE 11 = every interval takes TIME; below 11 an octave
+    // takes longer than a step, above 11 it is quicker. A single step always takes TIME.
+    auto run=[](float bal, int toKey, int blocks){ auto st=makeToneState(UpperVoiceMode::Legato); st->combi.uppers[0].portamentoSec=0.05F;
+        SamplerEngine e; e.prepare(96000.0,96U); e.setPortamentoNear(0.0F); e.setPortamentoBalance(bal); e.setState(st);
+        e.postNoteOn(0U,69U,100U); renderLeft(e,200); e.postNoteOn(0U,static_cast<std::uint8_t>(toKey),100U); return renderLeft(e,blocks); };
+    const double oct=880.0, semi=440.0*std::pow(2.0,1.0/12.0);
+    auto a=run(11.0F,81,160); assert(glideHzAt(a,25.0)>460.0 && glideHzAt(a,25.0)<860.0 && std::abs(glideHzAt(a,60.0)-oct)<oct*0.006);   // 50 ms, straight
+    assert(std::abs(glideHzAt(a,25.0)-440.0*std::pow(2.0,6.0/12.0))<30.0);   // half way at half time: a straight line in semitones
+    auto b=run(5.0F,81,400); assert(glideHzAt(b,60.0)<oct*0.97 && std::abs(glideHzAt(b,390.0)-oct)<oct*0.006);   // slower octave, still arrives
+    auto c=run(22.0F,81,160); assert(std::abs(glideHzAt(c,30.0)-oct)<oct*0.006);   // quicker octave
+    for(float bal : {5.0F, 11.0F, 22.0F}) { auto d=run(bal,70,160); assert(glideHzAt(d,25.0)>440.0 && glideHzAt(d,25.0)<semi && std::abs(glideHzAt(d,60.0)-semi)<semi*0.006); }
 }
 
 // SILVETON_SILK_PORTA_V1: BALANCE gives a softer TIME curve, but never a
@@ -2484,30 +2478,6 @@ void testCpuMeter() {
 // recording for the new key: both recordings glide together, the new one starts
 // past its attack. The level stays even through the change (no re-struck attack,
 // no dip) and the pitch is one continuous glide that lands exactly.
-// SILVETON_LEGATO_WINDOW_V1: fast playing where the fingers do not overlap is still one line -
-// a key within 100 ms after the last one was let go continues the ringing note (no new attack),
-// a key after a longer gap is struck again.
-void testLegatoWindow() {
-    for (int porta = 1; porta >= 0; --porta) {
-        auto st=makeToneState(UpperVoiceMode::Legato);
-        std::const_pointer_cast<Program>(st->combi.uppers[0].program)->layers[0].ampEnvelope={0.05F,0.01F,1.0F,0.3F};   // 50 ms attack, 300 ms release
-        st->combi.uppers[0].portamentoSec = porta != 0 ? 0.08F : 0.0F;
-        SamplerEngine e; e.prepare(96000.0,96U); e.setPortamentoNear(0.0F); e.setState(st);
-        e.postNoteOn(0U,69U,100U); auto a=renderLeft(e,200); const double steady=peakOf(a,15000U,19000U);
-        e.postNoteOff(0U,69U); renderLeft(e,30);                       // 30 ms gap: fingers did not overlap
-        e.postNoteOn(0U,72U,100U); auto b=renderLeft(e,150);
-        assert(peakOf(b,0U,960U) > steady*0.6);                        // continues the ringing note - no attack from zero
-        assert(e.activeVoiceCount()==1U);
-        if (porta != 0) { assert(glideHzAt(b,20.0) > 445.0 && glideHzAt(b,20.0) < 520.0); }   // glides into the new key
-        assert(std::abs(glideHzAt(b,130.0)-523.25)<523.25*0.01);
-        e.postNoteOff(0U,72U); renderLeft(e,150);                      // 150 ms gap: a separate note
-        e.postNoteOn(0U,76U,100U); auto c=renderLeft(e,150);
-        assert(peakOf(c,0U,480U) < steady*0.35);                       // struck again: the attack starts low
-        assert(std::abs(glideHzAt(c,130.0)-659.26)<659.26*0.01);
-        e.postNoteOff(0U,76U); renderLeft(e,400); assert(e.activeVoiceCount()==0U);
-    }
-}
-
 void testCrossfadePortamento() {
     // zone A: 440 Hz sine, keys up to 70; zone B: 660 Hz sine whose first 60 ms are SILENT (an "attack" we must not hear), loop from 80 ms
     auto a=makeLoopedSine(440.0,69U);
@@ -2539,9 +2509,9 @@ void testCrossfadePortamento() {
     // one voice remains, on the last key.
     e.postNoteOff(0U,76U); renderLeft(e,200);
     e.postNoteOn(0U,65U,100U); renderLeft(e,50); e.postNoteOn(0U,67U,100U); renderLeft(e,50); e.postNoteOn(0U,69U,100U); renderLeft(e,50);
-    e.postNoteOn(0U,76U,100U); auto y=renderLeft(e,120); for(float v:y) assert(std::isfinite(v));
-    assert(glideHzAt(y,30.0)<glideHzAt(y,60.0) && glideHzAt(y,60.0)<650.0 && std::abs(glideHzAt(y,115.0)-660.0)<660.0*0.02);   // full TIME glide, lands at 100 ms
-    const double steady2=peakOf(y,10000U,11500U);
+    e.postNoteOn(0U,76U,100U); auto y=renderLeft(e,170); for(float v:y) assert(std::isfinite(v));
+    assert(glideHzAt(y,30.0)<glideHzAt(y,60.0) && glideHzAt(y,60.0)<650.0 && std::abs(glideHzAt(y,150.0)-660.0)<660.0*0.02);   // straight glide at the rate of the 7-key interval (interrupted mid-glide: 8 semitones to go)
+    const double steady2=peakOf(y,15000U,16300U);
     // SILVETON_PHASE_ALIGN_V1: the two recordings are lined up in phase, so the blend never dips (it fell to -15 dB before)
     for(std::size_t from=0;from<10000U;from+=960U) { const double pk=peakOf(y,from,from+960U); assert(pk>steady2*0.7 && pk<steady2*1.3); }
     e.postNoteOn(0U,79U,100U); auto z=renderLeft(e,400); for(float v:z) assert(std::isfinite(v));
@@ -2740,7 +2710,7 @@ int main() {
     testUpperCutoffResonance();
     testLiveEditsOnHeldNote();
     testFxSlotsDelayReverb();
-    testLegatoWindow(); testCrossfadePortamento();
+    testCrossfadePortamento();
     testBuiltinWaves(); testPwmSubUnisonDrive(); testCharacterFilters(); testModMatrix(); testSynthBypass(); testEnsembleFx(); testSetV13RoundTrip();
     testUpperLayers(); testToneV2(); testUpperEq5(); testKronosPortamento(); testEffectsV3(); testSetV12RoundTrip(); testVoiceGuardQuietestStops(); testCpuMeter();
     std::puts("SILVETON sampler tests passed");

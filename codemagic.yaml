@@ -142,6 +142,8 @@ workflows:
           require_source 'SILVETON_SOFT_GLIDE_V1' "$ENGINE"
           require_source 'SILVETON_SILK_PORTA_V1' "$ENGINE"
           require_source 'SILVETON_PORTA_TEMPO_V1' "$ENGINE"
+          require_source 'SILVETON_XFADE_PORTA_V1' "$ENGINE"
+          require_source 'testCrossfadePortamento();' "$SAMPLER_TESTS"
           require_source 'testPortamentoTempoCap();' "$SAMPLER_TESTS"
           require_source 'SILVETON_KRONOS_MUSICAL_PORTA_V2' "$ENGINE"
           require_source 'sampler.setPortaBalance(round(nv).toInt())' "$VIEW"

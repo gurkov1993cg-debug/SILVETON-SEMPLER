@@ -1388,6 +1388,7 @@ struct SamplerEngine::Impl {
         float fadeGain{1.0F};
         float fadeStep{0.0F};
         bool fading{false};
+        bool fadeBlend{false};         // SILVETON_XFADE_PORTA_V1: crossfade law between two recordings of one line
         std::uint32_t delayFramesRemaining{0U};
         // Zone/layer gain x velocity. The Upper's level, pan and ON/MUTE/SOLO are
         // the live mix gains below (SILVETON_LIVE_EDIT_V1).
@@ -1818,6 +1819,37 @@ void updateMixTarget(SamplerEngine::Impl::Voice& v, const UpperPart& upper, bool
 
 // SILVETON_TONE_V2: SAMPLE START in frames of the sample, moved forward to the
 // next zero crossing (within 4 ms) so the note never starts with a click.
+// Frame at or after `start` where the recording crosses zero (within 4 ms).
+double snapToZeroCrossing(const SampleData& s, double start) noexcept {
+    const auto pre = s.preloadedFrameCount();
+    const auto ch = static_cast<std::size_t>(std::max<std::uint16_t>(1U, s.channels));
+    auto i = static_cast<std::uint64_t>(std::max(0.0, start));
+    const std::uint64_t limit = std::min<std::uint64_t>(pre, i + static_cast<std::uint64_t>(0.004 * s.sampleRate) + 1U);
+    if (i + 1U < limit) {
+        float prev = s.interleaved[static_cast<std::size_t>(i) * ch];
+        for (std::uint64_t k = i + 1U; k < limit; ++k) {
+            const float cur = s.interleaved[static_cast<std::size_t>(k) * ch];
+            if ((prev <= 0.0F && cur >= 0.0F) || (prev >= 0.0F && cur <= 0.0F)) { i = k; break; }
+            prev = cur;
+        }
+    }
+    return static_cast<double>(i);
+}
+
+// SILVETON_XFADE_PORTA_V1: where a recording starts when it takes over a held
+// line (legato / portamento): past its attack - at the loop start if it has
+// one, else 40 ms in - so the new note is not struck again.
+double legatoStartFrame(const SampleData& s) noexcept {
+    const double frames = static_cast<double>(s.frameCount());
+    if (s.loop.enabled && s.loop.endFrame > s.loop.startFrame && s.loop.startFrame > 0U &&
+        static_cast<double>(s.loop.startFrame) < frames - 8.0) {
+        return snapToZeroCrossing(s, static_cast<double>(s.loop.startFrame));
+    }
+    const double skip = 0.040 * static_cast<double>(s.sampleRate);
+    if (frames > skip * 3.0) return snapToZeroCrossing(s, skip);
+    return 0.0;
+}
+
 double startFrameFor(const SampleData& s, float startMs) noexcept {
     if (startMs <= 0.0F) return 0.0;
     const double frames = static_cast<double>(s.frameCount());
@@ -1849,7 +1881,8 @@ void startVoice(SamplerEngine::Impl& impl,
                  std::uint8_t velocity,
                  const GlobalState& global,
                  const std::shared_ptr<const EngineState>& ownerState,
-                 int soundIndex = 0) noexcept {
+                 int soundIndex = 0,
+                 bool legatoStart = false) noexcept {
     v = SamplerEngine::Impl::Voice{};
     v.active = true;
     v.keyHeld = true;
@@ -1874,6 +1907,7 @@ void startVoice(SamplerEngine::Impl& impl,
     if (!zone.reverse && zone.sample != nullptr) {
         const auto& s = *zone.sample;
         v.position = startFrameFor(s, tone.x.startMs);
+        if (legatoStart && tone.x.startMs <= 0.0F) v.position = legatoStartFrame(s);   // SILVETON_XFADE_PORTA_V1
         if (s.loop.enabled && v.position >= static_cast<double>(s.loop.endFrame) && s.loop.endFrame > s.loop.startFrame) {
             v.position = static_cast<double>(s.loop.startFrame);
         }
@@ -2264,7 +2298,7 @@ void playUpperNote(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
             }
         }
         auto* v = chooseVoice(impl);
-        startVoice(impl, *v, upper, layer, zone, ui, channel, key, velocity, global, stateOwner, s);
+        startVoice(impl, *v, upper, layer, zone, ui, channel, key, velocity, global, stateOwner, s, upperLegato && hadHeldVoice);
         v->mono = upperMono;
         v->glideKronos = kronos;
         startPortamentoGlide(impl, *v, glideFromKey, glideSec);
@@ -2314,6 +2348,12 @@ void playPortamentoNote(SamplerEngine::Impl& impl, const std::shared_ptr<const E
     const double fromPitch = static_cast<double>(sounding->key) + 12.0 * std::log2(sounding->ratio / sounding->targetRatio);
     glideSec = glideSecFor(impl, upper, fromPitch, static_cast<double>(key), ui);
     const float previousAmp = sounding->ampEnv.value;
+    // SILVETON_XFADE_PORTA_V1 - crossfade portamento: when the new key needs
+    // another recording, both recordings play the SAME pitch glide - the old one
+    // fading out, the new one (started past its attack) fading in - over the
+    // whole glide. No stretched single sample, no re-struck attack, no jump of
+    // timbre at the arrival.
+    const float xfadeSec = std::clamp(glideSec, kLegatoCrossfadeSec, 0.300F);
     for (auto& v : impl.voices) if (v.upperIndex == ui) v.legatoKeep = false;
     forEachSoundZone(upper, global, key, velocity, [&](int s, const ProgramLayer& layer, const SampleZone& zone) noexcept {
         SamplerEngine::Impl::Voice* keep = nullptr;
@@ -2330,19 +2370,25 @@ void playPortamentoNote(SamplerEngine::Impl& impl, const std::shared_ptr<const E
         }
         // another recording takes over without a new strike and glides from the pitch that sounded
         auto* v = chooseVoice(impl);
-        startVoice(impl, *v, upper, layer, zone, ui, channel, key, velocity, global, stateOwner, s);
+        startVoice(impl, *v, upper, layer, zone, ui, channel, key, velocity, global, stateOwner, s, true);
         v->mono = true;
         v->glideKronos = kronos;
         startPortamentoGlide(impl, *v, fromPitch, glideSec);
         v->ampEnv.value = previousAmp;
         v->ampEnv.stage = AmpEnv::Stage::Decay;
         v->fadeGain = 0.0F;
-        v->fadeStep = 1.0F / static_cast<float>(std::max(1.0, static_cast<double>(kLegatoCrossfadeSec) * impl.sampleRate));
+        v->fadeStep = 1.0F / static_cast<float>(std::max(1.0, static_cast<double>(xfadeSec) * impl.sampleRate));
+        v->fadeBlend = true;
         v->legatoKeep = true;
     });
     impl.polyLastKey[static_cast<std::size_t>(ui)] = key;
     for (auto& v : impl.voices) {
-        if (v.active && !v.fading && v.upperIndex == ui && v.keyHeld && !v.legatoKeep) softKill(impl, v, kLegatoCrossfadeSec);
+        if (v.active && !v.fading && v.upperIndex == ui && v.keyHeld && !v.legatoKeep) {
+            // the old recording glides along to the new key while it fades out
+            if (v.layer != nullptr && v.zone != nullptr) { v.glideKronos = kronos; legatoTo(impl, v, upper, *v.layer, *v.zone, key, global, glideSec); }
+            softKill(impl, v, xfadeSec);
+            v.fadeBlend = true;
+        }
     }
     for (auto& v : impl.voices) if (v.upperIndex == ui) v.legatoKeep = false;
 }
@@ -3007,7 +3053,11 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
                 if (v.fadeGain <= 0.0F) { v.ampEnv.forceOff(); v.active = false; v.fading = false; break; }
                 if (v.fadeGain >= 1.0F) { v.fadeGain = 1.0F; v.fadeStep = 0.0F; }
             }
-            if (v.fadeStep != 0.0F || v.fadeGain < 1.0F) g *= std::sin(v.fadeGain * 1.57079632679F); // equal-power fade
+            if (v.fadeStep != 0.0F || v.fadeGain < 1.0F) {
+                // equal-power fade; a crossfade between two recordings of the same line uses a
+                // middle law (x^0.75): no +3 dB bump when they are in phase, no -3 dB hole when not
+                g *= v.fadeBlend ? std::pow(v.fadeGain, 0.75F) : std::sin(v.fadeGain * 1.57079632679F);
+            }
             if (mixMoving) {
                 v.mixL += (mixTargetL - v.mixL) * mixSmooth;
                 v.mixR += (mixTargetR - v.mixR) * mixSmooth;

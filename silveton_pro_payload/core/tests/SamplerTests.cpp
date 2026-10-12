@@ -2496,6 +2496,37 @@ void testPortamentoTempoCap() {
     assert(glideHzAt(b,15.0)>hz71*1.003 && glideHzAt(b,15.0)<hz73*0.997);   // and it still glides, not jumps
 }
 
+// SILVETON_XFADE_PORTA_V1: crossfade portamento. A held line that needs another
+// recording for the new key: both recordings glide together, the new one starts
+// past its attack. The level stays even through the change (no re-struck attack,
+// no dip) and the pitch is one continuous glide that lands exactly.
+void testCrossfadePortamento() {
+    // zone A: 440 Hz sine, keys up to 70; zone B: 660 Hz sine whose first 60 ms are SILENT (an "attack" we must not hear), loop from 80 ms
+    auto a=makeLoopedSine(440.0,69U);
+    auto b=std::make_shared<SampleData>(); b->sampleRate=48000U; b->channels=1U; b->rootKey=76U;
+    b->interleaved.resize(48000U);
+    for(std::size_t i=0;i<48000U;++i) b->interleaved[i]= i<2880U ? 0.0F : static_cast<float>(0.5*std::sin(2.0*3.14159265358979323846*660.0*static_cast<double>(i)/48000.0));
+    b->totalFrames=48000U; b->loop.enabled=true; b->loop.startFrame=3840U; b->loop.endFrame=48000U;   // loop start at 80 ms (whole periods: 660*3840/48000 = 52.8 -> use 3840? use 4000)
+    b->loop.startFrame=4000U;   // 660 Hz * 4000/48000 = 55 periods: seamless
+    auto ms=std::make_shared<Multisample>();
+    SampleZone za{}; za.sample=a; za.keyLow=0U; za.keyHigh=70U; za.velocityLow=1U; za.velocityHigh=127U; za.rootKey=69U;
+    SampleZone zb{}; zb.sample=b; zb.keyLow=71U; zb.keyHigh=127U; zb.velocityLow=1U; zb.velocityHigh=127U; zb.rootKey=76U;
+    ms->zones.push_back(za); ms->zones.push_back(zb);
+    auto prog=std::make_shared<Program>(); ProgramLayer l{}; l.multisample=ms; l.ampEnvelope={0.0F,0.01F,1.0F,0.02F}; prog->layers.push_back(l);
+    auto st=std::make_shared<EngineState>(); auto& u=st->combi.uppers[0]; u.program=prog; u.enabled=true; u.voiceMode=UpperVoiceMode::Legato; u.portamentoSec=0.1F; st->global.masterGainDb=0.0F;
+    SamplerEngine e; e.prepare(96000.0,96U); e.setPortamentoNear(0.0F); e.setState(st);
+    e.postNoteOn(0U,69U,100U); renderLeft(e,300);
+    e.postNoteOn(0U,76U,100U); auto x=renderLeft(e,300);
+    // level: every 10 ms window through the 100 ms crossfade stays within 25 % of the steady level
+    const double steady=peakOf(x,20000U,25000U);
+    for(std::size_t from=0;from<12000U;from+=960U) { const double pk=peakOf(x,from,from+960U); assert(pk>steady*0.75 && pk<steady*1.3); }
+    // pitch: a continuous glide from 440 to 660 that lands exactly
+    const double h20=glideHzAt(x,20.0), h50=glideHzAt(x,50.0), h80=glideHzAt(x,80.0);
+    assert(h20>440.0 && h20<h50 && h50<h80 && h80<660.0);
+    assert(std::abs(glideHzAt(x,150.0)-660.0)<660.0*0.004);
+    assert(e.activeVoiceCount()==1U);   // the old recording has faded out
+}
+
 int main() {
     testWavAiffLoaders();
     testEnginePlaybackAndControls();
@@ -2546,7 +2577,7 @@ int main() {
     testUpperCutoffResonance();
     testLiveEditsOnHeldNote();
     testFxSlotsDelayReverb();
-    testPortamentoTempoCap();
+    testPortamentoTempoCap(); testCrossfadePortamento();
     testUpperLayers(); testToneV2(); testUpperEq5(); testKronosPortamento(); testEffectsV3(); testSetV12RoundTrip(); testVoiceGuardQuietestStops(); testCpuMeter();
     std::puts("SILVETON sampler tests passed");
     return 0;

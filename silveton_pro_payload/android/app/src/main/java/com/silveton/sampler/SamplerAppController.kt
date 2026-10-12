@@ -343,11 +343,11 @@ class SamplerAppController(
         bankPath = selected.absolutePath
         restoreUserStateIfMissing()
         val userState = userStateFile
-        if (userState.exists() && !engine.nativeLoadUserPerformanceState(userState.absolutePath)) {
+        if (setPresent(userState) && !engine.nativeLoadUserPerformanceState(userState.absolutePath)) {
             statusChanged(engine.nativeLastTextError().ifBlank { "BLENDS/LIST user state load failed" })
             return
         }
-        if (userState.isFile && !backupFile.isFile) backupUserState()   // first copy for LIST/BLENDS made before this version
+        if (setPresent(userState) && !setPresent(backupFile)) backupUserState()   // first copy for LIST/BLENDS made before this version
         val soundCount = bankSoundCount()
         if (soundCount <= 0) {
             statusChanged("SILVETON_BANK.sv loaded but contains no visible SOUND positions")
@@ -445,30 +445,43 @@ class SamplerAppController(
         return saveUserState()
     }
 
-    // SILVETON_LIST_BACKUP_V1: LIST and BLENDS live in the app's own folder, which
-    // Android deletes when the app is uninstalled. After every save a copy goes to
-    // /storage/emulated/0/SILVETON (next to the bank), which survives an uninstall;
-    // the previous copy is kept as .BAK. A failed copy never blocks the save.
-    private val userStateFile: File get() = File(appContext.filesDir, "SILVETON_USER_STATE.SVSET")
-    private val backupDir: File = File("/storage/emulated/0/SILVETON")
-    private val backupFile: File get() = File(backupDir, "SILVETON_USER_STATE.SVSET")
+    // SILVETON_LIST_BACKUP_V1 / SILVETON_SETS_FIX_V1 → replaced by SILVETON_SET_FILE_V1:
+    // the LIST and BLENDS are ONE file next to the bank -
+    // <folder of SILVETON_BANK.sv>/SILVETON_BLENDS.SVSET (the previous version stays as
+    // .BAK next to it). A silent safety copy goes to the app's own folder; at start a
+    // missing file is restored from the safety copy or from the old locations.
+    private fun bankDir(): File = bankFile()?.parentFile ?: appContext.filesDir
+    private val userStateFile: File get() = File(bankDir(), "SILVETON_BLENDS.SVSET")
+    private val privateStateFile: File get() = File(appContext.filesDir, "SILVETON_USER_STATE.SVSET")
+    private val oldBackupDir: File = File("/storage/emulated/0/SILVETON")
+    private val backupFile: File get() = privateStateFile
 
     private fun saveUserState(): Boolean {
-        val ok = nativeResult(engine.nativeSaveUserPerformanceState(userStateFile.absolutePath))
+        val dst = userStateFile
+        try {   // keep the previous version next to it as .BAK (one WRITE can always be undone)
+            if (setPresent(dst)) copySet(dst, File(dst.parentFile, "SILVETON_BLENDS.SVSET.BAK"))
+        } catch (_: Exception) {
+        }
+        val ok = nativeResult(engine.nativeSaveUserPerformanceState(dst.absolutePath))
         if (ok) backupUserState()
         return ok
     }
 
+    // SILVETON_SET_DIR_FIX_V1: a SET (.SVSET) is a FOLDER (manifest.svs + audio/), not one file.
+    // SAVE AS, LOAD, the backup and the restore all copy it as a folder.
+    private fun setPresent(f: File): Boolean =
+        (f.isDirectory && File(f, "manifest.svs").isFile) || (f.isFile && f.length() > 0L)
+
+    private fun copySet(src: File, dst: File): Boolean = try {
+        if (dst.exists()) dst.deleteRecursively()
+        if (src.isDirectory) src.copyRecursively(dst, overwrite = true) else src.copyTo(dst, overwrite = true).isFile
+    } catch (_: Exception) { false }
+
     private fun backupUserState() {
         try {
             val src = userStateFile
-            if (!src.isFile || src.length() <= 0L) return
-            if (!backupDir.isDirectory && !backupDir.mkdirs()) return
-            val tmp = File(backupDir, "SILVETON_USER_STATE.SVSET.tmp")
-            src.copyTo(tmp, overwrite = true)
-            val dst = backupFile
-            if (dst.isFile) dst.copyTo(File(backupDir, "SILVETON_USER_STATE.SVSET.BAK"), overwrite = true)
-            if (!tmp.renameTo(dst)) { tmp.copyTo(dst, overwrite = true); tmp.delete() }
+            if (!setPresent(src)) return
+            copySet(src, privateStateFile)   // silent safety copy (survives a lost SD card / moved bank)
         } catch (_: Exception) {
         }
     }
@@ -514,14 +527,11 @@ class SamplerAppController(
 
     // SILVETON_SET_SAVE_AS_V1: SAVE AS / LOAD of the whole set: every LIST position with
     // its BLEND, all COMBI settings, GLOBAL settings and the T / Q choice.
-    // Files: /storage/emulated/0/SILVETON/SETS/<name>.SVSET (+ <name>.TQ).
-    // SILVETON_SETS_FIX_V1: the sets live in the app's own folder (always readable and
-    // writable) AND a copy goes to /storage/emulated/0/SILVETON/SETS (survives an
-    // uninstall). LOAD shows both, so a saved set is always found.
-    private val setsDirPrivate: File get() = File(appContext.filesDir, "SETS")
-    private val setsDirShared: File get() = File(backupDir, "SETS")
-    private fun setsDirs(): List<File> = listOf(setsDirPrivate, setsDirShared)
-    fun setsFolders(): String = setsDirs().joinToString("  и  ") { it.absolutePath }
+    // SILVETON_SET_FILE_V1: one file per set, next to the bank:
+    // <folder of SILVETON_BANK.sv>/SILVETON_SETS/<name>.SVSET (+ <name>.TQ).
+    private val setsDir: File get() = File(bankDir(), "SILVETON_SETS")
+    private fun setsDirs(): List<File> = listOf(setsDir)
+    fun setsFolders(): String = setsDir.absolutePath
 
     // SILVETON_LIST_V2: favourite LIST positions
 
@@ -547,6 +557,10 @@ class SamplerAppController(
     fun setSoundSynthParam(upper: Int, sound: Int, id: Int, value: Float): Boolean = nativeResult(engine.nativeSetSoundSynthParam(upper, sound, id, value))
     fun soundSynthParams(upper: Int, sound: Int): FloatArray = engine.nativeSoundSynthParams(upper, sound)
 
+    // SILVETON_THEME_V1: the look of the screen (false = СВЕТЛА, true = ТЪМНА), kept between starts
+    fun themeDark(): Boolean = portaPrefs.getBoolean("theme_dark", false)
+    fun setThemeDark(dark: Boolean) { portaPrefs.edit().putBoolean("theme_dark", dark).apply() }
+
     fun listFavourites(): Set<Int> = portaPrefs.getString("list_favs", "")!!.split(',').mapNotNull { it.toIntOrNull() }.toSet()
     fun saveListFavourites(favs: Set<Int>) { portaPrefs.edit().putString("list_favs", favs.sorted().joinToString(",")).apply() }
 
@@ -556,7 +570,7 @@ class SamplerAppController(
     fun savedSets(): List<String> = try {
         val all = ArrayList<File>()
         for (dir in setsDirs()) {
-            val files: Array<File> = dir.listFiles { f: File -> f.isFile && f.name.endsWith(".SVSET") } ?: emptyArray()
+            val files: Array<File> = dir.listFiles { f: File -> f.name.endsWith(".SVSET") && setPresent(f) } ?: emptyArray()   // SILVETON_SET_DIR_FIX_V1
             all.addAll(files)
         }
         all.sortedByDescending { f: File -> f.lastModified() }.map { f: File -> f.name.removeSuffix(".SVSET") }.distinct()
@@ -564,7 +578,7 @@ class SamplerAppController(
 
     private fun setFile(name: String): File? {
         val base = setFileName(name) + ".SVSET"
-        return setsDirs().map { d: File -> File(d, base) }.firstOrNull { f: File -> f.isFile }
+        return setsDirs().map { d: File -> File(d, base) }.firstOrNull { f: File -> setPresent(f) }
     }
 
     fun setExists(name: String): Boolean = setFile(name) != null
@@ -580,7 +594,7 @@ class SamplerAppController(
         for (dir in setsDirs()) {
             try {
                 if (!dir.isDirectory && !dir.mkdirs()) { lastError = "Няма достъп до ${dir.absolutePath}"; continue }
-                userStateFile.copyTo(File(dir, "$base.SVSET"), overwrite = true)
+                if (!copySet(userStateFile, File(dir, "$base.SVSET"))) { lastError = "Няма достъп до ${dir.absolutePath}"; continue }   // SILVETON_SET_DIR_FIX_V1
                 File(dir, "$base.TQ").writeText(tq)
                 saved++
             } catch (e: Exception) { lastError = e.message ?: "Записът не успя" }
@@ -618,10 +632,13 @@ class SamplerAppController(
     private fun restoreUserStateIfMissing() {
         try {
             val dst = userStateFile
-            if (dst.isFile && dst.length() > 0L) return
-            val src = listOf(backupFile, File(backupDir, "SILVETON_USER_STATE.SVSET.BAK"))
-                .firstOrNull { it.isFile && it.length() > 0L } ?: return
-            src.copyTo(dst, overwrite = true)
+            if (setPresent(dst)) return
+            // the safety copy, then the places older versions used
+            val src = listOf(
+                privateStateFile, File(dst.parentFile, "SILVETON_BLENDS.SVSET.BAK"),
+                File(oldBackupDir, "SILVETON_USER_STATE.SVSET"), File(oldBackupDir, "SILVETON_USER_STATE.SVSET.BAK"))
+                .firstOrNull { setPresent(it) } ?: return
+            copySet(src, dst)   // SILVETON_SET_FILE_V1
         } catch (_: Exception) {
         }
     }

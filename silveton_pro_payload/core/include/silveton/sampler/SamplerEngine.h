@@ -162,6 +162,7 @@ private:
     std::shared_ptr<const EngineState> pendingState_;
     RealtimeEventQueue events_;
     SincInterpolator interpolator_;
+    SincInterpolator subInterpolator_{InterpolationQuality::LiveCubic4};   // SILVETON_SYNTH_LIGHT_V1: SUB read
 };
 
 } // namespace silveton::sampler

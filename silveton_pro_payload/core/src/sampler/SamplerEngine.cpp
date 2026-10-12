@@ -1492,6 +1492,12 @@ struct SamplerEngine::Impl {
         double pwmPhase{0.0};
         float pwmWidthNow{0.0F};
         float dcXL{0.0F}, dcYL{0.0F}, dcXR{0.0F}, dcYR{0.0F};
+        // SILVETON_SYNTH_LIGHT_V1: PWM = the read sound minus itself one WIDTH x period later,
+        // taken from this short delay line instead of a second interpolated read of the recording.
+        static constexpr int kPwmDelay = 2048;      // frames (one period down to 47 Hz at 96 kHz)
+        std::array<float, static_cast<std::size_t>(kPwmDelay) * 2U> pwmBuf{};
+        int pwmWrite{0};
+        int pwmFilled{0};
         float random{0.0F};            // -1..1, fixed for the note
         float modCutOct{0.0F}, modRes{0.0F}, modCut2Oct{0.0F}, modLevelDb{0.0F}, modPan{0.0F};
         float modPitch{0.0F}, modLfoCents{0.0F}, modLfoRateMul{1.0F}, modPwm{0.0F}, modDrive{0.0F}, modAttackMul{1.0F}, modReleaseMul{1.0F};
@@ -1546,10 +1552,11 @@ struct SamplerEngine::Impl {
     std::array<int, kUpperCount> polyLastKey{};                     // POLY portamento: last key of each Upper
     std::array<int, kUpperCount> polyAnchorKey{};                   // glide start shared by a chord
     std::array<std::uint64_t, kUpperCount> polyLastOn{};
-    // SILVETON_PORTA_TEMPO_V1: when notes come faster than TIME, every glide is
-    // shortened so each note is reached before the next one (no smeared runs).
-    std::array<std::uint64_t, kUpperCount> noteOnFrame{};
-    std::array<float, kUpperCount> tempoCapSec{};
+    // SILVETON_LEGATO_WINDOW_V1: when the last key of an Upper is let go, the line it played
+    // (frame + 1, 0 = never) and its key. A new key within kLegatoWindowSec continues that
+    // line as legato - fast playing where the fingers do not overlap is still one line.
+    std::array<std::uint64_t, kUpperCount> lineEndFrame{};
+    std::array<int, kUpperCount> lineEndKey{};
     // SILVETON_TERCA_V1 (written by the control thread, read by the audio thread)
     std::atomic<int> tercaConfig{-1};    // -1 off, else upperMask | root << 8 | cell << 12
     std::atomic<int> scaleUppers{0};     // Uppers whose Q key is on
@@ -1624,8 +1631,7 @@ struct SamplerEngine::Impl {
         for (auto& ch : tercaKey) ch.fill(-1);
         for (auto& ch : tercaRefs) ch.fill(0U);
         tercaApplied = -1;
-        polyLastKey.fill(-1); polyAnchorKey.fill(-1); polyLastOn.fill(0U); frameClock = 0U;
-        noteOnFrame.fill(0U); tempoCapSec.fill(10.0F);
+        polyLastKey.fill(-1); polyAnchorKey.fill(-1); polyLastOn.fill(0U); lineEndFrame.fill(0U); lineEndKey.fill(-1); frameClock = 0U;
         upperPeakL.fill(0.0F);
         upperPeakR.fill(0.0F);
         upperRouteMask.fill(0U);
@@ -2293,6 +2299,7 @@ void panic(SamplerEngine::Impl& impl) noexcept {
 }
 
 constexpr float kLegatoCrossfadeSec = 0.030F; // equal-power, only between two different recordings
+constexpr double kLegatoWindowSec = 0.100;    // SILVETON_LEGATO_WINDOW_V1: a key up to 100 ms after the last one was let go continues the line
 
 void monoRemoveAt(SamplerEngine::Impl::MonoKeys& m, std::size_t index) noexcept {
     for (std::size_t i = index + 1U; i < m.count; ++i) { m.key[i - 1U] = m.key[i]; m.vel[i - 1U] = m.vel[i]; }
@@ -2340,10 +2347,10 @@ UpperVoiceMode effectiveVoiceMode(const UpperPart& upper) noexcept {
 float glideSecFor(const SamplerEngine::Impl& impl, const UpperPart& upper, double fromKey, double toKey, int ui = -1) noexcept {
     const float base = portamentoSecFor(upper);
     if (base <= 0.0F || fromKey < 0.0) return base;
-    // SILVETON_PORTA_TEMPO_V1: never longer than 80 % of the time since the previous
-    // note of this Upper - a fast run articulates every note instead of smearing.
-    const float cap = (ui >= 0 && ui < kUpperCount) ? impl.tempoCapSec[static_cast<std::size_t>(ui)] : 10.0F;
-    const auto capped = [cap](float sec) noexcept { return std::min(sec, cap); };
+    // SILVETON_PORTA_SAME_V1: the glide is the same at any playing speed - exactly what
+    // the PORTA page says, slow or fast (the earlier tempo shortening is gone).
+    (void)ui;
+    const auto capped = [](float sec) noexcept { return sec; };
     const double d = std::abs(toKey - fromKey);
     if (upper.portaMode == PortamentoMode::Kronos) {
         // TIME: one duration for every interval. RATE: duration per octave.
@@ -2414,6 +2421,49 @@ void startPortamentoGlide(const SamplerEngine::Impl& impl, SamplerEngine::Impl::
     v.ratio = v.targetRatio * std::exp2(semitones / 12.0);
     const auto frames = static_cast<std::uint32_t>(std::max(1.0, static_cast<double>(seconds) * impl.sampleRate));
     beginGlide(v, v.targetRatio, frames);
+}
+
+// SILVETON_PHASE_ALIGN_V1: one mono frame of a recording (RAM prefix or streamed part).
+float monoFrameAt(const SampleData& s, std::uint64_t k) noexcept {
+    const auto ch = static_cast<std::size_t>(std::max<std::uint16_t>(1U, s.channels));
+    if (k < s.preloadedFrameCount()) {
+        const float* p = &s.interleaved[static_cast<std::size_t>(k) * ch];
+        return ch >= 2U ? 0.5F * (p[0] + p[1]) : p[0];
+    }
+    if (s.stream != nullptr && k < s.stream->frameCount()) {
+        return ch >= 2U ? 0.5F * (s.stream->readFrame(k, 0U) + s.stream->readFrame(k, 1U)) : s.stream->readFrame(k, 0U);
+    }
+    return 0.0F;
+}
+
+// SILVETON_PHASE_ALIGN_V1: when another recording takes over a held line, its start is
+// moved by up to one period so its waveform lines up with the recording still sounding
+// (both play the same pitch during the blend). Without this the two can sit in opposite
+// phase and eat each other for a moment - a hollow dip in the middle of every change of
+// recording. ~150 sample reads and 2300 multiplies, once per takeover.
+void alignLegatoPhase(SamplerEngine::Impl::Voice& v, const SamplerEngine::Impl::Voice& old, double sampleRate) noexcept {
+    if (v.sample == nullptr || old.sample == nullptr || v.ratio <= 0.0 || old.ratio <= 0.0 || v.periodFrames <= 0.0) return;
+    // period of the sounding pitch, in frames of each recording: both read their own
+    // recording at `ratio` frames per output frame and the output period is the same
+    const double outPeriod = v.periodFrames / v.ratio;                 // output frames per period (new voice at its current pitch)
+    if (!(outPeriod > 8.0) || !(outPeriod < 0.1 * sampleRate)) return;  // 10 Hz .. ~12 kHz: outside = not a pitched line
+    const double Pn = outPeriod * v.ratio;
+    const double Po = outPeriod * old.ratio;
+    constexpr int M = 48;
+    const double limitNew = static_cast<double>((v.sample->loop.enabled && v.sample->loop.endFrame > 0U) ? std::min<std::uint64_t>(v.sample->loop.endFrame, v.sample->frameCount()) : v.sample->frameCount());
+    const double limitOld = static_cast<double>(old.sample->frameCount());
+    if (v.position + 2.0 * Pn + 2.0 >= limitNew || old.position + Po + 2.0 >= limitOld || old.position < 0.0) return;
+    float o[M]; float n[2 * M];
+    for (int k = 0; k < M; ++k) o[k] = monoFrameAt(*old.sample, static_cast<std::uint64_t>(old.position + static_cast<double>(k) * Po / M));
+    for (int k = 0; k < 2 * M; ++k) n[k] = monoFrameAt(*v.sample, static_cast<std::uint64_t>(v.position + static_cast<double>(k) * Pn / M));
+    double best = -1.0e30; int bestJ = 0;
+    for (int j = 0; j < M; ++j) {
+        double c = 0.0;
+        for (int k = 0; k < M; ++k) c += static_cast<double>(o[k]) * static_cast<double>(n[j + k]);
+        if (c > best) { best = c; bestJ = j; }
+    }
+    v.position += static_cast<double>(bestJ) * Pn / M;
+    v.subPosition = v.position;
 }
 
 // SILVETON_LAYERS_V1: every recording this key plays on this Upper - the basic
@@ -2531,6 +2581,28 @@ void playUpperNote(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
     if (upperMono) for (auto& existing : impl.voices) if (existing.upperIndex == ui) existing.legatoKeep = false;
 }
 
+// SILVETON_LEGATO_WINDOW_V1: the line of this Upper ended less than kLegatoWindowSec ago and the
+// new key is another one: its voices (still ringing in their release) become held again, so the
+// new key continues them as legato instead of striking a new note. Returns the key they play.
+int reviveRecentLine(SamplerEngine::Impl& impl, int ui, std::uint8_t newKey) noexcept {
+    const auto u = static_cast<std::size_t>(ui);
+    if (impl.lineEndFrame[u] == 0U || impl.lineEndKey[u] < 0 || impl.lineEndKey[u] == static_cast<int>(newKey)) return -1;
+    if (impl.frameClock + 1U - impl.lineEndFrame[u] > static_cast<std::uint64_t>(kLegatoWindowSec * impl.sampleRate)) return -1;
+    bool revived = false;
+    for (auto& v : impl.voices) {
+        if (!v.active || v.fading || v.upperIndex != ui || v.keyHeld || v.delayFramesRemaining > 0U) continue;
+        if (static_cast<int>(v.key) != impl.lineEndKey[u]) continue;
+        if (v.ampEnv.stage != AmpEnv::Stage::Release && !v.sustained) continue;
+        v.keyHeld = true;
+        v.sustained = false;
+        v.ampEnv.stage = AmpEnv::Stage::Sustain;   // back to its level in ~10 ms, no new attack
+        revived = true;
+    }
+    if (!revived) return -1;
+    impl.lineEndFrame[u] = 0U;
+    return impl.lineEndKey[u];
+}
+
 // SILVETON_PORTA_PAGE_V1: one note of an Upper whose portamento is ON.
 // keyWasHeld = another key of this Upper was held before this note;
 // previousKey = that key (used only if its recording already ended).
@@ -2572,6 +2644,9 @@ void playPortamentoNote(SamplerEngine::Impl& impl, const std::shared_ptr<const E
     // fading out, the new one (started past its attack) fading in - over the
     // whole glide. No stretched single sample, no re-struck attack, no jump of
     // timbre at the arrival.
+    // SILVETON_PORTA_SOFT_FAST_V1: the blend between the two recordings lasts the whole
+    // glide (up to 300 ms) at any playing speed, and every tail still fading from an
+    // earlier note glides along to the newest key, so nothing lags behind in pitch.
     const float xfadeSec = std::clamp(glideSec, kLegatoCrossfadeSec, 0.300F);
     for (auto& v : impl.voices) if (v.upperIndex == ui) v.legatoKeep = false;
     forEachSoundZone(upper, global, key, velocity, [&](int s, const ProgramLayer& layer, const SampleZone& zone, int un) noexcept {
@@ -2593,6 +2668,15 @@ void playPortamentoNote(SamplerEngine::Impl& impl, const std::shared_ptr<const E
         v->mono = true;
         v->glideKronos = kronos;
         startPortamentoGlide(impl, *v, fromPitch, glideSec);
+        if (v != sounding && v->pitchGliding && sounding->pitchGliding) {
+            // SILVETON_PHASE_ALIGN_V1: the new recording takes over the exact glide of the old one
+            // (same momentum, same curve position) so the two stay in tune - and in phase - all the way
+            v->glideStartVelocity = sounding->glideStartVelocity; v->glideStartSemis = sounding->glideStartSemis;
+            v->glideRawSemis = sounding->glideRawSemis; v->glideSmooth1 = sounding->glideSmooth1; v->glideSmooth2 = sounding->glideSmooth2;
+            v->glideLastStep = sounding->glideLastStep; v->glideTotalFrames = sounding->glideTotalFrames; v->glideFramesRemaining = sounding->glideFramesRemaining;
+            v->ratio = v->targetRatio * std::exp2(12.0 * std::log2(sounding->ratio / sounding->targetRatio) / 12.0);
+        }
+        if (v != sounding) alignLegatoPhase(*v, *sounding, impl.sampleRate);   // SILVETON_PHASE_ALIGN_V1
         v->ampEnv.value = previousAmp;
         v->ampEnv.stage = AmpEnv::Stage::Decay;
         v->fadeGain = 0.0F;
@@ -2607,6 +2691,9 @@ void playPortamentoNote(SamplerEngine::Impl& impl, const std::shared_ptr<const E
             if (v.layer != nullptr && v.zone != nullptr) { v.glideKronos = kronos; legatoTo(impl, v, upper, *v.layer, *v.zone, key, global, glideSec); }
             softKill(impl, v, xfadeSec);
             v.fadeBlend = true;
+        } else if (v.active && v.fading && v.fadeBlend && v.upperIndex == ui && !v.legatoKeep && v.layer != nullptr && v.zone != nullptr) {
+            // SILVETON_PORTA_SOFT_FAST_V1: a tail from an earlier note of this line follows the newest key too
+            v.glideKronos = kronos; legatoTo(impl, v, upper, *v.layer, *v.zone, key, global, glideSec);
         }
     }
     for (auto& v : impl.voices) if (v.upperIndex == ui) v.legatoKeep = false;
@@ -2654,7 +2741,15 @@ void handleNoteOff(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
             }
         } else {
             releaseUpperVoices(impl, ui, channel);
+            impl.lineEndFrame[static_cast<std::size_t>(ui)] = impl.frameClock + 1U;   // SILVETON_LEGATO_WINDOW_V1
+            impl.lineEndKey[static_cast<std::size_t>(ui)] = static_cast<int>(keyHere);
         }
+    }
+    for (int ui = 0; ui < kUpperCount; ++ui) {   // SILVETON_LEGATO_WINDOW_V1: POLY Uppers too
+        const auto& upper = stateOwner->combi.uppers[static_cast<std::size_t>(ui)];
+        if (upper.midiChannel != (channel & 0x0FU) || voiceModeNow(impl, ui, upper) != UpperVoiceMode::Poly) continue;
+        impl.lineEndFrame[static_cast<std::size_t>(ui)] = impl.frameClock + 1U;
+        impl.lineEndKey[static_cast<std::size_t>(ui)] = static_cast<int>(key);
     }
     if (tmask != 0) {
         const auto tBits = static_cast<std::uint16_t>(tmask);
@@ -2728,17 +2823,14 @@ void processEvent(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineS
                     if (harmonyKey < 0) continue;
                     key = static_cast<std::uint8_t>(harmonyKey);
                 }
-                {   // SILVETON_PORTA_TEMPO_V1: how fast is the player going on this Upper
-                    const auto u = static_cast<std::size_t>(ui);
-                    const std::uint64_t since = impl.frameClock + 1U - impl.noteOnFrame[u];   // stored as frame + 1 (0 = never)
-                    impl.tempoCapSec[u] = impl.noteOnFrame[u] == 0U ? 10.0F
-                        : std::clamp(static_cast<float>(0.8 * static_cast<double>(since) / impl.sampleRate), 0.004F, 10.0F);
-                    impl.noteOnFrame[u] = impl.frameClock + 1U;
-                }
                 if (voiceModeNow(impl, ui, upper) != UpperVoiceMode::Poly) {
                     auto& mk = impl.mono[static_cast<std::size_t>(ui)];
-                    const bool keyWasHeld = mk.count > 0U;
-                    const int previousKey = keyWasHeld ? static_cast<int>(mk.key[mk.count - 1U]) : -1;
+                    bool keyWasHeld = mk.count > 0U;
+                    int previousKey = keyWasHeld ? static_cast<int>(mk.key[mk.count - 1U]) : -1;
+                    if (!keyWasHeld) {   // SILVETON_LEGATO_WINDOW_V1
+                        const int revivedKey = reviveRecentLine(impl, ui, key);
+                        if (revivedKey >= 0) { keyWasHeld = true; previousKey = revivedKey; }
+                    }
                     monoPush(mk, key, e.data2);
                     if (portamentoSecFor(upper) > 0.0F) {
                         // SILVETON_PORTA_PAGE_V1: the note that already sounds changes nothing
@@ -2754,6 +2846,8 @@ void processEvent(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineS
                     const auto u = static_cast<std::size_t>(ui);
                     bool held = false;
                     for (const auto& v : impl.voices) if (v.active && !v.fading && v.upperIndex == ui && v.keyHeld) { held = true; break; }
+                    // SILVETON_LEGATO_WINDOW_V1: a key let go less than the window ago still counts as held
+                    if (!held && impl.lineEndFrame[u] != 0U && impl.frameClock + 1U - impl.lineEndFrame[u] <= static_cast<std::uint64_t>(kLegatoWindowSec * impl.sampleRate)) held = true;
                     const bool sameChord = impl.frameClock - impl.polyLastOn[u] < static_cast<std::uint64_t>(0.050 * impl.sampleRate);   // a rolled chord is one chord
                     // KRONOS (not Fingered): always from the last key, held or not.
                     const bool always = upper.portaMode == PortamentoMode::Kronos && !upper.portaFingered;
@@ -3212,7 +3306,7 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
         const bool subOn = subLevel > 0.0F;
         const bool pwmOn = v.pwmWidthNow > 0.0F && v.periodFrames > 0.0;
         const float pwmMix = std::clamp(stC.x.pwmMix, 0.0F, 1.0F);
-        const double pwmDelta = pwmOn ? static_cast<double>(v.pwmWidthNow) * v.periodFrames : 0.0;
+        const double pwmDelta = pwmOn ? static_cast<double>(v.pwmWidthNow) * v.periodFrames : 0.0;   // in recording frames
         const float driveAmt = std::clamp(stC.x.drive + v.modDrive, 0.0F, 1.0F);
         const float driveK = 1.0F + 9.0F * driveAmt * driveAmt;
         const float driveNorm = 1.0F / std::sqrt(driveK);
@@ -3320,28 +3414,45 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
             double readPos = v.position;
             if (v.loopWrapped && looping && loopLen > 0.0 && readPos < loopStart + 64.0) readPos += loopLen;
             readWithLoopCrossfade(interpolator_, sample, readPos, ratio, looping, sL, sR);
+            if (pwmOn) {
+                // SILVETON_SYNTH_LIGHT_V1 - PWM: the recording minus itself shifted by WIDTH x its own
+                // period (saw -> pulse; any harmonic recording -> the comb PWM gives). The shifted copy
+                // comes from a delay line fed with the sound just read (4-point interpolation) - the
+                // same result as a second read of the recording at a tenth of the cost. 20 Hz DC blocker.
+                constexpr int kD = SamplerEngine::Impl::Voice::kPwmDelay;
+                const int w = v.pwmWrite;
+                v.pwmBuf[static_cast<std::size_t>(w) * 2U] = sL; v.pwmBuf[static_cast<std::size_t>(w) * 2U + 1U] = sR;
+                v.pwmWrite = (w + 1) & (kD - 1);
+                if (v.pwmFilled < kD) ++v.pwmFilled;
+                const double delay = std::clamp(pwmDelta / std::max(1.0e-6, ratio), 1.0, static_cast<double>(kD - 4));   // output frames
+                if (static_cast<double>(v.pwmFilled) > delay + 2.0) {
+                    const double rp = static_cast<double>(w) - delay;
+                    const int i1 = static_cast<int>(std::floor(rp));
+                    const float t = static_cast<float>(rp - static_cast<double>(i1));
+                    const auto at = [&](int ix, int c) noexcept { return v.pwmBuf[static_cast<std::size_t>(ix & (kD - 1)) * 2U + static_cast<std::size_t>(c)]; };
+                    const auto herm = [t](float y0, float y1, float y2, float y3) noexcept {
+                        const float c1 = 0.5F * (y2 - y0), c2 = y0 - 2.5F * y1 + 2.0F * y2 - 0.5F * y3, c3 = 0.5F * (y3 - y0) + 1.5F * (y1 - y2);
+                        return ((c3 * t + c2) * t + c1) * t + y1;
+                    };
+                    const float dL = herm(at(i1 - 1, 0), at(i1, 0), at(i1 + 1, 0), at(i1 + 2, 0));
+                    const float dR = herm(at(i1 - 1, 1), at(i1, 1), at(i1 + 1, 1), at(i1 + 2, 1));
+                    sL -= dL * pwmMix; sR -= dR * pwmMix;
+                }
+                const float yL = sL - v.dcXL + dcCoef * v.dcYL; v.dcXL = sL; v.dcYL = yL; sL = yL;
+                const float yR = sR - v.dcXR + dcCoef * v.dcYR; v.dcXR = sR; v.dcYR = yR; sR = yR;
+            }
             if (subOn) {
                 // SUB: the same recording an octave (or two) lower, from its own position
+                // (SILVETON_SYNTH_LIGHT_V1: read with the light 4-point interpolation - it runs at half
+                // or quarter speed, where that is already clean - instead of the Studio kernel)
                 float subL = 0.0F, subR = 0.0F;
                 double subPos = v.subPosition;
                 if (v.loopWrapped && looping && loopLen > 0.0 && subPos < loopStart + 64.0) subPos += loopLen;
-                readWithLoopCrossfade(interpolator_, sample, subPos, ratio / subRatioDiv, looping, subL, subR);
+                readWithLoopCrossfade(subInterpolator_, sample, subPos, ratio / subRatioDiv, looping, subL, subR);
                 sL += subL * subLevel; sR += subR * subLevel;
                 v.subPosition += ratio / subRatioDiv;
                 if (looping && v.subPosition >= loopEnd && loopLen > 0.0) v.subPosition = loopStart + std::fmod(v.subPosition - loopStart, loopLen);
                 else if (!looping && v.subPosition >= sampleEnd) v.subPosition = sampleEnd - 1.0;
-            }
-            if (pwmOn) {
-                // PWM: the recording minus itself shifted by WIDTH x its own period (saw -> pulse; any
-                // harmonic recording -> the same comb that PWM gives). A 20 Hz DC blocker follows.
-                double p2 = readPos - pwmDelta;
-                if (looping && loopLen > 0.0 && p2 < loopStart) { if (v.loopWrapped) p2 += loopLen; else p2 = std::max(0.0, p2); }
-                else if (p2 < 0.0) p2 = 0.0;
-                float dL = 0.0F, dR = 0.0F;
-                readWithLoopCrossfade(interpolator_, sample, p2, ratio, looping, dL, dR);
-                sL -= dL * pwmMix; sR -= dR * pwmMix;
-                const float yL = sL - v.dcXL + dcCoef * v.dcYL; v.dcXL = sL; v.dcYL = yL; sL = yL;
-                const float yR = sR - v.dcXR + dcCoef * v.dcYR; v.dcXR = sR; v.dcYR = yR; sR = yR;
             }
 
             if (filterActive) {

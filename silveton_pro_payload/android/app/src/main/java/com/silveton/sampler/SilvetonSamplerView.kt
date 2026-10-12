@@ -3,11 +3,13 @@ package com.silveton.sampler
 import android.app.AlertDialog
 import android.app.Dialog
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.LinearGradient
 import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.RadialGradient
 import android.graphics.RectF
 import android.graphics.Shader
@@ -66,6 +68,10 @@ class SilvetonSamplerView(
     private val hits = ArrayList<Hit>(256)
     // ---------------------------------------------------------------- SILVETON_GUI_V4 state
     private var editSound = 0                    // 0 basic sound, 1..4 layer, 5 = ОБЩО UPPER
+    // SILVETON_UPPER_MENU_V1: which sound every strip shows (0 = ОСНОВЕН, 1..4 = L1..L4) - chosen
+    // from the drop-down key above the strip; the strip and the editor below follow it.
+    private val stripSound = IntArray(7)
+    private var dropUpper = -1                   // strip whose drop-down list is open
     private val upperParamsCache = arrayOfNulls<FloatArray>(7)
     private val layerParamsCache = Array(7) { arrayOfNulls<FloatArray>(4) }
     private val layerNameCache = Array(7) { arrayOfNulls<String>(4) }
@@ -238,6 +244,7 @@ class SilvetonSamplerView(
 
     init {
         isFocusable = true
+        applyTheme(sampler.themeDark())   // SILVETON_THEME_V1
         refreshAllUppers()
         refreshFx()
         refreshGlobal()
@@ -516,11 +523,18 @@ class SilvetonSamplerView(
     ) {
         val start = value
         var last = value
+        // SILVETON_FINE_KNOBS_V1: ten times finer steps than the display grid (whole-number
+        // controls with a small range keep their steps), and a slow finger moves 4x finer -
+        // the hundredths are reached by hand; the number dialog sets them exactly.
+        val fine = if (step >= 1f && maxV - minV <= 48f) step else step / 10f
+        var acc = 0f; var prevD = 0f
         hit(r, { _, _ -> exact() }, reset) { x, y, final ->
             if (!dragMoved) return@hit
             val d = (x - downX) - (y - downY)
             val moved = if (abs(d) <= touchSlop) 0f else d - Math.signum(d) * touchSlop
-            val nv = quantizeControl(start + moved / (travel * DRAG_SLOW) * (maxV - minV), minV, maxV, step)
+            val delta = moved - prevD; prevD = moved
+            acc += delta * (if (abs(delta) <= 2f) 0.25f else 1f)
+            val nv = quantizeControl(start + acc / (travel * DRAG_SLOW) * (maxV - minV), minV, maxV, fine)
             if (nv != last) {
                 last = nv
                 onChange(nv)
@@ -631,17 +645,62 @@ class SilvetonSamplerView(
     private fun drawMetal(c: Canvas) {
         paint.style = Paint.Style.FILL
         paint.color = Color.BLACK
+        if (darkTheme) {   // SILVETON_THEME_V1: deep panel, lighter towards the middle
+            paint.shader = RadialGradient(DESIGN_W * 0.55f, DESIGN_H * 0.4f, DESIGN_W * 0.9f, Color.rgb(42, 44, 50), C_METAL_A, Shader.TileMode.CLAMP)
+            c.drawRect(0f, 0f, DESIGN_W, DESIGN_H, paint)
+            paint.shader = null
+            return
+        }
         paint.shader = LinearGradient(0f, 0f, 4f, 0f, intArrayOf(C_METAL_A, C_METAL_A, C_METAL_B, C_METAL_B),
             floatArrayOf(0f, 0.5f, 0.5f, 1f), Shader.TileMode.REPEAT)
         c.drawRect(0f, 0f, DESIGN_W, DESIGN_H, paint)
         paint.shader = null
     }
 
+    // SILVETON_THEME_V1: the wooden side of the dark theme (walnut), drawn once into a bitmap.
+    private var woodBitmap: Bitmap? = null
+    private fun wood(): Bitmap {
+        woodBitmap?.let { return it }
+        val bw = 96; val bh = 800
+        val bmp = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
+        val cv = Canvas(bmp)
+        val p = Paint(Paint.ANTI_ALIAS_FLAG)
+        p.shader = LinearGradient(0f, 0f, bw.toFloat(), 0f, intArrayOf(Color.rgb(78, 48, 28), Color.rgb(118, 74, 42), Color.rgb(96, 58, 34), Color.rgb(70, 42, 24)),
+            floatArrayOf(0f, 0.35f, 0.7f, 1f), Shader.TileMode.CLAMP)
+        cv.drawRect(0f, 0f, bw.toFloat(), bh.toFloat(), p)
+        p.shader = null
+        p.style = Paint.Style.STROKE
+        val rnd = java.util.Random(7)
+        for (k in 0 until 70) {   // grain: wavy vertical lines, darker and lighter
+            val x0 = rnd.nextFloat() * bw
+            val amp = 2f + rnd.nextFloat() * 6f
+            val per = 120f + rnd.nextFloat() * 260f
+            val ph = rnd.nextFloat() * 6.28f
+            val dark = rnd.nextBoolean()
+            p.color = if (dark) Color.argb(28 + rnd.nextInt(30), 20, 10, 4) else Color.argb(18 + rnd.nextInt(20), 220, 170, 110)
+            p.strokeWidth = 0.6f + rnd.nextFloat() * 1.6f
+            val path = Path()
+            path.moveTo(x0 + amp * kotlin.math.sin(ph), 0f)
+            var y = 0f
+            while (y < bh) { y += 8f; path.lineTo(x0 + amp * kotlin.math.sin(ph + y / per * 6.28f), y) }
+            cv.drawPath(path, p)
+        }
+        woodBitmap = bmp
+        return bmp
+    }
+
     private fun drawSideNav(c: Canvas) {
         paint.style = Paint.Style.FILL
         paint.color = Color.BLACK
-        paint.shader = LinearGradient(0f, 0f, 96f, 0f, C_SIDE_A, C_SIDE_B, Shader.TileMode.CLAMP)
-        c.drawRect(0f, 0f, 96f, DESIGN_H, paint)
+        if (darkTheme) {   // SILVETON_THEME_V1: walnut side like a real synthesizer
+            paint.shader = null
+            c.drawBitmap(wood(), null, RectF(0f, 0f, 96f, DESIGN_H), paint)
+            line(c, 96f, 0f, 96f, DESIGN_H, Color.rgb(10, 8, 6), 3f)
+            line(c, 98f, 0f, 98f, DESIGN_H, Color.rgb(120, 124, 134), 1f)
+        } else {
+            paint.shader = LinearGradient(0f, 0f, 96f, 0f, C_SIDE_A, C_SIDE_B, Shader.TileMode.CLAMP)
+            c.drawRect(0f, 0f, 96f, DESIGN_H, paint)
+        }
         paint.shader = LinearGradient(96f, 0f, 104f, 0f, Color.argb(80, 0, 0, 0), Color.argb(0, 0, 0, 0), Shader.TileMode.CLAMP)
         c.drawRect(96f, 0f, 104f, DESIGN_H, paint)
         paint.shader = null
@@ -661,7 +720,7 @@ class SilvetonSamplerView(
             val b = RectF(10f, 128f + i * 104f, 86f, 224f + i * 104f)
             navKey(c, b, page == p)
             led(c, b.centerX(), b.centerY() - 14f, page == p, 5f)
-            text(c, label, b.centerX(), b.centerY() + 22f, 11f, if (page == p) Color.WHITE else C_NAV_TEXT,
+            text(c, label, b.centerX(), b.centerY() + 22f, 11f, if (page == p) C_NAV_ON_TEXT else C_NAV_TEXT,
                 center = true, face = if (page == p) faceBold else faceRegular, spacing = 0.06f, maxWidth = 70f)
             hit(b, { _, _ ->
                 page = p
@@ -755,7 +814,7 @@ class SilvetonSamplerView(
             cell(1, 0, "MIDI", midiValue, if (midiRx) C_LCD else if (midiConnected) C_LCD_OK else C_LCD_VALUE)
             cell(2, 0, "ГЛАСОВЕ", a.activeVoices.toString(), if (audioSignal) C_LCD else C_LCD_VALUE)
             cell(0, 1, "XRUN", a.xrunCount.toString(), if (a.xrunCount > 0) C_LCD_BAD else C_LCD_VALUE)
-            cell(1, 1, "ЛАТЕНЦИЯ", if (a.estimatedLatencyMs >= 0.0) "%.1f ms".format(a.estimatedLatencyMs) else "—", C_LCD_VALUE)
+            cell(1, 1, "ЛАТЕНЦИЯ", if (a.estimatedLatencyMs >= 0.0) "%.2f ms".format(a.estimatedLatencyMs) else "—", C_LCD_VALUE)
             cell(2, 1, "CPU", "${round(a.cpuLoadPercent).toInt()} %", if (a.cpuLoadPercent > 95f) C_LCD_BAD else if (a.cpuLoadPercent > 80f) C_LCD else C_LCD_VALUE)
         } else {
             // SILVETON_STATUS_V2: ЗВУК · MASTER · PORTA boxes
@@ -766,7 +825,7 @@ class SilvetonSamplerView(
             led(c, zv.left + 18f, zv.top + 18f, audioOk, 6f)
             if (!audioOk && running) led(c, zv.left + 18f, zv.top + 18f, true, 6f)
             text(c, if (audioOk) "ЗВУК OK" else if (running) "ЗВУК $audioValue" else "ЗВУК $audioValue", zv.left + 32f, zv.top + 23f, 11f, if (audioOk) C_LCD_OK else C_LCD_BAD, face = faceMono, spacing = 0.2f, maxWidth = 120f)
-            text(c, if (a.estimatedLatencyMs >= 0.0) "%.1f ms".format(a.estimatedLatencyMs) else "—", zv.left + 14f, zv.top + 66f, 30f, C_LCD, face = faceMono)
+            text(c, if (a.estimatedLatencyMs >= 0.0) "%.2f ms".format(a.estimatedLatencyMs) else "—", zv.left + 14f, zv.top + 66f, 30f, C_LCD, face = faceMono)
             val cpu = a.cpuLoadPercent
             val cpuCol = if (cpu > 95f) C_LCD_BAD else if (cpu > 80f) C_LCD else C_LCD_OK
             text(c, "XRUN ${a.xrunCount}", zv.left + 150f, zv.top + 23f, 11f, if (a.xrunCount > 0) C_LCD_BAD else C_LCD_DIM, face = faceMono)
@@ -783,7 +842,7 @@ class SilvetonSamplerView(
             val g = globalState ?: sampler.globalUiState()?.also { globalState = it }
             val master = g?.masterGainDb ?: -6f
             text(c, "MASTER", ms.left + 12f, ms.top + 22f, 11f, C_LCD_DIM, face = faceMono, spacing = 0.2f)
-            text(c, "%.1f dB".format(master), ms.left + 12f, ms.top + 56f, 24f, if (master > 0f) C_LCD_BAD else C_LCD, face = faceMono)
+            text(c, "%.2f dB".format(master), ms.left + 12f, ms.top + 56f, 24f, if (master > 0f) C_LCD_BAD else C_LCD, face = faceMono)
             val pk = max(frameUpperMeters.maxOfOrNull { max(it.first, it.second) } ?: 0f, 0f)
             val mb = RectF(ms.left + 12f, ms.bottom - 16f, ms.right - 12f, ms.bottom - 10f)
             fill(c, mb, 3f, Color.rgb(40, 42, 40))
@@ -829,12 +888,57 @@ class SilvetonSamplerView(
             drawUpperStrip(c, RectF(left, 108f, left + stripW, 468f), i, state, meters.getOrElse(i) { 0f to 0f })
         }
         drawUpperEditor(c)
+        if (dropUpper in 0..6) drawUpperMenu(c, dropUpper, 112f + dropUpper * (stripW + 8f), stripW)
+    }
+
+    // SILVETON_UPPER_MENU_V1: the drop-down list of one Upper - ОСНОВЕН and L1..L4 with their sounds.
+    private fun drawUpperMenu(c: Canvas, i: Int, left: Float, w: Float) {
+        hit(RectF(0f, 0f, 1340f, 800f), { _, _ -> dropUpper = -1; invalidate() })   // anywhere else closes
+        val r = RectF(left + 4f, 140f, left + w - 4f, 140f + 6f + 5 * 38f + 6f)
+        shadow(c, r, 10f, 3f, 90)
+        fill(c, r, 10f, Color.WHITE)
+        paint.style = Paint.Style.STROKE; paint.strokeWidth = 2f; paint.color = Color.rgb(90, 94, 100); paint.shader = null
+        c.drawRoundRect(r, 10f, 10f, paint); paint.style = Paint.Style.FILL
+        val s = upperStates[i]
+        for (k in 0..4) {
+            val row = RectF(r.left + 4f, r.top + 6f + k * 38f, r.right - 4f, r.top + 6f + k * 38f + 34f)
+            val on = stripSound[i] == k
+            val label = if (k == 0) "ОСНОВЕН" else "L$k"
+            val has = if (k == 0) !(s == null || s.soundName == "EMPTY" || s.soundName.isBlank()) else layerSlot(i, k - 1) > 0
+            val name = when {
+                k == 0 -> if (has) s!!.soundName else "— празен —"
+                has -> sampler.layerName(i, k - 1).ifBlank { "L$k" }
+                else -> "— празен —"
+            }
+            if (on) fill(c, row, 6f, C_BOARD_TOP)
+            text(c, label, row.left + 8f, row.top + 22f, 11f, if (on) C_AMBER else Color.rgb(60, 66, 74), face = faceBold)
+            text(c, name, row.right - 6f, row.top + 22f, 9f, if (on) C_LCD_DIM else (if (has) Color.rgb(90, 95, 105) else Color.rgb(150, 155, 162)),
+                right = true, maxWidth = row.width() - 70f)
+            hit(row, { _, _ ->
+                stripSound[i] = k
+                selectedUpper = i
+                if (editSound != 5) { editSound = k; if (tab !in tabsFor(k)) tab = tabsFor(k).first() }
+                dropUpper = -1
+                if (!has) openPicker(i, k - 1)   // an empty place: choose its sound straight away
+                invalidate()
+            })
+        }
     }
 
     private fun drawUpperStrip(c: Canvas, r: RectF, i: Int, s: SamplerAppController.UpperState, meter: Pair<Float, Float>) {
         val selected = i == selectedUpper
-        val empty = s.soundName == "EMPTY" || s.soundName.isBlank()
-        val live = s.enabled && !empty
+        // SILVETON_UPPER_MENU_V1: the strip shows ОСНОВЕН or the layer chosen from its drop-down key
+        val ls = stripSound[i].coerceIn(0, 4)
+        val layerView = ls > 0
+        val lHas = layerView && layerSlot(i, ls - 1) > 0
+        val lp = if (layerView) lParams(i, ls - 1) else FloatArray(0)
+        val empty = if (layerView) !lHas else (s.soundName == "EMPTY" || s.soundName.isBlank())
+        val live = if (layerView) (lHas && layerOn(i, ls - 1) && s.enabled) else (s.enabled && !empty)
+        val shownName = if (layerView) (if (lHas) sampler.layerName(i, ls - 1).ifBlank { "L$ls" } else "EMPTY") else s.soundName
+        val shownPan = if (layerView) lp.getOrElse(2) { 0f } else s.pan
+        val shownLevel = if (layerView) lp.getOrElse(1) { 0f } else s.levelDb
+        val shownLow = if (layerView) lp.getOrElse(6) { 0f }.toInt() else s.keyLow
+        val shownHigh = if (layerView) lp.getOrElse(7) { 127f }.toInt() else s.keyHigh
         val L = r.left
         val T = r.top
         val W = r.width()
@@ -848,29 +952,34 @@ class SilvetonSamplerView(
             shadow(c, r, 12f, 2f, 55)
         }
         fill(c, r, 12f, if (selected) C_STRIP_SEL else C_STRIP)
-        line(c, L + 12f, T + 1f, r.right - 12f, T + 1f, Color.WHITE, 1f)
+        line(c, L + 12f, T + 1f, r.right - 12f, T + 1f, if (darkTheme) Color.rgb(72, 76, 86) else Color.WHITE, 1f)
 
-        text(c, "UPPER ${i + 1}", L + 12f, T + 21f, 10f, C_LABEL_GREY, spacing = 0.2f)
-        led(c, r.right - 15f, T + 17f, live, 5f, light = true)
-        text(c, if (empty) "EMPTY" else s.soundName, L + 12f, T + 42f, 15f, if (empty) C_EMPTY_TEXT else C_INK,
+        // SILVETON_UPPER_MENU_V1: drop-down key "UPPER n ▾" / "UPPER n · L2 ▾"
+        val menuR = RectF(L + 6f, T + 5f, r.right - 24f, T + 29f)
+        stripToggle(c, menuR, if (layerView) "UPPER ${i + 1} · L$ls ▾" else "UPPER ${i + 1} ▾", layerView, C_AMBER, size = 10f)
+        hit(menuR, { _, _ -> selectedUpper = i; dropUpper = if (dropUpper == i) -1 else i; invalidate() })
+        led(c, r.right - 13f, T + 17f, live, 5f, light = true)
+        text(c, if (empty) "EMPTY" else shownName, L + 12f, T + 46f, 15f, if (empty) C_EMPTY_TEXT else C_INK,
             face = faceBold, maxWidth = W - 24f)
-        hit(RectF(L, T + 26f, r.right, T + 50f), { _, _ -> selectedUpper = i; openPicker(i, -1) })
+        hit(RectF(L, T + 30f, r.right, T + 50f), { _, _ -> selectedUpper = i; openPicker(i, ls - 1) })
 
         // ON / SOLO / MUTE - big keys (SILVETON_GUI_V3)
         val tgW = (W - 16f - 8f) / 3f
         for (k in 0 until 3) {
             val tr = RectF(L + 8f + k * (tgW + 4f), T + 52f, L + 8f + k * (tgW + 4f) + tgW, T + 90f)
-            val on = when (k) { 0 -> s.enabled; 1 -> s.solo; else -> s.mute }
+            val on = when (k) { 0 -> if (layerView) (lHas && layerOn(i, ls - 1)) else s.enabled; 1 -> s.solo; else -> s.mute }
             val label = when (k) { 0 -> "ON"; 1 -> "SOLO"; else -> "MUTE" }
             val onColor = when (k) { 0 -> C_AMBER; 1 -> C_SOLO; else -> C_MUTE }
             stripToggle(c, tr, label, on, onColor, size = if (k == 0) 15f else 11f)
             hit(tr, { _, _ ->
                 val cur = upperStates[i] ?: s
                 when (k) {
-                    0 -> if (!empty) commitMain(i, cur.copy(enabled = !cur.enabled))
+                    0 -> if (layerView) { if (lHas) setLParam(i, ls - 1, 0, if (layerOn(i, ls - 1)) 0f else 1f) else openPicker(i, ls - 1) }
+                         else if (!empty) commitMain(i, cur.copy(enabled = !cur.enabled))
                     1 -> commitMain(i, cur.copy(solo = !cur.solo))
                     else -> commitMain(i, cur.copy(mute = !cur.mute))
                 }
+                invalidate()
             })
         }
 
@@ -891,18 +1000,14 @@ class SilvetonSamplerView(
         }
 
         // PAN knob: drag the whole row, long press = number, double tap = centre.
-        drawKnob(c, L + 29f, T + 147f, 19f, (s.pan + 1f) * 0.5f, bipolar = true, ring = false)
+        drawKnob(c, L + 29f, T + 147f, 19f, (shownPan + 1f) * 0.5f, bipolar = true, ring = false)
         text(c, "PAN", L + 58f, T + 142f, 10f, C_LABEL_GREY, spacing = 0.2f)
-        text(c, panText(s.pan), L + 58f, T + 160f, 14f, C_INK, face = faceMonoBold)
-        knobHit(RectF(L, T + 126f, r.right, T + 170f), s.pan, -1f, 1f, 0.01f, 160f,
-            onChange = { nv -> val cur = upperStates[i] ?: s; commitMain(i, cur.copy(pan = nv)) },
-            exact = {
-                showNumber("UPPER ${i + 1} PAN", s.pan, -1f, 1f, 2) { nv ->
-                    val cur = upperStates[i] ?: s
-                    commitMain(i, cur.copy(pan = nv))
-                }
-            },
-            reset = { val cur = upperStates[i] ?: s; commitMain(i, cur.copy(pan = 0f)) })
+        text(c, panText(shownPan), L + 58f, T + 160f, 14f, C_INK, face = faceMonoBold)
+        val setPan: (Float) -> Unit = { nv -> if (layerView) setLParam(i, ls - 1, 2, nv) else { val cur = upperStates[i] ?: s; commitMain(i, cur.copy(pan = nv)) } }
+        knobHit(RectF(L, T + 126f, r.right, T + 170f), shownPan, -1f, 1f, 0.01f, 160f,
+            onChange = setPan,
+            exact = { showNumber(if (layerView) "UPPER ${i + 1} L$ls PAN" else "UPPER ${i + 1} PAN", shownPan, -1f, 1f, 2) { nv -> setPan(nv) } },
+            reset = { setPan(0f) })
 
         // LEVEL fader with L/R meters.
         val trackL = L + 52f
@@ -920,18 +1025,15 @@ class SilvetonSamplerView(
         paint.shader = null
         stripMeter(c, RectF(L + 92f, trackTop, L + 103f, trackBot), meter.first)
         stripMeter(c, RectF(L + 109f, trackTop, L + 120f, trackBot), meter.second)
-        faderCap(c, (trackL + trackR) * 0.5f, trackBot - faderT(s.levelDb) * travel, big = true)
-        text(c, dbText(s.levelDb), r.centerX(), T + 272f, 14f, C_INK, center = true, face = faceMonoBold)
+        faderCap(c, (trackL + trackR) * 0.5f, trackBot - faderT(shownLevel) * travel, big = true)
+        text(c, dbText(shownLevel), r.centerX(), T + 272f, 14f, C_INK, center = true, face = faceMonoBold)
+        val setLevel: (Float) -> Unit = { nv -> if (layerView) setLParam(i, ls - 1, 1, nv) else { val cur = upperStates[i] ?: s; commitMain(i, cur.copy(levelDb = nv)) } }
         val exactLevel = {
-            showNumber("UPPER ${i + 1} LEVEL dB", s.levelDb, -60f, 12f, 1) { nv ->
-                val cur = upperStates[i] ?: s
-                commitMain(i, cur.copy(levelDb = nv))
-            }
+            showNumber(if (layerView) "UPPER ${i + 1} L$ls LEVEL dB" else "UPPER ${i + 1} LEVEL dB", shownLevel, -60f, 12f, 1) { nv -> setLevel(nv) }
         }
-        val resetLevel = { val cur = upperStates[i] ?: s; commitMain(i, cur.copy(levelDb = 0f)) }
-        faderHit(RectF(L + 26f, T + 172f, r.right - 4f, T + 258f), s.levelDb, travel,
-            onChange = { nv -> val cur = upperStates[i] ?: s; commitMain(i, cur.copy(levelDb = nv)) },
-            exact = exactLevel, reset = resetLevel)
+        val resetLevel = { setLevel(0f) }
+        faderHit(RectF(L + 26f, T + 172f, r.right - 4f, T + 258f), shownLevel, travel,
+            onChange = setLevel, exact = exactLevel, reset = resetLevel)
         hit(RectF(L, T + 258f, r.right, T + 278f), { _, _ -> exactLevel() }, resetLevel)
 
         // POLY / MONO / LEGATO - three own keys (SILVETON_GUI_V3) + key range.
@@ -953,44 +1055,47 @@ class SilvetonSamplerView(
         val rangeR = RectF(qR.right + 4f, T + 316f, r.right - 8f, T + 354f)
         // SILVETON_KEY_SCAN_V1: tap = SCAN, then press a key: this Upper plays up to it.
         // Tap again = cancel, double tap = whole keyboard.
-        if (sampler.keyScanUpper() == i) {
+        if (!layerView && sampler.keyScanUpper() == i) {
             val blink = (android.os.SystemClock.uptimeMillis() / 300L) % 2L == 0L
             stripToggle(c, rangeR, "НАТИСНИ…", true, if (blink) C_ORANGE else C_AMBER, size = 10f)
             postInvalidateDelayed(150L)
         } else {
-            lightKey(c, rangeR, "${noteName(s.keyLow)}–${noteName(s.keyHigh)}", size = 10f, radius = 6f)
+            lightKey(c, rangeR, "${noteName(shownLow)}–${noteName(shownHigh)}", size = 10f, radius = 6f)
         }
         hit(rangeR, { _, _ ->
             selectedUpper = i
-            if (sampler.keyScanUpper() == i) sampler.cancelKeyScan() else sampler.startKeyScan(i)
+            if (layerView) { editSound = ls; tab = UpperTab.RANGE }   // the layer range is set on its RANGE page
+            else if (sampler.keyScanUpper() == i) sampler.cancelKeyScan() else sampler.startKeyScan(i)
             invalidate()
         }, {
-            sampler.cancelKeyScan()
-            val cur = upperStates[i] ?: s
-            commitMain(i, cur.copy(keyLow = 0, keyHigh = 127))
+            if (layerView) { setLParam(i, ls - 1, 6, 0f); setLParam(i, ls - 1, 7, 127f) }
+            else { sampler.cancelKeyScan(); val cur = upperStates[i] ?: s; commitMain(i, cur.copy(keyLow = 0, keyHigh = 127)) }
         })
 
         if (!live) {
             // Switched-off / empty UPPER: veil it, controls stay usable.
-            fill(c, r, 12f, Color.argb(92, 220, 221, 225))
+            fill(c, r, 12f, if (darkTheme) Color.argb(120, 30, 32, 37) else Color.argb(92, 220, 221, 225))
         }
     }
 
     private fun drawUpperEditor(c: Canvas) {
         val s = upperStates[selectedUpper] ?: return
         val u = selectedUpper
-        // SILVETON_GUI_V4: which sound of the Upper is edited (or the common settings)
+        // SILVETON_UPPER_MENU_V1: the edited sound is the one the strip shows (its drop-down key);
+        // the first key names it and opens that list, the second is the common settings of the Upper.
+        val ss = stripSound[u].coerceIn(0, 4)
+        if (editSound != 5 && editSound != ss) { editSound = ss; if (tab !in tabsFor(ss)) tab = tabsFor(ss).first() }
         var x = 112f
-        for (k in 0..5) {
-            val label = when (k) { 0 -> "ОСНОВЕН"; 5 -> "ОБЩО U${u + 1}"; else -> "L$k" }
-            val w = when (k) { 0 -> 108f; 5 -> 118f; else -> 54f }
-            val rr = RectF(x, 478f, x + w, 514f)
-            val dim = k in 1..4 && layerSlot(u, k - 1) <= 0
-            stripToggle(c, rr, label, editSound == k, if (dim) C_LCD_DIM else C_AMBER, size = if (k in 1..4) 13f else 11f)
-            hit(rr, { _, _ -> editSound = k; if (tab !in tabsFor(k)) tab = tabsFor(k).first() })
-            x += w + 5f
+        run {
+            val rr = RectF(x, 478f, x + 150f, 514f)
+            stripToggle(c, rr, if (ss == 0) "UPPER ${u + 1} · ОСНОВЕН" else "UPPER ${u + 1} · L$ss", editSound != 5, C_AMBER, size = 11f)
+            hit(rr, { _, _ -> if (editSound == 5) { editSound = ss; if (tab !in tabsFor(ss)) tab = tabsFor(ss).first() } else dropUpper = u; invalidate() })
+            x += 158f
+            val gr = RectF(x, 478f, x + 118f, 514f)
+            stripToggle(c, gr, "ОБЩО U${u + 1}", editSound == 5, C_AMBER, size = 11f)
+            hit(gr, { _, _ -> editSound = 5; if (tab !in tabsFor(5)) tab = tabsFor(5).first() })
+            x += 126f
         }
-        x += 8f
         tabsFor(editSound).forEach { t ->
             val name = when (t) { UpperTab.CONTROL -> "CTRL"; else -> t.name }
             val tw = textWidth(name, 13f, faceBold, 0.15f) + 40f
@@ -1107,7 +1212,7 @@ class SilvetonSamplerView(
             if (v >= 0f) v else when (k) { 0 -> 5f; 1 -> 80f; 2 -> 1f; 3 -> 120f; 4 -> 20000f; else -> 0f }
         }
         fun setLegacy(k: Int, v: Float) { if (sound == 0) setTone(TonePar.entries[k], v) else setLParam(u, sound - 1, 10 + k, v) }
-        text(c, "TONE · ${soundLabel(sound)}", sec.left + 6f, sec.top + 12f, 11f, C_SECTION_TITLE, spacing = 0.25f)
+        secTitle(c, sec, "TONE · ${soundLabel(sound)}")
         // row 1: ATTACK DECAY SUSTAIN RELEASE | START END | CUTOFF RESON F.ENV F.TIME | HI-PASS | MOD WHEEL
         val envNames = arrayOf("ATTACK", "DECAY", "SUSTAIN", "RELEASE", "CUTOFF", "RESON")
         val envCols = intArrayOf(0, 1, 2, 3, 6, 7)
@@ -1122,7 +1227,7 @@ class SilvetonSamplerView(
                 reset = { setLegacy(k, -1f) })
         }
         // START / END (ms into the sample)
-        fun msText(v: Float) = if (v <= 0f) "OFF" else if (v < 1000f) "${round(v).toInt()} ms" else "%.2f s".format(v / 1000f)
+        fun msText(v: Float) = if (v <= 0f) "OFF" else if (v < 1000f) "%.2f ms".format(v) else "%.2f s".format(v / 1000f)
         listOf(0 to "START", 1 to "END").forEachIndexed { k, (id, label) ->
             val v = toneX(u, sound, id)
             val maxV = if (id == 0) 2000f else 60000f
@@ -1135,7 +1240,7 @@ class SilvetonSamplerView(
         // FILTER ENV amount (octaves) + time
         run {
             val v = toneX(u, sound, 2)
-            knobControl(c, cx(8), r1, rad, v, -8f, 8f, 0.05f, 280f, true, "%.1f oct".format(v), "F.ENV", hitW = hw,
+            knobControl(c, cx(8), r1, rad, v, -8f, 8f, 0.05f, 280f, true, "%.2f oct".format(v), "F.ENV", hitW = hw,
                 onChange = { nv -> setToneX(u, sound, 2, nv) }, exact = { showNumber("FILTER ENV (октави)", v, -8f, 8f, 2) { setToneX(u, sound, 2, it) } }, reset = { setToneX(u, sound, 2, 0f) })
             val t = toneX(u, sound, 3)
             val norm = kotlin.math.ln(t.coerceIn(1f, 20000f)) / kotlin.math.ln(20000f)
@@ -1144,7 +1249,7 @@ class SilvetonSamplerView(
                 exact = { showNumber("FILTER ENV TIME ms", t, 1f, 20000f, 0) { setToneX(u, sound, 3, it) } }, reset = { setToneX(u, sound, 3, 120f) })
             val hp = toneX(u, sound, 6)
             val hn = if (hp < 10f) 0f else kotlin.math.ln(hp / 10f) / kotlin.math.ln(400f)
-            knobControl(c, cx(10), r1, rad, hn, 0f, 1f, 0.002f, 260f, false, if (hp < 10f) "OFF" else "${round(hp).toInt()} Hz", "HI-PASS", hitW = hw,
+            knobControl(c, cx(10), r1, rad, hn, 0f, 1f, 0.002f, 260f, false, if (hp < 10f) "OFF" else "${"%.2f".format(hp)} Hz", "HI-PASS", hitW = hw,
                 onChange = { nv -> setToneX(u, sound, 6, if (nv <= 0.002f) 0f else round(10f * Math.pow(400.0, nv.toDouble()).toFloat())) },
                 exact = { showNumber("HIGH-PASS Hz (0 = OFF)", hp, 0f, 4000f, 0) { setToneX(u, sound, 6, it) } }, reset = { setToneX(u, sound, 6, 0f) })
             val wheel = toneX(u, sound, 11) >= 0.5f
@@ -1156,10 +1261,10 @@ class SilvetonSamplerView(
         // row 2: VEL->LEV VEL->CUT | quick START keys | LFO RATE DEPTH DELAY FADE | EQ LOW MID HIGH
         run {
             val vl = toneX(u, sound, 4)
-            knobControl(c, cx(0), r2, rad, vl, 0f, 1f, 0.01f, 250f, false, "${round(vl * 100f).toInt()} %", "VEL→LEVEL", hitW = hw,
+            knobControl(c, cx(0), r2, rad, vl, 0f, 1f, 0.01f, 250f, false, "${"%.2f".format(vl * 100f)} %", "VEL→LEVEL", hitW = hw,
                 onChange = { nv -> setToneX(u, sound, 4, nv) }, exact = { showNumber("VEL→LEVEL %", vl * 100f, 0f, 100f, 0) { setToneX(u, sound, 4, it / 100f) } }, reset = { setToneX(u, sound, 4, 1f) })
             val vc = toneX(u, sound, 5)
-            knobControl(c, cx(1), r2, rad, vc, 0f, 8f, 0.05f, 250f, false, "%.1f oct".format(vc), "VEL→CUTOFF", hitW = hw,
+            knobControl(c, cx(1), r2, rad, vc, 0f, 8f, 0.05f, 250f, false, "%.2f oct".format(vc), "VEL→CUTOFF", hitW = hw,
                 onChange = { nv -> setToneX(u, sound, 5, nv) }, exact = { showNumber("VEL→CUTOFF (октави)", vc, 0f, 8f, 2) { setToneX(u, sound, 5, it) } }, reset = { setToneX(u, sound, 5, 0f) })
             // quick SAMPLE START like Korg M3 OSC Start Offset: OFF 1 2 3 4
             val st = toneX(u, sound, 0)
@@ -1174,14 +1279,14 @@ class SilvetonSamplerView(
             val lfo = listOf(Triple("RATE", 7, Triple(0.1f, 20f, 0.05f)), Triple("DEPTH", 8, Triple(0f, 200f, 1f)), Triple("DELAY", 9, Triple(0f, 5000f, 10f)), Triple("FADE", 10, Triple(0f, 5000f, 10f)))
             lfo.forEachIndexed { k, (label, id, rng) ->
                 val v = toneX(u, sound, id)
-                val shown = when (id) { 7 -> "%.1f Hz".format(v); 8 -> "${round(v).toInt()} c"; else -> msText(v) }
+                val shown = when (id) { 7 -> "%.2f Hz".format(v); 8 -> "${round(v).toInt()} c"; else -> msText(v) }
                 knobControl(c, cx(4 + k), r2, rad, v, rng.first, rng.second, rng.third, 260f, false, shown, "LFO $label", hitW = hw,
                     onChange = { nv -> setToneX(u, sound, id, nv) }, exact = { showNumber("ВИБРАТО $label", v, rng.first, rng.second, if (id == 7) 1 else 0) { setToneX(u, sound, id, it) } },
                     reset = { setToneX(u, sound, id, when (id) { 7 -> 5.5f; 10 -> 300f; else -> 0f }) })
             }
             listOf("LOW" to 12, "MID" to 13, "HIGH" to 14).forEachIndexed { k, (label, id) ->
                 val v = toneX(u, sound, id)
-                knobControl(c, cx(8 + k), r2, rad, v, -18f, 18f, 0.1f, 300f, true, "%.1f dB".format(v), "EQ $label", hitW = hw,
+                knobControl(c, cx(8 + k), r2, rad, v, -18f, 18f, 0.1f, 300f, true, "%.2f dB".format(v), "EQ $label", hitW = hw,
                     onChange = { nv -> setToneX(u, sound, id, nv) }, exact = { showNumber("EQ $label dB", v, -18f, 18f, 1) { setToneX(u, sound, id, it) } }, reset = { setToneX(u, sound, id, 0f) })
             }
             text(c, "допир на числото = точно", cx(11), r2 + 4f, 9f, C_HINT, center = true)
@@ -1204,7 +1309,7 @@ class SilvetonSamplerView(
         if (!kronos) {
             // SILVETON_PORTA_UI_ROUTE_V2: TIME is a TUNE parameter, not a TONE parameter.
             val porta = portamentoUiValue(s.portamentoSec)
-            knobControl(c, sec.left + 115f, cy, 30f, porta, 0f, 100f, 1f, 300f, false, if (porta <= 0f) "OFF" else "${round(porta).toInt()} ms", "TIME", hitW = 200f,
+            knobControl(c, sec.left + 115f, cy, 30f, porta, 0f, 100f, 1f, 300f, false, if (porta <= 0f) "OFF" else "${"%.2f".format(porta)} ms", "TIME", hitW = 200f,
                 onChange = { nv -> commitTune(currentUpper(s).copy(portamentoSec = portamentoSecondsFromUi(nv))) },
                 exact = { showNumber("PORTAMENTO TIME ms (0 = OFF)", porta, 0f, 100f, 0) { commitTune(currentUpper(s).copy(portamentoSec = portamentoSecondsFromUi(it))) } },
                 reset = { commitTune(currentUpper(s).copy(portamentoSec = 0f)) })
@@ -1212,7 +1317,7 @@ class SilvetonSamplerView(
             knobControl(c, sec.left + 345f, cy, 30f, bal, 3f, 40f, 1f, 300f, false, "${bal.toInt()}", "BALANCE", hitW = 200f,
                 onChange = { nv -> sampler.setPortaBalance(round(nv).toInt()) }, exact = { showNumber("PORTA BALANCE (мекота)", bal, 3f, 40f, 0) { sampler.setPortaBalance(round(it).toInt()) } }, reset = { sampler.setPortaBalance(11) })
             val near = sampler.portaNear().toFloat()
-            knobControl(c, sec.left + 575f, cy, 30f, near, 0f, 400f, 1f, 300f, false, "${near.toInt()} ms", "TIME СЪСЕДНИ", hitW = 200f,
+            knobControl(c, sec.left + 575f, cy, 30f, near, 0f, 400f, 1f, 300f, false, "${"%.2f".format(near)} ms", "TIME СЪСЕДНИ", hitW = 200f,
                 onChange = { nv -> sampler.setPortaNear(round(nv).toInt()) }, exact = { showNumber("TIME СЪСЕДНИ ТОНОВЕ ms", near, 0f, 400f, 0) { sampler.setPortaNear(round(it).toInt()) } }, reset = { sampler.setPortaNear(90) })
             text(c, "Меко влизане · чисто достигане точно в TIME · BALANCE задава мекотата", sec.left + 16f, sec.bottom - 12f, 11f, C_HINT, maxWidth = 700f)
         } else {
@@ -1283,7 +1388,7 @@ class SilvetonSamplerView(
             onReset = { commitTune(currentUpper(s).copy(transpose = 0)) })
 
         // SILVETON_TUNE_RANGES_V1: -1200..+1200 cents (one octave each way).
-        knobControl(c, cx[3], cy, 42f, s.fineCents, -1200f, 1200f, 1f, 600f, true, "%.0f ct".format(s.fineCents), "ФИНА НАСТРОЙКА",
+        knobControl(c, cx[3], cy, 42f, s.fineCents, -1200f, 1200f, 1f, 600f, true, "%.2f ct".format(s.fineCents), "ФИНА НАСТРОЙКА",
             onChange = { nv -> commitTune(currentUpper(s).copy(fineCents = nv)) },
             exact = { showNumber("ФИНА НАСТРОЙКА ct", s.fineCents, -1200f, 1200f, 0) { nv -> commitTune(currentUpper(s).copy(fineCents = nv)) } },
             reset = { commitTune(currentUpper(s).copy(fineCents = 0f)) })
@@ -1391,11 +1496,11 @@ class SilvetonSamplerView(
     private fun toneText(p: TonePar, v: Float): String = when (p) {
         TonePar.ATTACK, TonePar.DECAY, TonePar.RELEASE ->
             if (v < 1000f) "${round(v).toInt()} ms" else "%.2f s".format(v / 1000f)
-        TonePar.SUSTAIN, TonePar.RESONANCE -> "${round(v * 100f).toInt()} %"
+        TonePar.SUSTAIN, TonePar.RESONANCE -> "${"%.2f".format(v * 100f)} %"
         TonePar.CUTOFF -> when {
             v >= 19900f -> "OPEN"
             v < 1000f -> "${round(v).toInt()} Hz"
-            else -> "%.1f kHz".format(v / 1000f)
+            else -> "%.2f kHz".format(v / 1000f)
         }
     }
 
@@ -1482,7 +1587,7 @@ class SilvetonSamplerView(
                 commitTone(when (k) { 0 -> cur.copy(eqLowDb = nv); 1 -> cur.copy(eqMidDb = nv); else -> cur.copy(eqHighDb = nv) })
             }
             knobControl(c, cxOf(boxes[3], k), cy, radius, value, -18f, 18f, 0.1f, 300f, true,
-                "%.1f dB".format(value), label, hitW = unit - 4f,
+                "%.2f dB".format(value), label, hitW = unit - 4f,
                 onChange = { nv -> apply(nv) },
                 exact = { showNumber("EQ $label dB", value, -18f, 18f, 1) { apply(it) } },
                 reset = { apply(0f) })
@@ -1503,7 +1608,7 @@ class SilvetonSamplerView(
             }
             val fxType = fxP(n - 1).getOrElse(0) { 0f }.toInt()
             knobControl(c, sec.left + 90f + (n - 1) * 180f, 640f, 36f, value, 0f, 1f, 0.01f, 250f, false,
-                "${round(value * 100f).toInt()} %", "FX$n · ${effectName(fxType)}", hitW = 170f,
+                "${"%.2f".format(value * 100f)} %", "FX$n · ${effectName(fxType)}", hitW = 170f,
                 onChange = { nv -> apply(nv) },
                 exact = { showNumber("FX$n SEND %", value * 100f, 0f, 100f, 0) { pct -> apply((pct / 100f).coerceIn(0f, 1f)) } },
                 reset = { apply(0f) })
@@ -1513,7 +1618,7 @@ class SilvetonSamplerView(
         lcd(c, insR, 8f)
         text(c, "INSERT U${u + 1}", insR.left + 14f, insR.top + 22f, 11f, C_LCD_DIM, face = faceMono, spacing = 0.2f)
         val insType = ins.getOrElse(0) { 0f }.toInt()
-        text(c, effectName(insType) + if (insType != 0) "   MIX ${round(ins.getOrElse(1) { 0f } * 100f).toInt()} %" else "", insR.left + 14f, insR.top + 48f, 20f, C_LCD, face = faceMono, maxWidth = insR.width() - 28f)
+        text(c, effectName(insType) + if (insType != 0) "   MIX ${"%.2f".format(ins.getOrElse(1) { 0f } * 100f)} %" else "", insR.left + 14f, insR.top + 48f, 20f, C_LCD, face = faceMono, maxWidth = insR.width() - 28f)
         hit(insR, { _, _ -> fxUnitFocus = 4 + u; page = Page.EFFECTS; refreshFx() })
         val open = RectF(sec.left + 760f, sec.top + 136f, sec.right - 16f, sec.top + 184f)
         lightKey(c, open, "ОТВОРИ ЕФЕКТИТЕ (FX1–FX4 · INSERT)")
@@ -1533,8 +1638,8 @@ class SilvetonSamplerView(
         val unit = sec.width() / 12f
         fun cx(k: Int) = sec.left + unit * (k + 0.5f)
         val r1 = 572f; val r2 = 684f; val rad = 20f; val hw = unit - 4f
-        text(c, "SYNTH · ${soundLabel(sound)} · Polysix функции върху записа", sec.left + 6f, sec.top + 12f, 11f, C_SECTION_TITLE, spacing = 0.25f)
-        fun pct(v: Float) = "${round(v * 100f).toInt()} %"
+        secTitle(c, sec, "SYNTH · ${soundLabel(sound)} · Polysix функции върху записа")
+        fun pct(v: Float) = "${"%.2f".format(v * 100f)} %"
         // row 1: PWM WIDTH DEPTH RATE MIX | SUB LEVEL | SUB OCT | UNISON | DETUNE | SPREAD | DRIVE | ANALOG
         val w = p[0]
         knobControl(c, cx(0), r1, rad, w, 0f, 0.98f, 0.01f, 260f, false, if (w < 0.02f) "OFF" else pct(w), "PWM WIDTH", hitW = hw,
@@ -1556,7 +1661,7 @@ class SilvetonSamplerView(
             for (k in 1..4) { val ur = RectF(cx(6) - hw / 2f + 2f + (k - 1) * uw, r1 - 22f, cx(6) - hw / 2f + 2f + k * uw - 2f, r1 + 22f); stripToggle(c, ur, "$k", p[6].toInt() == k, C_AMBER, size = 12f); hit(ur, { _, _ -> setSParam(u, sound, 6, k.toFloat()) }) }
             text(c, "UNISON ГЛАСОВЕ", cx(6), r1 + 56f, 9f, C_KNOB_LABEL, center = true, spacing = 0.15f)
         }
-        knobControl(c, cx(7), r1, rad, p[7], 0f, 100f, 0.5f, 260f, false, "${round(p[7]).toInt()} c", "DETUNE", hitW = hw,
+        knobControl(c, cx(7), r1, rad, p[7], 0f, 100f, 0.5f, 260f, false, "%.2f c".format(p[7]), "DETUNE", hitW = hw,
             onChange = { nv -> setSParam(u, sound, 7, nv) }, exact = { showNumber("UNISON DETUNE (cents)", p[7], 0f, 100f, 0) { setSParam(u, sound, 7, it) } }, reset = { setSParam(u, sound, 7, 8f) })
         knobControl(c, cx(8), r1, rad, p[8], 0f, 1f, 0.01f, 250f, false, pct(p[8]), "SPREAD", hitW = hw,
             onChange = { nv -> setSParam(u, sound, 8, nv) }, exact = { showNumber("UNISON SPREAD %", p[8] * 100f, 0f, 100f, 0) { setSParam(u, sound, 8, it / 100f) } }, reset = { setSParam(u, sound, 8, 0.5f) })
@@ -1588,7 +1693,7 @@ class SilvetonSamplerView(
             text(c, "ФИЛТЪР 2", cx(5), r2 + 56f, 9f, C_KNOB_LABEL, center = true, spacing = 0.15f)
         }
         val f2 = p[13]; val f2n = (kotlin.math.ln(f2.coerceIn(20f, 20000f) / 20f) / kotlin.math.ln(1000f))
-        knobControl(c, cx(7), r2, rad, f2n, 0f, 1f, 0.002f, 260f, false, if (f2 < 1000f) "${round(f2).toInt()} Hz" else "%.1f kHz".format(f2 / 1000f), "F2 CUTOFF", hitW = hw,
+        knobControl(c, cx(7), r2, rad, f2n, 0f, 1f, 0.002f, 260f, false, if (f2 < 1000f) "${round(f2).toInt()} Hz" else "%.2f kHz".format(f2 / 1000f), "F2 CUTOFF", hitW = hw,
             onChange = { nv -> setSParam(u, sound, 13, round(20f * Math.pow(1000.0, nv.toDouble()).toFloat())) }, exact = { showNumber("FILTER 2 CUTOFF Hz", f2, 20f, 20000f, 0) { setSParam(u, sound, 13, it) } }, reset = { setSParam(u, sound, 13, 1000f) })
         knobControl(c, cx(8), r2, rad, p[14], 0f, 1f, 0.01f, 250f, false, pct(p[14]), "F2 RESO", hitW = hw,
             onChange = { nv -> setSParam(u, sound, 14, nv) }, exact = { showNumber("FILTER 2 RESONANCE %", p[14] * 100f, 0f, 100f, 0) { setSParam(u, sound, 14, it / 100f) } }, reset = { setSParam(u, sound, 14, 0f) })
@@ -1603,7 +1708,7 @@ class SilvetonSamplerView(
     private fun drawMatrix(c: Canvas, sec: RectF, u: Int, sound: Int) {
         val p = sParams(u, sound)
         if (p.size < 52) return
-        text(c, "МАТРИЦА · ${soundLabel(sound)} · всичко към всичко (8 връзки)", sec.left + 6f, sec.top + 12f, 11f, C_SECTION_TITLE, spacing = 0.25f)
+        secTitle(c, sec, "МАТРИЦА · ${soundLabel(sound)} · всичко към всичко (8 връзки)")
         if (p[17] >= 0.5f) text(c, "SYNTH ИЗКЛ – матрицата не действа", sec.right - 6f, sec.top + 12f, 10f, C_AMBER, right = true)   // SILVETON_SYNTH_BYPASS_V1
         val colW = (sec.width() - 12f) / 2f
         val rowH = 52f
@@ -1626,7 +1731,7 @@ class SilvetonSamplerView(
             val mid = (tx0 + tx1) / 2f; val px = mid + (tx1 - tx0) / 2f * amt.coerceIn(-1f, 1f)
             fill(c, RectF(min(mid, px), y0 + 20f, max(mid, px), y0 + 28f), 4f, if (amt >= 0f) C_AMBER else C_LCD_OK)
             paint.color = Color.rgb(236, 238, 241); c.drawCircle(px, y0 + 24f, 12f, paint)
-            text(c, "${if (amt >= 0f) "+" else ""}${round(amt * 100f).toInt()} %", tx1 + 6f, y0 + 29f, 11f, C_AMBER, face = faceMono)
+            text(c, "${if (amt >= 0f) "+" else ""}${"%.2f".format(amt * 100f)} %", tx1 + 6f, y0 + 29f, 11f, C_AMBER, face = faceMono)
             val onDrag = { x: Float -> setSParam(u, sound, base + 2, round(((x - mid) / ((tx1 - tx0) / 2f)).coerceIn(-1f, 1f) * 100f) / 100f) }
             hit(RectF(tx0 - 8f, y0, tx1 + 8f, y0 + rowH - 6f), { x, _ -> onDrag(x) }, { setSParam(u, sound, base + 2, 0f) }, { x, _, _ -> onDrag(x) })
             val br = RectF(x0 + colW - 48f, y0 + 6f, x0 + colW - 4f, y0 + rowH - 10f)
@@ -1748,7 +1853,7 @@ class SilvetonSamplerView(
         val ids = eqBandIds(eqBand)
         val isPass = eqBand == 0 || eqBand == 6
         val hz = p.getOrElse(ids[1]) { 1000f }
-        fun hzText(v: Float) = if (v < 1000f) "${round(v).toInt()} Hz" else "%.2f kHz".format(v / 1000f)
+        fun hzText(v: Float) = if (v < 1000f) "%.2f Hz".format(v) else "%.2f kHz".format(v / 1000f)
         val fMin = if (eqBand == 6) 1000f else if (eqBand == 0) 10f else 20f
         val fMax = if (eqBand == 0) 2000f else 20000f
         eqSlider(c, RectF(124f, 534f, 700f, 600f), "FREQ", hzText(hz), (kotlin.math.ln(hz / fMin) / kotlin.math.ln(fMax / fMin)).coerceIn(0f, 1f),
@@ -2168,7 +2273,7 @@ class SilvetonSamplerView(
         val sets = sampler.savedSets()
         if (sets.isEmpty()) {
             AlertDialog.Builder(context).setTitle("LOAD")
-                .setMessage("Няма записани сетове.\nЗапиши с SAVE AS. Папки: ${sampler.setsFolders()}")
+                .setMessage("Няма записани сетове.\nЗапиши с SAVE AS. Папка: ${sampler.setsFolders()}")
                 .setPositiveButton("OK", null).show()
             return
         }
@@ -2541,11 +2646,11 @@ class SilvetonSamplerView(
     private class FxKnob(val id: Int, val label: String, val minV: Float, val maxV: Float, val step: Float, val def: Float, val show: (Float) -> String, val decimals: Int = 0)
 
     private fun fxKnobsFor(type: Int): List<FxKnob> {
-        val pct = { v: Float -> "${round(v * 100f).toInt()} %" }
+        val pct = { v: Float -> "${"%.2f".format(v * 100f)} %" }
         val ms = { v: Float -> if (v < 1000f) "${round(v).toInt()} ms" else "%.2f s".format(v / 1000f) }
         val hz = { v: Float -> "%.2f Hz".format(v) }
         val wet = FxKnob(1, "WET", 0f, 1f, 0.01f, 0.3f, pct)
-        val reverb = listOf(wet, FxKnob(7, "PRE-DELAY", 0f, 200f, 1f, 10f, ms), FxKnob(3, "DECAY", 0f, 0.95f, 0.005f, 0.6f, { "%.1f s".format(reverbSeconds(it)) }, 1),
+        val reverb = listOf(wet, FxKnob(7, "PRE-DELAY", 0f, 200f, 1f, 10f, ms), FxKnob(3, "DECAY", 0f, 0.95f, 0.005f, 0.6f, { "%.2f s".format(reverbSeconds(it)) }, 1),
             FxKnob(6, "TONE", 0f, 1f, 0.01f, 0.6f, pct), FxKnob(8, "DAMPING", 0f, 1f, 0.01f, 0.4f, pct), FxKnob(9, "SIZE", 0f, 1f, 0.01f, 0.5f, pct), FxKnob(10, "MOD", 0f, 1f, 0.01f, 0.3f, pct))
         val delay = listOf(wet, FxKnob(2, "TIME", 1f, 2500f, 1f, 320f, ms), FxKnob(3, "FEEDBACK", 0f, 0.95f, 0.005f, 0.25f, pct), FxKnob(6, "TONE", 0f, 1f, 0.01f, 0.5f, pct))
         return when (type) {
@@ -2559,8 +2664,8 @@ class SilvetonSamplerView(
             17 -> listOf(wet, FxKnob(4, "SPEED", 0.1f, 2f, 0.01f, 0.6f, hz, 2), FxKnob(5, "DEPTH", 0f, 1f, 0.01f, 0.7f, pct))
             13 -> listOf(wet, FxKnob(4, "RATE", 0.02f, 8f, 0.01f, 0.4f, hz, 2), FxKnob(5, "DEPTH", 0f, 1f, 0.01f, 0.6f, pct), FxKnob(3, "FEEDBACK", 0f, 0.9f, 0.01f, 0.3f, pct), FxKnob(14, "STAGES", 4f, 8f, 2f, 6f, { "${it.toInt()}" }))
             14 -> listOf(wet, FxKnob(4, "SLOW Hz", 0.1f, 2f, 0.01f, 0.8f, hz, 2), FxKnob(14, "FAST Hz", 2f, 10f, 0.1f, 6.5f, hz, 1), FxKnob(5, "DEPTH", 0f, 1f, 0.01f, 0.6f, pct), FxKnob(15, "SPEED", 0f, 1f, 1f, 0f, { if (it >= 0.5f) "FAST" else "SLOW" }))
-            15 -> listOf(FxKnob(14, "THRESHOLD", -60f, 0f, 0.5f, -20f, { "%.1f dB".format(it) }, 1), FxKnob(15, "RATIO", 1f, 20f, 0.1f, 4f, { "%.1f : 1".format(it) }, 1), FxKnob(2, "ATTACK", 0.1f, 300f, 0.1f, 10f, ms, 1), FxKnob(16, "RELEASE", 10f, 3000f, 1f, 120f, ms), FxKnob(6, "MAKE-UP", 0f, 24f, 0.1f, 0f, { "%.1f dB".format(it) }, 1))
-            16 -> listOf(wet, FxKnob(5, "DRIVE", 0f, 1f, 0.01f, 0.4f, pct), FxKnob(6, "TONE", 0f, 1f, 0.01f, 0.6f, pct), FxKnob(14, "OUTPUT", -24f, 12f, 0.5f, 0f, { "%.1f dB".format(it) }, 1))
+            15 -> listOf(FxKnob(14, "THRESHOLD", -60f, 0f, 0.5f, -20f, { "%.2f dB".format(it) }, 1), FxKnob(15, "RATIO", 1f, 20f, 0.1f, 4f, { "%.1f : 1".format(it) }, 1), FxKnob(2, "ATTACK", 0.1f, 300f, 0.1f, 10f, ms, 1), FxKnob(16, "RELEASE", 10f, 3000f, 1f, 120f, ms), FxKnob(6, "MAKE-UP", 0f, 24f, 0.1f, 0f, { "%.2f dB".format(it) }, 1))
+            16 -> listOf(wet, FxKnob(5, "DRIVE", 0f, 1f, 0.01f, 0.4f, pct), FxKnob(6, "TONE", 0f, 1f, 0.01f, 0.6f, pct), FxKnob(14, "OUTPUT", -24f, 12f, 0.5f, 0f, { "%.2f dB".format(it) }, 1))
             3, 4, 5, 6, 7 -> reverb
             else -> emptyList()
         }
@@ -2671,7 +2776,7 @@ class SilvetonSamplerView(
         val b = RectF(112f, 154f, 1326f, 786f)
         board(c, b)
         val labels = arrayOf("MASTER TUNE", "TRANSPOSE", "MASTER GAIN", "EQ LOW", "EQ MID", "EQ HIGH", "LIMITER", "CEILING",
-            "VELOCITY CURVE", "BREATH CC", "EXPRESSION CC", "DAMPER CC", "PITCH BEND", "AFTERTOUCH")
+            "VELOCITY CURVE", "BREATH CC", "EXPRESSION CC", "DAMPER CC", "PITCH BEND", "AFTERTOUCH", "ТЕМА")   // SILVETON_THEME_V1
         val cols = 5
         val gap = 10f
         val cw = (b.width() - 32f - gap * (cols - 1)) / cols
@@ -2686,6 +2791,14 @@ class SilvetonSamplerView(
             val cx = rr.centerX()
             val cy = rr.top + 98f
             when (i) {
+                14 -> {   // SILVETON_THEME_V1: СВЕТЛА / ТЪМНА
+                    val a = RectF(rr.left + 14f, rr.top + 56f, cx - 4f, rr.top + 146f)
+                    val bb = RectF(cx + 4f, rr.top + 56f, rr.right - 14f, rr.top + 146f)
+                    stripToggle(c, a, "СВЕТЛА", !darkTheme, C_AMBER, size = 13f)
+                    stripToggle(c, bb, "ТЪМНА", darkTheme, C_AMBER, size = 13f)
+                    hit(a, { _, _ -> sampler.setThemeDark(false); applyTheme(false); woodBitmap = null; invalidate() })
+                    hit(bb, { _, _ -> sampler.setThemeDark(true); applyTheme(true); invalidate() })
+                }
                 6, 12, 13 -> {
                     val on = when (i) { 6 -> g.limiterEnabled; 12 -> g.pitchBendEnabled; else -> g.aftertouchEnabled }
                     val key = RectF(cx - 80f, rr.top + 56f, cx + 80f, rr.top + 146f)
@@ -2835,9 +2948,9 @@ class SilvetonSamplerView(
     }
 
     private fun globalValueText(i: Int, g: SamplerAppController.GlobalUiState): String = when (i) {
-        0 -> "%.1f Hz".format(g.masterTuneHz); 1 -> signed(g.transpose); 2 -> "%.1f dB".format(g.masterGainDb)
-        3 -> "%.1f dB".format(g.eqLowDb); 4 -> "%.1f dB".format(g.eqMidDb); 5 -> "%.1f dB".format(g.eqHighDb)
-        7 -> "%.1f dB".format(g.limiterCeilingDb); 8 -> g.velocityCurve.toString(); 9 -> "CC ${g.breathCc}"
+        0 -> "%.2f Hz".format(g.masterTuneHz); 1 -> signed(g.transpose); 2 -> "%.2f dB".format(g.masterGainDb)
+        3 -> "%.2f dB".format(g.eqLowDb); 4 -> "%.2f dB".format(g.eqMidDb); 5 -> "%.2f dB".format(g.eqHighDb)
+        7 -> "%.2f dB".format(g.limiterCeilingDb); 8 -> g.velocityCurve.toString(); 9 -> "CC ${g.breathCc}"
         10 -> "CC ${g.expressionCc}"; 11 -> "CC ${g.damperCc}"; else -> ""
     }
 
@@ -3112,8 +3225,11 @@ class SilvetonSamplerView(
             done(v)
             invalidate()
         }
-        fun formatEditorValue(value: Float): String = if (decimals == 0) round(value).toInt().toString() else "% .${decimals}f".format(value).trim()
-        val scale = when { decimals <= 0 -> 1; decimals == 1 -> 10; else -> 100 }
+        // SILVETON_FINE_KNOBS_V1: every value can be set to the hundredth; only small
+        // whole-number ranges (BALANCE, BEND, MIDI channel ...) stay whole.
+        val dec = if (decimals > 0 || maxV - minV >= 50f) 2 else decimals
+        fun formatEditorValue(value: Float): String = if (dec == 0) round(value).toInt().toString() else "% .${dec}f".format(value).trim()
+        val scale = when { dec <= 0 -> 1; dec == 1 -> 10; else -> 100 }
         val step = 1f / scale.toFloat()
         val edit = editorField(formatEditorValue(current.coerceIn(minV, maxV))).apply {
             textSize = 40f
@@ -3317,17 +3433,17 @@ class SilvetonSamplerView(
         val y2 = b.top + 374f
         val y3 = b.top + 444f
         cellKey(c, row(y1, 0), "BREATH CC", "CC ${g.breathCc}") { editGlobal(9, g) }
-        cellKey(c, row(y1, 1), "BREATH MIN", "%.0f %%".format(a.breathMin * 100f)) {
+        cellKey(c, row(y1, 1), "BREATH MIN", "%.2f %%".format(a.breathMin * 100f)) {
             showNumber("BREATH MIN %", a.breathMin * 100f, 0f, 99f, 0, live = false) { sampler.updateGlobalAdvanced(a.copy(breathMin = it / 100f)) } }
-        cellKey(c, row(y1, 2), "BREATH MAX", "%.0f %%".format(a.breathMax * 100f)) {
+        cellKey(c, row(y1, 2), "BREATH MAX", "%.2f %%".format(a.breathMax * 100f)) {
             showNumber("BREATH MAX %", a.breathMax * 100f, 1f, 100f, 0, live = false) { sampler.updateGlobalAdvanced(a.copy(breathMax = it / 100f)) } }
         cellKey(c, row(y1, 3), "BREATH CURVE", "%.2f".format(a.breathCurve)) {
             showNumber("BREATH CURVE", a.breathCurve, 0.1f, 8f, 2, live = false) { sampler.updateGlobalAdvanced(a.copy(breathCurve = it)) } }
         cellKey(c, row(y1, 4), "VELOCITY CURVE", g.velocityCurve.toString()) { editGlobal(8, g) }
         cellKey(c, row(y2, 0), "EXPRESSION CC", "CC ${g.expressionCc}") { editGlobal(10, g) }
-        cellKey(c, row(y2, 1), "EXPRESSION MIN", "%.0f %%".format(a.expressionMin * 100f)) {
+        cellKey(c, row(y2, 1), "EXPRESSION MIN", "%.2f %%".format(a.expressionMin * 100f)) {
             showNumber("EXPRESSION MIN %", a.expressionMin * 100f, 0f, 99f, 0, live = false) { sampler.updateGlobalAdvanced(a.copy(expressionMin = it / 100f)) } }
-        cellKey(c, row(y2, 2), "EXPRESSION MAX", "%.0f %%".format(a.expressionMax * 100f)) {
+        cellKey(c, row(y2, 2), "EXPRESSION MAX", "%.2f %%".format(a.expressionMax * 100f)) {
             showNumber("EXPRESSION MAX %", a.expressionMax * 100f, 1f, 100f, 0, live = false) { sampler.updateGlobalAdvanced(a.copy(expressionMax = it / 100f)) } }
         cellKey(c, row(y2, 3), "EXPRESSION CURVE", "%.2f".format(a.expressionCurve)) {
             showNumber("EXPRESSION CURVE", a.expressionCurve, 0.1f, 8f, 2, live = false) { sampler.updateGlobalAdvanced(a.copy(expressionCurve = it)) } }
@@ -3487,13 +3603,35 @@ class SilvetonSamplerView(
 
     private fun navKey(c: Canvas, r: RectF, on: Boolean) {
         shadow(c, r, 12f, 2f, 100)
-        fillV(c, r, 12f, if (on) Color.rgb(66, 69, 75) else Color.rgb(50, 53, 58), if (on) Color.rgb(54, 57, 63) else Color.rgb(41, 44, 49))
+        if (darkTheme) {   // SILVETON_THEME_V1: lit = on
+            if (on) { fill(c, r, 12f, C_KEY_ON); litGlow(c, r, 12f, C_LOGO) } else fillV(c, r, 12f, Color.rgb(72, 76, 86), Color.rgb(58, 62, 70))
+        } else {
+            fillV(c, r, 12f, if (on) Color.rgb(66, 69, 75) else Color.rgb(50, 53, 58), if (on) Color.rgb(54, 57, 63) else Color.rgb(41, 44, 49))
+        }
         line(c, r.left + 10f, r.top + 1f, r.right - 10f, r.top + 1f, C_NAV_EDGE, 1f)
         if (isDown(r)) fill(c, r, 12f, Color.argb(70, 0, 0, 0))
     }
 
+    // SILVETON_THEME_V1: a soft inner glow of a lit key (no blur filters: a few translucent rings)
+    private fun litGlow(c: Canvas, r: RectF, radius: Float, color: Int) {
+        for (k in 0 until 4) {
+            val inset = 2f + k * 3f
+            fill(c, RectF(r.left + inset, r.top + inset, r.right - inset, r.bottom - inset), max(2f, radius - inset), colorWithAlpha(color, 14 + k * 6))
+        }
+    }
+
     private fun lightKey(c: Canvas, r: RectF, label: String, enabled: Boolean = true, size: Float = 12f, radius: Float = 8f) {
         val down = enabled && isDown(r)
+        if (darkTheme) {   // SILVETON_THEME_V1: matte dark key with a light top edge
+            if (!down) shadow(c, r, radius, 3f, 120)
+            fill(c, r, radius, C_KEY_LIGHT_EDGE)
+            val face = RectF(r.left, r.top, r.right, r.bottom - if (down) 0.5f else 2f)
+            fillV(c, face, radius, if (down) Color.rgb(52, 56, 64) else Color.rgb(74, 78, 88), if (down) Color.rgb(46, 50, 58) else Color.rgb(60, 64, 72))
+            if (!down) line(c, face.left + radius, face.top + 1f, face.right - radius, face.top + 1f, C_KEY_DARK_EDGE, 1f)
+            text(c, label, r.centerX(), r.centerY() + size * 0.36f, size, if (enabled) C_KEY_DARK_TEXT else C_EMPTY_TEXT,
+                center = true, face = faceBold, spacing = 0.1f, maxWidth = r.width() - 12f)
+            return
+        }
         if (!down) shadow(c, r, radius, 4f, 90)   // SILVETON_LOOK_V2: relief
         fill(c, r, radius, Color.rgb(150, 154, 162))
         val face = RectF(r.left + 1f, r.top + if (down) 2f else 1f, r.right - 1f, r.bottom - if (down) 1f else 3f)
@@ -3514,6 +3652,24 @@ class SilvetonSamplerView(
 
     private fun stripToggle(c: Canvas, r: RectF, label: String, on: Boolean, onColor: Int, size: Float = 11f) {
         val down = isDown(r)
+        if (darkTheme) {   // SILVETON_THEME_V1: lit = on, dark matte = off
+            if (!down) shadow(c, r, 7f, 3f, 120)
+            if (on) {
+                fill(c, r, 7f, Color.rgb(8, 9, 10))
+                val face = RectF(r.left, r.top, r.right, r.bottom - if (down) 0.5f else 2f)
+                fill(c, face, 7f, C_KEY_ON)
+                litGlow(c, face, 7f, onColor)
+                line(c, face.left + 7f, face.top + 1f, face.right - 7f, face.top + 1f, Color.rgb(70, 74, 84), 1f)
+            } else {
+                fill(c, r, 7f, Color.rgb(16, 17, 20))
+                val face = RectF(r.left, r.top, r.right, r.bottom - if (down) 0.5f else 2f)
+                fillV(c, face, 7f, if (down) Color.rgb(52, 56, 64) else Color.rgb(74, 78, 88), if (down) Color.rgb(46, 50, 58) else Color.rgb(60, 64, 72))
+                if (!down) line(c, face.left + 7f, face.top + 1f, face.right - 7f, face.top + 1f, C_KEY_DARK_EDGE, 1f)
+            }
+            text(c, label, r.centerX(), r.centerY() + size * 0.36f, size, if (on) onColor else C_KEY_DARK_TEXT, center = true, face = faceBold,
+                maxWidth = r.width() - 4f)
+            return
+        }
         if (!down) shadow(c, r, 7f, 3f, 80)   // SILVETON_LOOK_V2: relief keys, lit keys glow
         if (on) {
             fill(c, r, 7f, Color.rgb(12, 12, 14))
@@ -3579,7 +3735,9 @@ class SilvetonSamplerView(
     }
 
     private fun lcd(c: Canvas, r: RectF, radius: Float = 10f) {
-        fill(c, RectF(r.left, r.top + 1f, r.right, r.bottom + 1f), radius, Color.argb(150, 255, 255, 255))
+        if (darkTheme) {   // SILVETON_THEME_V1: the display's own warm light on the panel
+            for (k in 3 downTo 1) fill(c, RectF(r.left - k * 3f, r.top - k * 3f, r.right + k * 3f, r.bottom + k * 3f), radius + k * 3f, Color.argb(10, 255, 160, 40))
+        } else fill(c, RectF(r.left, r.top + 1f, r.right, r.bottom + 1f), radius, Color.argb(150, 255, 255, 255))
         fillV(c, r, radius, C_LCD_TOP, C_LCD_BOT)
         paint.color = Color.BLACK
         paint.shader = LinearGradient(0f, r.top, 0f, r.top + 9f, Color.argb(170, 0, 0, 0), Color.argb(0, 0, 0, 0), Shader.TileMode.CLAMP)
@@ -3597,6 +3755,13 @@ class SilvetonSamplerView(
             paint.shader = null
         }
         line(c, r.left + (if (squareTopLeft) 1f else 14f), r.top + 1f, r.right - 14f, r.top + 1f, C_BOARD_EDGE, 1f)
+    }
+
+    // SILVETON_THEME_V1: the title of a sound page - left in the light theme, right in the dark one
+    // (there the knob names are printed above the knobs and would collide with it).
+    private fun secTitle(c: Canvas, sec: RectF, title: String) {
+        if (darkTheme) text(c, title, sec.right - 6f, sec.top + 12f, 11f, C_SECTION_TITLE, right = true, face = faceBold, spacing = 0.25f, maxWidth = sec.width() * 0.5f)
+        else text(c, title, sec.left + 6f, sec.top + 12f, 11f, C_SECTION_TITLE, spacing = 0.25f)
     }
 
     private fun section(c: Canvas, r: RectF, title: String?) {
@@ -3620,7 +3785,10 @@ class SilvetonSamplerView(
         drawKnob(c, cx, cy, radius, t, bipolar, ring = true)
         val vy = cy + radius + 30f
         text(c, valueText, cx, vy, if (radius >= 40f) 19f else 15f, C_AMBER, center = true, face = faceMono, maxWidth = hitW - 6f)
-        if (label.isNotEmpty()) text(c, label, cx, vy + 16f, if (radius >= 40f) 11f else 10f, C_KNOB_LABEL, center = true, spacing = 0.15f, maxWidth = hitW - 6f)
+        if (label.isNotEmpty()) {
+            if (darkTheme) text(c, label, cx, cy - radius * 1.42f - 8f, if (radius >= 40f) 12f else 11f, C_KNOB_LABEL, center = true, face = faceBold, spacing = 0.12f, maxWidth = hitW + 20f)   // SILVETON_THEME_V1: printed above, like on the instrument
+            else text(c, label, cx, vy + 16f, if (radius >= 40f) 11f else 10f, C_KNOB_LABEL, center = true, spacing = 0.15f, maxWidth = hitW - 6f)
+        }
         knobHit(RectF(cx - hitW / 2f, cy - radius - 16f, cx + hitW / 2f, cy + radius + 10f), value, minV, maxV, step, travel,
             onChange, exact, reset, onFinal)
         hit(RectF(cx - hitW / 2f, cy + radius + 10f, cx + hitW / 2f, vy + 22f), { _, _ -> exact() }, reset)
@@ -3629,6 +3797,7 @@ class SilvetonSamplerView(
     private fun drawKnob(c: Canvas, cx: Float, cy: Float, r: Float, t: Float, bipolar: Boolean, ring: Boolean) {
         val tt = t.coerceIn(0f, 1f)
         paint.style = Paint.Style.FILL
+        if (darkTheme) { drawRhodesKnob(c, cx, cy, r, tt, ring); return }   // SILVETON_THEME_V1
         if (ring) {
             val rr = r + 8f
             val arc = RectF(cx - rr, cy - rr, cx + rr, cy + rr)
@@ -3672,6 +3841,56 @@ class SilvetonSamplerView(
         paint.style = Paint.Style.FILL
     }
 
+    // SILVETON_THEME_V1: matte black knob, flat brushed-aluminium insert, white line on the rim,
+    // thin scale ticks printed on the panel (like the Rhodes Mark I). No value arc.
+    private fun drawRhodesKnob(c: Canvas, cx: Float, cy: Float, r: Float, tt: Float, ticks: Boolean) {
+        paint.shader = null
+        if (ticks) {
+            paint.style = Paint.Style.STROKE
+            paint.strokeCap = Paint.Cap.BUTT
+            val sk = r * 1.42f
+            for (i in 0..10) {
+                val a = Math.toRadians(135.0 + 270.0 * i / 10.0)
+                val cs = kotlin.math.cos(a).toFloat(); val sn = kotlin.math.sin(a).toFloat()
+                val l1 = sk * 0.86f; val l2 = if (i % 5 == 0) sk else sk * 0.95f
+                paint.color = Color.rgb(196, 196, 190); paint.strokeWidth = if (i % 5 == 0) 1.6f else 1.1f
+                c.drawLine(cx + cs * l1, cy + sn * l1, cx + cs * l2, cy + sn * l2, paint)
+            }
+            paint.style = Paint.Style.FILL
+        }
+        // shadow under the body
+        paint.shader = RadialGradient(cx, cy + r * 0.25f, r * 1.25f, Color.argb(170, 0, 0, 0), Color.argb(0, 0, 0, 0), Shader.TileMode.CLAMP)
+        c.drawCircle(cx, cy + r * 0.2f, r * 1.25f, paint)
+        // matte black body, a little lighter in the middle
+        paint.shader = RadialGradient(cx, cy, r, Color.rgb(40, 40, 42), Color.rgb(22, 22, 24), Shader.TileMode.CLAMP)
+        c.drawCircle(cx, cy, r, paint)
+        paint.shader = null
+        paint.style = Paint.Style.STROKE; paint.strokeWidth = 1f; paint.color = Color.rgb(58, 58, 60)
+        c.drawCircle(cx, cy, r, paint)
+        paint.color = Color.argb(60, 255, 255, 255); paint.strokeWidth = 1.5f
+        c.drawArc(RectF(cx - r + 1.5f, cy - r + 1.5f, cx + r - 1.5f, cy + r - 1.5f), 200f, 140f, false, paint)
+        paint.style = Paint.Style.FILL
+        // flat brushed-aluminium insert
+        val cr = r * 0.56f
+        paint.shader = LinearGradient(0f, cy - cr, 0f, cy + cr,
+            intArrayOf(Color.rgb(176, 178, 182), Color.rgb(150, 152, 156), Color.rgb(184, 186, 190), Color.rgb(146, 148, 152), Color.rgb(172, 174, 178), Color.rgb(152, 154, 158), Color.rgb(180, 182, 186), Color.rgb(148, 150, 154), Color.rgb(170, 172, 176)),
+            null, Shader.TileMode.CLAMP)
+        c.drawCircle(cx, cy, cr, paint)
+        paint.shader = RadialGradient(cx, cy + cr * 0.6f, cr, Color.argb(0, 0, 0, 0), Color.argb(50, 0, 0, 0), Shader.TileMode.CLAMP)
+        c.drawCircle(cx, cy, cr, paint)
+        paint.shader = null
+        paint.style = Paint.Style.STROKE; paint.strokeWidth = 1.2f; paint.color = Color.rgb(90, 90, 94)
+        c.drawCircle(cx, cy, cr, paint)
+        paint.strokeWidth = 1.4f; paint.color = Color.rgb(8, 8, 9)
+        c.drawCircle(cx, cy, cr + 2f, paint)
+        // white pointer line on the rim
+        val ang = Math.toRadians(135.0 + 270.0 * tt)
+        val cos = kotlin.math.cos(ang).toFloat(); val sin = kotlin.math.sin(ang).toFloat()
+        paint.color = Color.rgb(236, 234, 226); paint.strokeWidth = max(2.4f, r * 0.08f); paint.strokeCap = Paint.Cap.BUTT
+        c.drawLine(cx + cos * (cr + 3f), cy + sin * (cr + 3f), cx + cos * r * 0.96f, cy + sin * r * 0.96f, paint)
+        paint.style = Paint.Style.FILL
+    }
+
     private fun stripMeter(c: Canvas, r: RectF, peak: Float) {
         fill(c, r, 3f, C_METER_BG)
         val db = if (peak <= 0.000001f) -90f else 20f * kotlin.math.log10(peak)
@@ -3689,6 +3908,14 @@ class SilvetonSamplerView(
         val hw = if (big) 26f else 20f
         val hh = if (big) 15f else 11f
         val r = RectF(cx - hw, cy - hh, cx + hw, cy + hh)
+        if (darkTheme) {   // SILVETON_THEME_V1: black cap with a white line, like the Rhodes sliders
+            shadow(c, r, 3f, 4f, 150)
+            fill(c, r, 3f, Color.rgb(60, 60, 64))
+            fill(c, RectF(r.left + 1f, r.top + 1f, r.right - 1f, r.bottom - 1f), 2.5f, Color.rgb(26, 26, 28))
+            fill(c, RectF(r.left + 3f, r.top + 3f, r.right - 3f, cy - 1f), 2f, Color.rgb(38, 38, 41))
+            fill(c, RectF(r.left + 5f, cy - 1.2f, r.right - 5f, cy + 1.2f), 1f, Color.rgb(236, 234, 226))
+            return
+        }
         shadow(c, r, 5f, 3f, 110)
         fillV(c, r, 5f, Color.rgb(91, 95, 102), Color.rgb(42, 44, 49))
         line(c, r.left + 4f, r.top + 1f, r.right - 4f, r.top + 1f, Color.rgb(154, 160, 168), 1f)
@@ -3755,7 +3982,7 @@ class SilvetonSamplerView(
         min(255, Color.red(color) + amount), min(255, Color.green(color) + amount), min(255, Color.blue(color) + amount))
 
     private fun signed(v: Int): String = if (v > 0) "+$v" else v.toString()
-    private fun dbText(db: Float): String = "%.1f dB".format(db)
+    private fun dbText(db: Float): String = "%.2f dB".format(db)
     private fun voiceModeName(m: Int) = when (m) { 1 -> "MONO"; 2 -> "LEGATO"; else -> "POLY" }
     private fun effectName(t: Int) = when (t) {
         1 -> "DIGITAL DELAY"; 2 -> "CHORUS"; 3 -> "PLATE REVERB"; 4 -> "HALL"; 5 -> "ROOM"; 6 -> "CHAMBER"; 7 -> "SPRING"
@@ -3778,32 +4005,70 @@ class SilvetonSamplerView(
         private const val LIST_PAGES = (LIST_SIZE + LIST_PER_PAGE - 1) / LIST_PER_PAGE
         private const val DESIGN_H = 800f
         // brushed metal + side navigation
-        private val C_METAL_A = Color.rgb(217, 218, 222); private val C_METAL_B = Color.rgb(222, 223, 227)
-        private val C_SIDE_A = Color.rgb(38, 40, 44); private val C_SIDE_B = Color.rgb(51, 54, 59)
-        private val C_NAV_EDGE = Color.rgb(72, 76, 82); private val C_NAV_TEXT = Color.rgb(158, 163, 171)
-        private val C_LOGO = Color.rgb(233, 196, 106)
+        private var C_METAL_A = Color.rgb(217, 218, 222); private var C_METAL_B = Color.rgb(222, 223, 227)
+        private var C_SIDE_A = Color.rgb(38, 40, 44); private var C_SIDE_B = Color.rgb(51, 54, 59)
+        private var C_NAV_EDGE = Color.rgb(72, 76, 82); private var C_NAV_TEXT = Color.rgb(158, 163, 171)
+        private var C_LOGO = Color.rgb(233, 196, 106)
         // LCD
         private val C_LCD_TOP = Color.rgb(13, 15, 13); private val C_LCD_BOT = Color.rgb(23, 26, 22)
         private val C_LCD = Color.rgb(255, 179, 71); private val C_LCD_DIM = Color.rgb(184, 132, 60)
         private val C_LCD_VALUE = Color.rgb(255, 207, 138); private val C_LCD_OK = Color.rgb(123, 216, 143); private val C_LCD_BAD = Color.rgb(255, 107, 94)
         // light parts
-        private val C_KEY_LIGHT = Color.rgb(236, 238, 241); private val C_KEY_LIGHT_EDGE = Color.rgb(185, 188, 194); private val C_KEY_TEXT = Color.rgb(48, 52, 58)
-        private val C_STRIP = Color.rgb(236, 238, 241); private val C_STRIP_SEL = Color.WHITE; private val C_EMPTY_CARD = Color.rgb(226, 228, 232)
-        private val C_INK = Color.rgb(35, 38, 43); private val C_INK_SOFT = Color.rgb(48, 52, 58); private val C_LABEL_GREY = Color.rgb(123, 128, 138)
-        private val C_SCALE = Color.rgb(138, 143, 151); private val C_EMPTY_TEXT = Color.rgb(160, 165, 172)
-        private val C_TOGGLE = Color.rgb(223, 226, 230); private val C_TOGGLE_TEXT = Color.rgb(91, 97, 107); private val C_DARK_KEY = Color.rgb(43, 46, 51)
-        private val C_TRACK_LIGHT = Color.rgb(201, 204, 209); private val C_METER_BG = Color.rgb(27, 29, 32)
+        private var C_KEY_LIGHT = Color.rgb(236, 238, 241); private var C_KEY_LIGHT_EDGE = Color.rgb(185, 188, 194); private var C_KEY_TEXT = Color.rgb(48, 52, 58)
+        private var C_STRIP = Color.rgb(236, 238, 241); private var C_STRIP_SEL = Color.WHITE; private var C_EMPTY_CARD = Color.rgb(226, 228, 232)
+        private var C_INK = Color.rgb(35, 38, 43); private var C_INK_SOFT = Color.rgb(48, 52, 58); private var C_LABEL_GREY = Color.rgb(123, 128, 138)
+        private var C_SCALE = Color.rgb(138, 143, 151); private var C_EMPTY_TEXT = Color.rgb(160, 165, 172)
+        private var C_TOGGLE = Color.rgb(223, 226, 230); private var C_TOGGLE_TEXT = Color.rgb(91, 97, 107); private var C_DARK_KEY = Color.rgb(43, 46, 51)
+        private var C_TRACK_LIGHT = Color.rgb(201, 204, 209); private var C_METER_BG = Color.rgb(27, 29, 32)
         private val C_ORANGE = Color.rgb(255, 122, 26); private val C_ORANGE_DARK = Color.rgb(194, 90, 15); private val C_AMBER = Color.rgb(255, 179, 71)
         private val C_SOLO = Color.rgb(255, 215, 106); private val C_MUTE = Color.rgb(255, 107, 94); private val C_FREE = Color.rgb(46, 140, 80)
         private val C_GREEN = Color.rgb(60, 157, 90); private val C_YELLOW = Color.rgb(233, 196, 106); private val C_RED = Color.rgb(255, 107, 61)
         // dark boards
-        private val C_BOARD_TOP = Color.rgb(52, 55, 61); private val C_BOARD_BOT = Color.rgb(39, 41, 46); private val C_BOARD_EDGE = Color.rgb(85, 89, 95)
-        private val C_SECTION = Color.argb(38, 0, 0, 0); private val C_SECTION_TITLE = Color.rgb(201, 204, 209)
-        private val C_KNOB_LABEL = Color.rgb(170, 176, 184); private val C_HINT = Color.rgb(143, 148, 156)
-        private val C_TAB = Color.rgb(201, 204, 209); private val C_TAB_TEXT = Color.rgb(87, 92, 101)
+        private var C_BOARD_TOP = Color.rgb(52, 55, 61); private var C_BOARD_BOT = Color.rgb(39, 41, 46); private var C_BOARD_EDGE = Color.rgb(85, 89, 95)
+        private val C_SECTION = Color.argb(38, 0, 0, 0); private var C_SECTION_TITLE = Color.rgb(201, 204, 209)
+        private var C_KNOB_LABEL = Color.rgb(170, 176, 184); private var C_HINT = Color.rgb(143, 148, 156)
+        private var C_TAB = Color.rgb(201, 204, 209); private var C_TAB_TEXT = Color.rgb(87, 92, 101)
         private val C_KNOB_A = Color.rgb(75, 79, 86); private val C_KNOB_B = Color.rgb(42, 44, 49); private val C_KNOB_C = Color.rgb(32, 34, 38)
         private val C_PANIC = Color.rgb(179, 38, 30); private val C_PANIC_TOP = Color.rgb(224, 100, 92)
         private val C_WARN_BG = Color.rgb(179, 38, 30); private val C_WARN_TEXT = Color.WHITE
-        private val C_LED_OFF = Color.rgb(85, 85, 85); private val C_LED_OFF_LIGHT = Color.rgb(187, 187, 187)
+        private val C_LED_OFF = Color.rgb(85, 85, 85); private var C_LED_OFF_LIGHT = Color.rgb(187, 187, 187)
+        // SILVETON_THEME_V1: СВЕТЛА (the look above) / ТЪМНА (dark panel, wooden side, Rhodes knobs and
+        // faders, lit = on). The colours above are the light set; applyTheme() swaps them.
+        private var darkTheme = false
+        private var C_NAV_ON_TEXT = Color.WHITE
+        private var C_KEY_DARK_FACE = Color.rgb(66, 70, 80); private var C_KEY_DARK_EDGE = Color.rgb(96, 100, 112); private var C_KEY_DARK_TEXT = Color.rgb(190, 194, 204)
+        private var C_KEY_ON = Color.rgb(24, 26, 30)
+        fun applyTheme(dark: Boolean) {
+            darkTheme = dark
+            if (!dark) {
+                C_METAL_A = Color.rgb(217, 218, 222); C_METAL_B = Color.rgb(222, 223, 227)
+                C_SIDE_A = Color.rgb(38, 40, 44); C_SIDE_B = Color.rgb(51, 54, 59)
+                C_NAV_EDGE = Color.rgb(72, 76, 82); C_NAV_TEXT = Color.rgb(158, 163, 171); C_NAV_ON_TEXT = Color.WHITE
+                C_LOGO = Color.rgb(233, 196, 106)
+                C_KEY_LIGHT = Color.rgb(236, 238, 241); C_KEY_LIGHT_EDGE = Color.rgb(185, 188, 194); C_KEY_TEXT = Color.rgb(48, 52, 58)
+                C_STRIP = Color.rgb(236, 238, 241); C_STRIP_SEL = Color.WHITE; C_EMPTY_CARD = Color.rgb(226, 228, 232)
+                C_INK = Color.rgb(35, 38, 43); C_INK_SOFT = Color.rgb(48, 52, 58); C_LABEL_GREY = Color.rgb(123, 128, 138)
+                C_SCALE = Color.rgb(138, 143, 151); C_EMPTY_TEXT = Color.rgb(160, 165, 172)
+                C_TOGGLE = Color.rgb(223, 226, 230); C_TOGGLE_TEXT = Color.rgb(91, 97, 107); C_DARK_KEY = Color.rgb(43, 46, 51)
+                C_TRACK_LIGHT = Color.rgb(201, 204, 209); C_METER_BG = Color.rgb(27, 29, 32)
+                C_BOARD_TOP = Color.rgb(52, 55, 61); C_BOARD_BOT = Color.rgb(39, 41, 46); C_BOARD_EDGE = Color.rgb(85, 89, 95)
+                C_SECTION_TITLE = Color.rgb(201, 204, 209); C_KNOB_LABEL = Color.rgb(170, 176, 184); C_HINT = Color.rgb(143, 148, 156)
+                C_TAB = Color.rgb(201, 204, 209); C_TAB_TEXT = Color.rgb(87, 92, 101); C_LED_OFF_LIGHT = Color.rgb(187, 187, 187)
+            } else {
+                C_METAL_A = Color.rgb(30, 32, 37); C_METAL_B = Color.rgb(31, 33, 38)
+                C_SIDE_A = Color.rgb(74, 46, 28); C_SIDE_B = Color.rgb(112, 70, 40)
+                C_NAV_EDGE = Color.rgb(96, 100, 112); C_NAV_TEXT = Color.rgb(190, 194, 204); C_NAV_ON_TEXT = Color.rgb(222, 186, 110)
+                C_LOGO = Color.rgb(222, 186, 110)
+                C_KEY_LIGHT = Color.rgb(66, 70, 80); C_KEY_LIGHT_EDGE = Color.rgb(16, 17, 20); C_KEY_TEXT = Color.rgb(190, 194, 204)
+                C_STRIP = Color.rgb(42, 45, 52); C_STRIP_SEL = Color.rgb(50, 54, 62); C_EMPTY_CARD = Color.rgb(36, 38, 44)
+                C_INK = Color.rgb(226, 228, 232); C_INK_SOFT = Color.rgb(200, 204, 210); C_LABEL_GREY = Color.rgb(150, 156, 168)
+                C_SCALE = Color.rgb(120, 126, 138); C_EMPTY_TEXT = Color.rgb(120, 126, 138)
+                C_TOGGLE = Color.rgb(66, 70, 80); C_TOGGLE_TEXT = Color.rgb(190, 194, 204); C_DARK_KEY = Color.rgb(24, 26, 30)
+                C_TRACK_LIGHT = Color.rgb(14, 15, 18); C_METER_BG = Color.rgb(14, 15, 18)
+                C_BOARD_TOP = Color.rgb(26, 28, 32); C_BOARD_BOT = Color.rgb(22, 24, 28); C_BOARD_EDGE = Color.rgb(52, 56, 64)
+                C_SECTION_TITLE = Color.rgb(222, 186, 110); C_KNOB_LABEL = Color.rgb(222, 224, 230); C_HINT = Color.rgb(150, 156, 168)
+                C_TAB = Color.rgb(66, 70, 80); C_TAB_TEXT = Color.rgb(190, 194, 204); C_LED_OFF_LIGHT = Color.rgb(85, 85, 85)
+            }
+        }
     }
 }

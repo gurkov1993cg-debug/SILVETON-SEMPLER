@@ -1534,14 +1534,6 @@ class SilvetonSamplerView(
         fun cx(k: Int) = sec.left + unit * (k + 0.5f)
         val r1 = 572f; val r2 = 684f; val rad = 20f; val hw = unit - 4f
         text(c, "SYNTH · ${soundLabel(sound)} · Polysix функции върху записа", sec.left + 6f, sec.top + 12f, 11f, C_SECTION_TITLE, spacing = 0.25f)
-        // SILVETON_SYNTH_BYPASS_V1: one key = SYNTH ВКЛ / ИЗКЛ (all of this page + MATRIX skipped, knobs kept)
-        run {
-            val byp = p[17] >= 0.5f
-            val br = RectF(sec.right - 150f, sec.top + 4f, sec.right - 6f, sec.top + 36f)
-            stripToggle(c, br, if (byp) "SYNTH ИЗКЛ" else "SYNTH ВКЛ", !byp, if (byp) C_AMBER else C_LCD_OK, size = 12f)
-            hit(br, { _, _ -> setSParam(u, sound, 17, if (byp) 0f else 1f) })
-            if (byp) text(c, "изключено – звучи като преди, настройките са запазени", sec.right - 158f, sec.top + 26f, 9f, C_AMBER, right = true)
-        }
         fun pct(v: Float) = "${round(v * 100f).toInt()} %"
         // row 1: PWM WIDTH DEPTH RATE MIX | SUB LEVEL | SUB OCT | UNISON | DETUNE | SPREAD | DRIVE | ANALOG
         val w = p[0]
@@ -1571,9 +1563,16 @@ class SilvetonSamplerView(
         knobControl(c, cx(9), r1, rad, p[9], 0f, 1f, 0.01f, 250f, false, if (p[9] <= 0f) "OFF" else pct(p[9]), "DRIVE", hitW = hw,
             onChange = { nv -> setSParam(u, sound, 9, nv) }, exact = { showNumber("DRIVE %", p[9] * 100f, 0f, 100f, 0) { setSParam(u, sound, 9, it / 100f) } }, reset = { setSParam(u, sound, 9, 0f) })
         run {
-            val ar = RectF(cx(10) - hw / 2f + 2f, r1 - 22f, cx(11) + hw / 2f - 2f, r1 + 22f)
-            stripToggle(c, ar, "ANALOG FEEL", p[16] >= 0.5f, C_AMBER, size = 11f); hit(ar, { _, _ -> setSParam(u, sound, 16, if (p[16] >= 0.5f) 0f else 1f) })
-            text(c, "малки случайни разлики на всяка нота", (cx(10) + cx(11)) / 2f, r1 + 56f, 9f, C_KNOB_LABEL, center = true)
+            val ar = RectF(cx(10) - hw / 2f + 2f, r1 - 22f, cx(10) + hw / 2f - 2f, r1 + 22f)
+            stripToggle(c, ar, "ANALOG", p[16] >= 0.5f, C_AMBER, size = 12f); hit(ar, { _, _ -> setSParam(u, sound, 16, if (p[16] >= 0.5f) 0f else 1f) })
+            text(c, "ЖИВИ РАЗЛИКИ", cx(10), r1 + 56f, 9f, C_KNOB_LABEL, center = true, spacing = 0.15f, maxWidth = hw)
+            // SILVETON_SYNTH_BYPASS_V1: one key, same size as the others = SYNTH ВКЛ / ИЗКЛ
+            // (ИЗКЛ = this page + MATRIX skipped, sound exactly as before Polysix, knob settings kept)
+            val byp = p[17] >= 0.5f
+            val br = RectF(cx(11) - hw / 2f + 2f, r1 - 22f, cx(11) + hw / 2f - 2f, r1 + 22f)
+            stripToggle(c, br, if (byp) "ИЗКЛ" else "ВКЛ", !byp, C_LCD_OK, size = 13f)
+            hit(br, { _, _ -> setSParam(u, sound, 17, if (byp) 0f else 1f) })
+            text(c, if (byp) "SYNTH ИЗКЛ" else "SYNTH ВКЛ", cx(11), r1 + 56f, 9f, if (byp) C_AMBER else C_KNOB_LABEL, center = true, spacing = 0.15f, maxWidth = hw)
         }
         // row 2: FILTER TYPE (3 keys over 3 cols) | KEY TRACK | F2 TYPE (5 keys over 3 cols) | F2 CUTOFF | F2 RESO | F2 ROUTE
         run {

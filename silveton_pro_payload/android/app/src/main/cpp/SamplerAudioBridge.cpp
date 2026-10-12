@@ -1590,14 +1590,14 @@ public:
             out.push_back(static_cast<int>(item.address.page));
             out.push_back(static_cast<int>(item.address.slot));
         }
-        for (int i = 0; i < kBuiltinWaveCount; ++i) { out.push_back(0); out.push_back(0); out.push_back(static_cast<int>(kBuiltinWaveFirstSlot) + i); }
+        // SILVETON_BANK_LOAD_FIX_V1: the built-in waves are not offered as SOUNDs - the Polysix
+        // functions work on the bank recordings only (what was asked for).
         return out;
     }
 
     std::vector<std::string> soundCatalogNames() const {
         std::vector<std::string> out;
         for (const auto& item : library_.programCatalog()) out.push_back(item.name);
-        for (int i = 0; i < kBuiltinWaveCount; ++i) out.push_back(std::string("~ ") + builtinWaveName(i));   // built-in waves
         return out;
     }
 

@@ -155,6 +155,7 @@ workflows:
           require_source 'SILVETON_SYNTH_BYPASS_V1' "$VIEW"
           require_source 'SILVETON_SET_V14' "$PROJECT_DIR/core/src/sampler/SetPackage.cpp"
           require_source 'testSynthBypass();' "$SAMPLER_TESTS"
+          require_source 'SILVETON_BANK_LOAD_FIX_V1' "$CONTROLLER"
           require_source 'testCrossfadePortamento();' "$SAMPLER_TESTS"
           require_source 'testPortamentoTempoCap();' "$SAMPLER_TESTS"
           require_source 'SILVETON_KRONOS_MUSICAL_PORTA_V2' "$ENGINE"

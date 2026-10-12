@@ -302,10 +302,15 @@ class SamplerAppController(
         }
     }
 
+    /** SOUNDs of SILVETON_BANK.sv only (the built-in waves are not a bank). SILVETON_BANK_LOAD_FIX_V1 */
+    private fun bankSoundCount(): Int = engine.nativeSoundCatalogNames().count { !it.startsWith("~ ") }
+
     private fun loadDefaultBankOnce() {
         if (defaultBankAttempted) return
         // The native sampler survives an Activity restart; keep its bank and BLENDS.
-        if (engine.nativeSoundCatalogNames().isNotEmpty()) {
+        // SILVETON_BANK_LOAD_FIX_V1: the built-in waves ("~ SAW" ...) are always in the catalog,
+        // so only real bank SOUNDs count as "a bank is loaded".
+        if (bankSoundCount() > 0) {
             defaultBankAttempted = true
             statusChanged(null)
             return
@@ -343,7 +348,7 @@ class SamplerAppController(
             return
         }
         if (userState.isFile && !backupFile.isFile) backupUserState()   // first copy for LIST/BLENDS made before this version
-        val soundCount = engine.nativeSoundCatalogNames().size
+        val soundCount = bankSoundCount()
         if (soundCount <= 0) {
             statusChanged("SILVETON_BANK.sv loaded but contains no visible SOUND positions")
             return

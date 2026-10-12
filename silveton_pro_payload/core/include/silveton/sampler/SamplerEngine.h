@@ -72,6 +72,12 @@ struct UpperToneValues {
 // SILVETON_TONE_V2: the basic sound of an Upper as one SoundTone (its six legacy
 // values plus toneExtra), so the engine treats it exactly like a layer.
 [[nodiscard]] SoundTone basicSoundTone(const UpperPart& upper) noexcept;
+// SILVETON_POLYSIX_V1: built-in single-cycle waves (SAW, SQUARE, PULSE 25, TRIANGLE, SINE,
+// SAW WARM) as ordinary multisample PROGRAMs: one band-limited table per octave, so the
+// sampler plays them like any recording (and PWM / SUB / UNISON / filters apply the same).
+// index 0..kBuiltinWaveCount-1; nullptr for others. Built once, shared.
+[[nodiscard]] ProgramPtr builtinWaveProgram(int index);
+[[nodiscard]] const char* builtinWaveName(int index) noexcept;
 
 class SamplerEngine {
 public:

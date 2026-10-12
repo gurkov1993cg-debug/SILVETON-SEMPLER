@@ -2527,6 +2527,139 @@ void testCrossfadePortamento() {
     assert(e.activeVoiceCount()==1U);   // the old recording has faded out
 }
 
+// ---------------------------------------------------------------- SILVETON_POLYSIX_V1
+double magAt(const std::vector<float>& x, std::size_t from, std::size_t to, double hz, double sr) {
+    double re=0.0, im=0.0; for(std::size_t i=from;i<to&&i<x.size();++i){ const double w=2.0*3.14159265358979323846*hz*static_cast<double>(i)/sr; re+=x[i]*std::cos(w); im+=x[i]*std::sin(w);} return std::sqrt(re*re+im*im)/static_cast<double>(to-from);
+}
+std::shared_ptr<EngineState> waveState(int wave, UpperVoiceMode mode=UpperVoiceMode::Poly) {
+    auto st=std::make_shared<EngineState>(); auto& u=st->combi.uppers[0]; u.program=builtinWaveProgram(wave); u.enabled=true; u.voiceMode=mode; st->global.masterGainDb=0.0F; return st;
+}
+std::vector<float> playWave(const std::shared_ptr<EngineState>& st, std::uint8_t key, int blocks, std::uint8_t vel=100U, SamplerEngine* ext=nullptr) {
+    SamplerEngine local; SamplerEngine& e = ext? *ext : local; if(!ext){ e.prepare(96000.0,96U); e.setState(st);} e.postNoteOn(0U,key,vel); return renderLeft(e,blocks);
+}
+void testBuiltinWaves() {
+    for(int w=0;w<kBuiltinWaveCount;++w){ auto p=builtinWaveProgram(w); assert(p && p->layers.size()==1U && p->layers[0].multisample->zones.size()==10U); assert(std::string(builtinWaveName(w)).size()>0); }
+    auto x=playWave(waveState(0),69U,100); for(float v:x) assert(std::isfinite(v));
+    assert(std::abs(measureHz(x,4000U,9000U,96000.0)-440.0)<2.0);
+    auto lo=playWave(waveState(0),45U,100); assert(std::abs(measureHz(lo,4000U,9000U,96000.0)-110.0)<1.0);
+    // square has no even harmonics, saw has them
+    auto sq=playWave(waveState(1),69U,100);
+    assert(magAt(sq,4000U,9600U,880.0,96000.0) < magAt(sq,4000U,9600U,440.0,96000.0)*0.05);
+    assert(magAt(x,4000U,9600U,880.0,96000.0) > magAt(x,4000U,9600U,440.0,96000.0)*0.3);
+    // sine: 3rd harmonic absent
+    auto si=playWave(waveState(4),69U,100); assert(magAt(si,4000U,9600U,1320.0,96000.0) < magAt(si,4000U,9600U,440.0,96000.0)*0.02);
+}
+void testPwmSubUnisonDrive() {
+    // PWM width 0.5 on a saw = square: the 2nd harmonic disappears
+    auto st=waveState(0); st->combi.uppers[0].toneExtra.pwmWidth=0.5F;
+    auto x=playWave(st,69U,120); for(float v:x) assert(std::isfinite(v));
+    assert(magAt(x,6000U,11000U,880.0,96000.0) < magAt(x,6000U,11000U,440.0,96000.0)*0.08);
+    assert(magAt(x,6000U,11000U,1320.0,96000.0) > magAt(x,6000U,11000U,440.0,96000.0)*0.2);   // 3rd harmonic stays
+    // PWM LFO moves the width: the 2nd harmonic comes and goes
+    auto mv=waveState(0); mv->combi.uppers[0].toneExtra.pwmWidth=0.5F; mv->combi.uppers[0].toneExtra.pwmDepth=0.3F; mv->combi.uppers[0].toneExtra.pwmRateHz=2.0F;
+    auto y=playWave(mv,69U,500); double hi=0.0, lo=1e9; for(std::size_t f=6000U;f+4800U<y.size();f+=4800U){ const double m=magAt(y,f,f+4800U,880.0,96000.0)/magAt(y,f,f+4800U,440.0,96000.0); hi=std::max(hi,m); lo=std::min(lo,m);} assert(hi>lo*3.0);
+    // PWM on a real recording (a looped sine): width 0.5 = the recording minus itself half a period later = doubled fundamental, no harm
+    auto rec=makeToneState(UpperVoiceMode::Poly); rec->combi.uppers[0].toneExtra.pwmWidth=0.5F;
+    auto z=playWave(rec,69U,100); for(float v:z) assert(std::isfinite(v)); assert(magAt(z,4000U,9000U,440.0,96000.0)>0.1);
+    // SUB adds the octave below
+    auto sub=waveState(4); sub->combi.uppers[0].toneExtra.subLevel=0.8F;
+    auto s1=playWave(waveState(4),69U,100), s2=playWave(sub,69U,100);
+    assert(magAt(s2,4000U,9600U,220.0,96000.0) > magAt(s1,4000U,9600U,220.0,96000.0)*5.0+0.01);
+    // UNISON 3 = three voices, level kept, detuned (beating: the level moves over time)
+    auto un=waveState(4); un->combi.uppers[0].toneExtra.unisonVoices=3; un->combi.uppers[0].toneExtra.unisonDetuneCents=20.0F;
+    SamplerEngine e; e.prepare(96000.0,96U); e.setState(un); e.postNoteOn(0U,69U,100U); auto u=renderLeft(e,400); assert(e.activeVoiceCount()==3U);
+    assert(peakOf(u,2000U,38000U) < peakOf(s1,2000U,9000U)*2.2);
+    double pmax=0.0, pmin=1e9; for(std::size_t f=4000U;f+2000U<u.size();f+=2000U){ const double pk=peakOf(u,f,f+2000U); pmax=std::max(pmax,pk); pmin=std::min(pmin,pk);} assert(pmax>pmin*1.3);
+    e.postNoteOff(0U,69U); renderLeft(e,200); assert(e.activeVoiceCount()==0U);
+    // DRIVE changes the waveform (adds harmonics to a sine)
+    auto dr=waveState(4); dr->combi.uppers[0].toneExtra.drive=0.8F;
+    auto d=playWave(dr,69U,100); assert(magAt(d,4000U,9600U,1320.0,96000.0) > magAt(s1,4000U,9600U,1320.0,96000.0)*5.0+0.005);
+}
+// SILVETON_SYNTH_BYPASS_V1: SYNTH ИЗКЛ = the recording exactly as without Polysix; ВКЛ brings the knobs back
+void testSynthBypass() {
+    auto plain=playWave(waveState(4),69U,100);
+    auto on=waveState(4); on->combi.uppers[0].toneExtra.drive=0.8F; on->combi.uppers[0].toneExtra.subLevel=0.8F; on->combi.uppers[0].toneExtra.pwmWidth=0.5F;
+    on->combi.uppers[0].toneMod.route[0].source=ModSource::Velocity; on->combi.uppers[0].toneMod.route[0].target=ModTarget::Level; on->combi.uppers[0].toneMod.route[0].amount=-0.2F;
+    auto off=std::make_shared<EngineState>(*on); off->combi.uppers[0].toneExtra.synthBypass=true;
+    auto a=playWave(on,69U,100), b=playWave(off,69U,100);
+    double diff=0.0; for(std::size_t i=0;i<plain.size()&&i<b.size();++i) diff=std::max(diff,std::abs(static_cast<double>(plain[i]-b[i])));
+    assert(diff < 1e-6);                                                   // bypass == untouched recording
+    assert(magAt(a,4000U,9600U,220.0,96000.0) > magAt(b,4000U,9600U,220.0,96000.0)*5.0);   // ВКЛ: SUB is there
+    // unison copies still sounding when SYNTH goes off fade away
+    auto un=waveState(4); un->combi.uppers[0].toneExtra.unisonVoices=3;
+    SamplerEngine e; e.prepare(96000.0,96U); e.setState(un); e.postNoteOn(0U,69U,100U); renderLeft(e,100); assert(e.activeVoiceCount()==3U);
+    auto byp=std::make_shared<EngineState>(*un); byp->combi.uppers[0].toneExtra.synthBypass=true; e.setState(byp); auto t=renderLeft(e,100);
+    for(float v:t) assert(std::isfinite(v));
+    assert(e.activeVoiceCount()==1U);
+    e.setState(un); renderLeft(e,100); assert(e.activeVoiceCount()==1U);   // SYNTH ВКЛ again: the held note stays single until re-struck
+    e.postNoteOff(0U,69U); renderLeft(e,200); assert(e.activeVoiceCount()==0U);
+}
+void testCharacterFilters() {
+    for(int type=1;type<=2;++type) {
+        // low cutoff darkens a saw strongly; resonance lifts the cutoff region; nothing blows up
+        auto st=waveState(0); st->combi.uppers[0].toneCutoffHz=300.0F; st->combi.uppers[0].toneExtra.filterType=static_cast<std::int8_t>(type);
+        auto x=playWave(st,69U,120); for(float v:x) assert(std::isfinite(v));
+        auto open=playWave(waveState(0),69U,120);
+        assert(magAt(x,6000U,11000U,2200.0,96000.0) < magAt(open,6000U,11000U,2200.0,96000.0)*0.1);
+        auto res=waveState(0); res->combi.uppers[0].toneCutoffHz=880.0F; res->combi.uppers[0].toneExtra.filterType=static_cast<std::int8_t>(type); res->combi.uppers[0].toneResonance=0.0F;
+        auto flat=playWave(res,69U,120);
+        res->combi.uppers[0].toneResonance=0.85F;
+        auto peaky=playWave(res,69U,120); for(float v:peaky) assert(std::isfinite(v) && std::abs(v)<2.0F);
+        assert(magAt(peaky,6000U,11000U,880.0,96000.0) > magAt(flat,6000U,11000U,880.0,96000.0)*1.5);
+        // key tracking: cutoff follows the key -> a high note through a 300 Hz filter is brighter with KEY TRACK 1
+        auto kt=waveState(0); kt->combi.uppers[0].toneCutoffHz=300.0F; kt->combi.uppers[0].toneExtra.filterType=static_cast<std::int8_t>(type); kt->combi.uppers[0].toneExtra.filterKeyTrack=1.0F;
+        auto hiKey=playWave(kt,93U,120); auto hiKeyNoTrack=playWave(st,93U,120);
+        assert(peakOf(hiKey,6000U,11000U) > peakOf(hiKeyNoTrack,6000U,11000U)*2.0);
+    }
+    // second filter: HP 2 kHz removes a 440 Hz sine (series), halves it in parallel
+    auto f2=waveState(4); f2->combi.uppers[0].toneExtra.filter2Type=2; f2->combi.uppers[0].toneExtra.filter2Hz=2000.0F;
+    auto hp=playWave(f2,69U,120); auto dry=playWave(waveState(4),69U,120);
+    assert(magAt(hp,6000U,11000U,440.0,96000.0) < magAt(dry,6000U,11000U,440.0,96000.0)*0.1);
+    f2->combi.uppers[0].toneExtra.filter2Parallel=true; auto par=playWave(f2,69U,120);
+    const double ratio=magAt(par,6000U,11000U,440.0,96000.0)/magAt(dry,6000U,11000U,440.0,96000.0); assert(ratio>0.35 && ratio<0.65);
+}
+void testModMatrix() {
+    // velocity -> cutoff (negative): a soft note is darker than a loud one
+    auto st=waveState(0); st->combi.uppers[0].toneExtra.velToLevel=0.0F;
+    auto& r=st->combi.uppers[0].toneMod.route[0]; r.source=ModSource::Velocity; r.target=ModTarget::Cutoff; r.amount=-1.0F; r.bipolar=true;   // vel 127 -> 0 oct, vel 1 -> -4 oct... bipolar: 0..1 -> -1..1 -> loud = -4 oct? use unipolar below
+    r.bipolar=false; r.amount=-1.0F;   // loud = -4 octaves, soft ~ 0
+    auto loud=playWave(st,69U,120,127U), soft=playWave(st,69U,120,10U);
+    assert(magAt(loud,6000U,11000U,3520.0,96000.0) < magAt(soft,6000U,11000U,3520.0,96000.0)*0.3);
+    // mod wheel -> level: wheel up = +24 dB
+    auto lv=waveState(4); auto& r2=lv->combi.uppers[0].toneMod.route[1]; r2.source=ModSource::ModWheel; r2.target=ModTarget::Level; r2.amount=-1.0F;
+    SamplerEngine e; e.prepare(96000.0,96U); e.setState(lv); e.postNoteOn(0U,69U,100U); auto a=renderLeft(e,60); e.postControlChange(0U,1U,127U); auto b=renderLeft(e,60);
+    assert(peakOf(b,3000U,5700U) < peakOf(a,3000U,5700U)*0.1);
+    // note -> pan, LFO -> pitch (vibrato through the matrix), random -> pitch all finite
+    auto mx=waveState(4); auto& r3=mx->combi.uppers[0].toneMod.route[0]; r3.source=ModSource::Lfo; r3.target=ModTarget::Pitch; r3.amount=0.1F;
+    mx->combi.uppers[0].toneExtra.lfoRateHz=6.0F; auto& r4=mx->combi.uppers[0].toneMod.route[1]; r4.source=ModSource::Random; r4.target=ModTarget::Cutoff; r4.amount=0.5F;
+    auto m=playWave(mx,69U,300); double hi=0.0, lo=1e9; for(std::size_t f=10000U;f+1500U<m.size();f+=1000U){ const double h=measureHz(m,f,f+1500U,96000.0); hi=std::max(hi,h); lo=std::min(lo,h);} assert(hi>440.0*1.02 && lo<440.0/1.02);
+}
+void testEnsembleFx() {
+    auto base=makeToneState(UpperVoiceMode::Poly); base->combi.uppers[0].fxSend1=1.0F;
+    auto st=std::make_shared<EngineState>(*base); st->combi.fx[0].type=EffectType::Ensemble; st->combi.fx[0].wet=1.0F; st->combi.fx[0].depth=0.7F; st->combi.fx[0].rateHz=0.6F;
+    SamplerEngine d; d.prepare(96000.0,96U); d.setState(base); d.postNoteOn(0U,69U,100U); auto x=renderLeft(d,200);
+    SamplerEngine e; e.prepare(96000.0,96U); e.setState(st); e.postNoteOn(0U,69U,100U); auto y=renderLeft(e,200);
+    for(float v:y) assert(std::isfinite(v));
+    double diff=0.0; for(std::size_t i=0;i<x.size();++i) diff+=std::abs(x[i]-y[i]);
+    assert(diff>1.0); assert(peakOf(y,0U,y.size())<2.0);
+}
+void testSetV13RoundTrip() {
+    const auto sample=AudioFileLoader::load(makeWav()).sample; auto state=makeState(sample);
+    SetData data; data.name="V13"; data.global=state->global; data.programs.push_back({{1U,1U,1U},state->combi.uppers[0].program});
+    CombiSlot cs; cs.address={1U,1U,2U}; cs.combi=state->combi; auto& u=cs.combi.uppers[0];
+    u.toneExtra.pwmWidth=0.4F; u.toneExtra.pwmDepth=0.2F; u.toneExtra.pwmRateHz=1.5F; u.toneExtra.pwmMix=0.7F; u.toneExtra.subLevel=0.6F; u.toneExtra.subOctave=2; u.toneExtra.unisonVoices=3; u.toneExtra.unisonDetuneCents=12.0F; u.toneExtra.unisonSpread=0.8F; u.toneExtra.drive=0.3F; u.toneExtra.filterType=2; u.toneExtra.filterKeyTrack=0.5F; u.toneExtra.filter2Type=3; u.toneExtra.filter2Hz=2500.0F; u.toneExtra.filter2Res=0.4F; u.toneExtra.filter2Parallel=true; u.toneExtra.analogFeel=true;
+    u.toneMod.route[2].source=ModSource::Breath; u.toneMod.route[2].target=ModTarget::Drive; u.toneMod.route[2].amount=0.75F; u.toneMod.route[2].bipolar=true;
+    u.toneExtra.synthBypass=true; u.layers[0].enabled=true; u.layers[0].program=state->combi.uppers[0].program; u.layers[0].tone.x.unisonVoices=2; u.layers[0].tone.mod.route[0].source=ModSource::Aftertouch; u.layers[0].tone.mod.route[0].target=ModTarget::LfoDepth; u.layers[0].tone.mod.route[0].amount=0.5F;
+    data.combis.push_back(cs);
+    const std::string dir="/tmp/SILVETON_TEST_V13.SVSET"; assert(SetPackage::save(dir,data).success); const auto loaded=SetPackage::load(dir); assert(loaded.ok());
+    const auto& v=loaded.data.combis.front().combi.uppers[0];
+    assert(v.toneExtra.pwmWidth==0.4F && v.toneExtra.pwmDepth==0.2F && v.toneExtra.pwmRateHz==1.5F && v.toneExtra.pwmMix==0.7F && v.toneExtra.subLevel==0.6F && v.toneExtra.subOctave==2 && v.toneExtra.unisonVoices==3 && v.toneExtra.unisonDetuneCents==12.0F && v.toneExtra.unisonSpread==0.8F);
+    assert(v.toneExtra.drive==0.3F && v.toneExtra.filterType==2 && v.toneExtra.filterKeyTrack==0.5F && v.toneExtra.filter2Type==3 && v.toneExtra.filter2Hz==2500.0F && v.toneExtra.filter2Res==0.4F && v.toneExtra.filter2Parallel && v.toneExtra.analogFeel);
+    assert(v.toneExtra.synthBypass);
+    assert(v.toneMod.route[2].source==ModSource::Breath && v.toneMod.route[2].target==ModTarget::Drive && v.toneMod.route[2].amount==0.75F && v.toneMod.route[2].bipolar);
+    assert(v.layers[0].tone.x.unisonVoices==2 && v.layers[0].tone.mod.route[0].source==ModSource::Aftertouch && v.layers[0].tone.mod.route[0].target==ModTarget::LfoDepth && v.layers[0].tone.mod.route[0].amount==0.5F);
+}
+
 int main() {
     testWavAiffLoaders();
     testEnginePlaybackAndControls();
@@ -2578,6 +2711,7 @@ int main() {
     testLiveEditsOnHeldNote();
     testFxSlotsDelayReverb();
     testPortamentoTempoCap(); testCrossfadePortamento();
+    testBuiltinWaves(); testPwmSubUnisonDrive(); testCharacterFilters(); testModMatrix(); testSynthBypass(); testEnsembleFx(); testSetV13RoundTrip();
     testUpperLayers(); testToneV2(); testUpperEq5(); testKronosPortamento(); testEffectsV3(); testSetV12RoundTrip(); testVoiceGuardQuietestStops(); testCpuMeter();
     std::puts("SILVETON sampler tests passed");
     return 0;

@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <string>
 #include <vector>
 
 namespace silveton::sampler {
@@ -137,6 +139,7 @@ SoundTone basicToneOf(const UpperPart& u) noexcept {
     s.attackMs = u.toneAttackMs; s.decayMs = u.toneDecayMs; s.sustain = u.toneSustain;
     s.releaseMs = u.toneReleaseMs; s.cutoffHz = u.toneCutoffHz; s.resonance = u.toneResonance;
     s.x = u.toneExtra;
+    s.mod = u.toneMod;
     return s;
 }
 
@@ -149,7 +152,15 @@ const UpperLayer* layerOf(const UpperPart& u, int soundIndex) noexcept {
 
 SoundTone soundToneOf(const UpperPart& u, int soundIndex) noexcept {
     const UpperLayer* l = layerOf(u, soundIndex);
-    return l != nullptr ? l->tone : basicToneOf(u);
+    SoundTone t = l != nullptr ? l->tone : basicToneOf(u);
+    // SILVETON_SYNTH_BYPASS_V1: SYNTH ИЗКЛ = every Polysix function and the matrix read as "off";
+    // the stored knob values stay untouched, so SYNTH ВКЛ brings them straight back.
+    if (t.x.synthBypass) {
+        t.x.pwmWidth = 0.0F; t.x.pwmDepth = 0.0F; t.x.subLevel = 0.0F; t.x.unisonVoices = 1; t.x.drive = 0.0F;
+        t.x.filterType = 0; t.x.filterKeyTrack = 0.0F; t.x.filter2Type = 0; t.x.analogFeel = false;
+        for (auto& r : t.mod.route) r.source = ModSource::Off;
+    }
+    return t;
 }
 
 const Program* soundProgramOf(const UpperPart& u, int soundIndex) noexcept {
@@ -250,6 +261,66 @@ struct ToneLowPass {
         if (prime) { ic1L = ic1R = 0.0F; ic2L = l; ic2R = r; prime = false; }
         l = tick(l, a1, a2, a3, ic1L, ic2L);
         r = tick(r, a1, a2, a3, ic1R, ic2R);
+    }
+};
+
+// SILVETON_POLYSIX_V1: 4-pole ladder low-pass (the Polysix / SSM2044 family), zero-delay
+// feedback (Zavalishin): four one-pole stages, resonance feeds the output back to the
+// input, a soft saturation at the input keeps it musical when it screams.
+struct LadderFilter {
+    float G{0.0F}, k{0.0F}, comp{1.0F};
+    std::array<float, 4> sL{}, sR{};
+    bool prime{true};
+    void set(float cutoffHz, float resonance, double sr) noexcept {
+        const double fc = std::clamp(static_cast<double>(cutoffHz), 20.0, 0.45 * std::max(1.0, sr));
+        const double g = std::tan(kPi * fc / std::max(1.0, sr));
+        G = static_cast<float>(g / (1.0 + g));
+        k = 4.0F * std::clamp(resonance, 0.0F, 1.0F) * 0.98F;
+        comp = 1.0F + 0.5F * k;   // keep the bass when the resonance is up
+    }
+    float tick(float x, std::array<float, 4>& st) const noexcept {
+        const float g1 = 1.0F - G;
+        const float G2 = G * G, G3 = G2 * G, G4 = G3 * G;
+        const float S = g1 * (G3 * st[0] + G2 * st[1] + G * st[2] + st[3]);   // state contribution to the output
+        float u = (x * comp - k * S) / (1.0F + k * G4);
+        u = std::tanh(u * 0.5F) * 2.0F;   // soft clip
+        for (int i = 0; i < 4; ++i) { const float vI = (u - st[static_cast<std::size_t>(i)]) * G; const float y = vI + st[static_cast<std::size_t>(i)]; st[static_cast<std::size_t>(i)] = y + vI; u = y; }
+        return u;
+    }
+    void process(float& l, float& r) noexcept {
+        if (prime) { sL.fill(0.0F); sR.fill(0.0F); prime = false; }
+        l = tick(l, sL); r = tick(r, sR);
+    }
+};
+
+// SILVETON_POLYSIX_V1: Korg35 low-pass (the MS-20 filter), after W. Pirkle's zero-delay
+// model: LPF1 -> LPF2, a HPF in the feedback with gain K (0..2); K near 2 self-oscillates.
+struct Korg35Filter {
+    float G{0.0F}, K{0.0F};
+    float s1L{0.0F}, s2L{0.0F}, s3L{0.0F}, s1R{0.0F}, s2R{0.0F}, s3R{0.0F};
+    bool prime{true};
+    void set(float cutoffHz, float resonance, double sr) noexcept {
+        const double fc = std::clamp(static_cast<double>(cutoffHz), 20.0, 0.45 * std::max(1.0, sr));
+        const double g = std::tan(kPi * fc / std::max(1.0, sr));
+        G = static_cast<float>(g / (1.0 + g));
+        K = 2.0F * std::clamp(resonance, 0.0F, 1.0F) * 0.985F;
+    }
+    float tick(float x, float& s1, float& s2, float& s3) const noexcept {
+        // LPF1
+        const float v1 = (x - s1) * G; const float u = v1 + s1; s1 = u + v1;
+        // LPF2 with the HPF1 feedback solved instantly
+        const float g1 = 1.0F - G;
+        const float den = 1.0F - G * K * g1;
+        float y = (G * u - G * K * g1 * s3 + g1 * s2) / std::max(den, 0.05F);
+        y = std::tanh(y * 0.8F) * 1.25F;   // the nonlinearity that gives the MS-20 its growl
+        const float in2 = u + K * g1 * (y - s3);
+        const float v2 = (in2 - s2) * G; const float y2 = v2 + s2; s2 = y2 + v2;
+        const float v3 = (y - s3) * G; const float lp3 = v3 + s3; s3 = lp3 + v3;
+        return y2;
+    }
+    void process(float& l, float& r) noexcept {
+        if (prime) { s1L = s2L = s3L = s1R = s2R = s3R = 0.0F; prime = false; }
+        l = tick(l, s1L, s2L, s3L); r = tick(r, s1R, s2R, s3R);
     }
 };
 
@@ -808,12 +879,13 @@ struct ModEngine {
     double phase{0.0};
     float fbL{0.0F}, fbR{0.0F};
     std::array<float, 8U> apL{}, apR{};
+    double fastPhase{0.0};         // ensemble fast LFO
     double rotSpeed{0.0};          // current rotor speed (Hz) with inertia
     double hornPhase{0.0}, drumPhase{0.0};
     float splitL{0.0F}, splitR{0.0F};
 
     void allocate(double sr) { sampleRate = sr; line.allocate(static_cast<std::size_t>(0.06 * sr) + 64U); reset(); }
-    void reset() noexcept { line.clear(); phase = 0.0; fbL = fbR = 0.0F; apL.fill(0.0F); apR.fill(0.0F); rotSpeed = 0.0; hornPhase = drumPhase = 0.0; splitL = splitR = 0.0F; }
+    void reset() noexcept { line.clear(); phase = 0.0; fastPhase = 0.0; fbL = fbR = 0.0F; apL.fill(0.0F); apR.fill(0.0F); rotSpeed = 0.0; hornPhase = drumPhase = 0.0; splitL = splitR = 0.0F; }
 
     void process(float inL, float inR, const EffectSlot& p, float& wetL, float& wetR) noexcept {
         const double rate = std::clamp(static_cast<double>(p.rateHz), 0.02, 12.0);
@@ -885,6 +957,27 @@ struct ModEngine {
                 const float drumR = lowR * static_cast<float>(0.7 - 0.3 * std::sin(drumPhase));
                 (void)ch;
                 wetL = hornL + drumL; wetR = hornR + drumR;
+                break;
+            }
+            case EffectType::Ensemble: {
+                // SILVETON_POLYSIX_V1: string-machine ensemble - three taps on one line, each moved
+                // by a slow (0.6 Hz) and a fast (6 Hz) triangle 120 degrees apart; DEPTH = width.
+                line.push(inL, inR);
+                const double slowPh = phase;                       // 'rate' is used as the slow speed scale
+                const double fastPh = fastPhase;
+                const double base = sampleRate * 0.0045;
+                const double dSlow = sampleRate * 0.0028 * static_cast<double>(depth);
+                const double dFast = sampleRate * 0.00035 * static_cast<double>(depth);
+                float l = 0.0F, r = 0.0F;
+                for (int v = 0; v < 3; ++v) {
+                    const double off = static_cast<double>(v) / 3.0;
+                    const auto triAt = [](double ph) noexcept { ph -= std::floor(ph); return 1.0 - 4.0 * std::abs(ph - 0.5); };
+                    const double d = base + dSlow * (0.5 + 0.5 * triAt(slowPh + off)) + dFast * (0.5 + 0.5 * triAt(fastPh + off));
+                    const float tl = line.tapHL(d), tr = line.tapHR(d + 0.0003 * sampleRate);
+                    if (v == 0) { l += tl; r += tr; } else if (v == 1) { l += tl * 0.8F; r += tr * 0.5F; } else { l += tl * 0.5F; r += tr * 0.8F; }
+                }
+                wetL = l * 0.55F; wetR = r * 0.55F;
+                fastPhase += 6.0 * std::clamp(static_cast<double>(p.rateHz), 0.1, 2.0) / 0.6 / sampleRate; fastPhase -= std::floor(fastPhase);
                 break;
             }
             default: wetL = inL; wetR = inR; break;
@@ -1271,7 +1364,7 @@ struct FxUnit {
 
     void clearFor(EffectType t) noexcept {
         if (effectIsDelay(t)) delay.reset();
-        else if (t == EffectType::Chorus || t == EffectType::Flanger || t == EffectType::Phaser || t == EffectType::Rotary) mod.reset();
+        else if (t == EffectType::Chorus || t == EffectType::Flanger || t == EffectType::Phaser || t == EffectType::Rotary || t == EffectType::Ensemble) mod.reset();
         else if (t == EffectType::Reverb) { if (plate != nullptr) plate->reset(sampleRate); }
         else if (t == EffectType::Spring) spring.reset();
         else if (effectIsReverb(t)) fdn.reset();
@@ -1287,7 +1380,7 @@ struct FxUnit {
             case EffectType::Delay: case EffectType::TapeDelay: case EffectType::PingPong:
             case EffectType::MultiTap: case EffectType::DuckDelay:
                 delay.process(inL, inR, p, wetL, wetR); break;
-            case EffectType::Chorus: case EffectType::Flanger: case EffectType::Phaser: case EffectType::Rotary:
+            case EffectType::Chorus: case EffectType::Flanger: case EffectType::Phaser: case EffectType::Rotary: case EffectType::Ensemble:
                 mod.process(inL, inR, p, wetL, wetR); break;
             case EffectType::Reverb:
                 if (plate != nullptr) plate->process(inL, inR, p, wetL, wetR); else wetL = wetR = 0.0F;
@@ -1389,6 +1482,24 @@ struct SamplerEngine::Impl {
         float fadeStep{0.0F};
         bool fading{false};
         bool fadeBlend{false};         // SILVETON_XFADE_PORTA_V1: crossfade law between two recordings of one line
+        // SILVETON_POLYSIX_V1
+        int unisonIndex{0};
+        float unisonCents{0.0F};
+        float unisonPan{0.0F};
+        float unisonGain{1.0F};
+        double subPosition{0.0};
+        double periodFrames{0.0};      // one period of the recording's own pitch, in its frames (PWM)
+        double pwmPhase{0.0};
+        float pwmWidthNow{0.0F};
+        float dcXL{0.0F}, dcYL{0.0F}, dcXR{0.0F}, dcYR{0.0F};
+        float random{0.0F};            // -1..1, fixed for the note
+        float modCutOct{0.0F}, modRes{0.0F}, modCut2Oct{0.0F}, modLevelDb{0.0F}, modPan{0.0F};
+        float modPitch{0.0F}, modLfoCents{0.0F}, modLfoRateMul{1.0F}, modPwm{0.0F}, modDrive{0.0F}, modAttackMul{1.0F}, modReleaseMul{1.0F};
+        std::int8_t filterTypeNow{0};
+        LadderFilter ladder{};
+        Korg35Filter korg35{};
+        StateVariableFilter filter2{};
+        float filter2Hz{1000.0F}, filter2Res{0.0F};
         std::uint32_t delayFramesRemaining{0U};
         // Zone/layer gain x velocity. The Upper's level, pan and ON/MUTE/SOLO are
         // the live mix gains below (SILVETON_LIVE_EDIT_V1).
@@ -1446,6 +1557,7 @@ struct SamplerEngine::Impl {
     std::array<std::array<std::int8_t, 128>, 16> tercaKey{};       // physical key -> harmony (-1)
     std::array<std::array<std::uint8_t, 128>, 16> tercaRefs{};     // harmony refcount
     std::uint64_t voiceAge{0U};
+    std::uint32_t noiseState{0x9E3779B9U};   // SILVETON_POLYSIX_V1: per-note random
     float peakL{0.0F};
     float peakR{0.0F};
     float limiterGrDb{0.0F};
@@ -1552,6 +1664,86 @@ UpperToneValues effectiveLayerTone(const UpperLayer& layer) noexcept {
 }
 
 SoundTone basicSoundTone(const UpperPart& upper) noexcept { return basicToneOf(upper); }
+
+// ---------------------------------------------------------------- SILVETON_POLYSIX_V1 built-in waves
+namespace {
+constexpr std::array<const char*, kBuiltinWaveCount> kBuiltinWaveNames{{"SAW", "SQUARE", "PULSE 25", "TRIANGLE", "SINE", "SAW WARM"}};
+
+SamplePtr makeWaveTable(int wave, int rootKey) {
+    const double f = 440.0 * std::pow(2.0, (rootKey - 69) / 12.0);
+    const auto P = static_cast<std::size_t>(std::max(16L, std::lround(96000.0 / f)));   // one period in frames
+    const std::size_t periods = 8U;
+    auto s = std::make_shared<SampleData>();
+    s->name = std::string(kBuiltinWaveNames[static_cast<std::size_t>(wave)]) + " " + std::to_string(rootKey);
+    s->sampleRate = static_cast<std::uint32_t>(std::lround(static_cast<double>(P) * f));   // so that one period = exactly P frames
+    s->channels = 1U;
+    s->rootKey = static_cast<std::uint8_t>(rootKey);
+    s->interleaved.assign(P * periods, 0.0F);
+    s->totalFrames = P * periods;
+    s->loop.enabled = true; s->loop.startFrame = 0U; s->loop.endFrame = P * periods; s->loop.crossfadeFrames = 0U;
+    const int nMax = static_cast<int>(P / 2U) - 1;   // the table's own Nyquist
+    std::vector<double> one(P, 0.0);
+    for (int n = 1; n <= nMax; ++n) {
+        double a = 0.0; bool cosTerm = false;
+        switch (wave) {
+            case 0: a = ((n % 2) ? 1.0 : -1.0) / n; break;                                        // saw
+            case 1: a = (n % 2) ? 1.0 / n : 0.0; break;                                            // square
+            case 2: a = 2.0 / (n * kPi) * std::sin(n * kPi * 0.25); cosTerm = true; break;         // pulse 25 %
+            case 3: a = (n % 2) ? (((n / 2) % 2 == 0) ? 1.0 : -1.0) / (static_cast<double>(n) * n) : 0.0; break;   // triangle
+            case 4: a = n == 1 ? 1.0 : 0.0; break;                                                  // sine
+            default: a = ((n % 2) ? 1.0 : -1.0) / n / (1.0 + std::pow(n / 12.0, 2.0)); break;       // saw warm
+        }
+        if (a == 0.0) continue;
+        const double sigma = std::sin(kPi * n / (nMax + 1.0)) / (kPi * n / (nMax + 1.0));   // Lanczos: no Gibbs ripple
+        a *= sigma;
+        for (std::size_t i = 0; i < P; ++i) {
+            const double th = 2.0 * kPi * static_cast<double>(i) / static_cast<double>(P);
+            one[i] += a * (cosTerm ? std::cos(n * th) : std::sin(n * th));
+        }
+    }
+    double peak = 1.0e-9; double mean = 0.0;
+    for (double v : one) mean += v;
+    mean /= static_cast<double>(P);
+    for (double& v : one) { v -= mean; peak = std::max(peak, std::abs(v)); }
+    for (std::size_t k = 0; k < periods; ++k)
+        for (std::size_t i = 0; i < P; ++i) s->interleaved[k * P + i] = static_cast<float>(one[i] / peak * 0.5);
+    return s;
+}
+} // namespace
+
+const char* builtinWaveName(int index) noexcept {
+    return (index >= 0 && index < kBuiltinWaveCount) ? kBuiltinWaveNames[static_cast<std::size_t>(index)] : "";
+}
+
+ProgramPtr builtinWaveProgram(int index) {
+    if (index < 0 || index >= kBuiltinWaveCount) return nullptr;
+    static std::array<ProgramPtr, kBuiltinWaveCount> cache{};
+    static std::mutex cacheMutex;
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    auto& slot = cache[static_cast<std::size_t>(index)];
+    if (slot != nullptr) return slot;
+    auto ms = std::make_shared<Multisample>();
+    ms->name = kBuiltinWaveNames[static_cast<std::size_t>(index)];
+    for (int root = 12; root <= 120; root += 12) {
+        SampleZone z{};
+        z.sample = makeWaveTable(index, root);
+        z.rootKey = static_cast<std::uint8_t>(root);
+        z.keyLow = static_cast<std::uint8_t>(root == 12 ? 0 : root - 6);
+        z.keyHigh = static_cast<std::uint8_t>(root == 120 ? 127 : root + 5);
+        z.velocityLow = 1U; z.velocityHigh = 127U;
+        ms->zones.push_back(z);
+    }
+    auto prog = std::make_shared<Program>();
+    prog->name = kBuiltinWaveNames[static_cast<std::size_t>(index)];
+    ProgramLayer layer{};
+    layer.name = prog->name;
+    layer.multisample = ms;
+    layer.ampEnvelope = EnvelopeParams{0.003F, 0.05F, 1.0F, 0.08F};
+    prog->layers.push_back(layer);
+    slot = prog;
+    return slot;
+}
+
 
 SamplerEngine::SamplerEngine()
     : impl_(std::make_unique<Impl>()), state_(std::make_shared<EngineState>()), interpolator_(InterpolationQuality::Studio) { // SILVETON_STUDIO_INTERP_V1
@@ -1882,7 +2074,8 @@ void startVoice(SamplerEngine::Impl& impl,
                  const GlobalState& global,
                  const std::shared_ptr<const EngineState>& ownerState,
                  int soundIndex = 0,
-                 bool legatoStart = false) noexcept {
+                 bool legatoStart = false,
+                 int unisonIndex = 0) noexcept {
     v = SamplerEngine::Impl::Voice{};
     v.active = true;
     v.keyHeld = true;
@@ -1940,6 +2133,27 @@ void startVoice(SamplerEngine::Impl& impl,
     velGain = 1.0F + (velGain - 1.0F) * std::clamp(tone.x.velToLevel, 0.0F, 1.0F);
     v.velCutoffOct = -std::clamp(tone.x.velToCutoff, 0.0F, 8.0F) * (1.0F - velocityNorm);
     v.filterEnvValue = 1.0F;
+    // SILVETON_POLYSIX_V1: unison copy, sub position, PWM period, per-note random
+    {
+        const int n = std::clamp<int>(tone.x.unisonVoices, 1, 4);
+        v.unisonIndex = unisonIndex;
+        if (n > 1) {
+            const float t = (static_cast<float>(unisonIndex) - 0.5F * static_cast<float>(n - 1)) / (0.5F * static_cast<float>(n - 1));   // -1..1
+            v.unisonCents = t * std::clamp(tone.x.unisonDetuneCents, 0.0F, 100.0F);
+            v.unisonPan = t * std::clamp(tone.x.unisonSpread, 0.0F, 1.0F);
+            v.unisonGain = 1.0F / std::sqrt(static_cast<float>(n));
+        }
+        v.subPosition = v.position;
+        v.periodFrames = 0.0;
+        if (zone.sample != nullptr) {
+            const double rootHz = 440.0 * std::pow(2.0, (static_cast<double>(zone.rootKey) - 69.0) / 12.0) *
+                                  std::pow(2.0, -static_cast<double>(zone.tuneCents + zone.sample->fineTuneCents) / 1200.0);
+            v.periodFrames = static_cast<double>(zone.sample->sampleRate) / std::max(1.0, rootHz);
+        }
+        impl.noiseState = impl.noiseState * 1664525U + 1013904223U;
+        v.random = static_cast<float>(impl.noiseState >> 8) / 8388608.0F - 1.0F;
+        if (tone.x.analogFeel) { v.unisonCents += v.random * 3.0F; }   // a few cents, like a real analog
+    }
     float layerVelocityGain = 1.0F;
     if (layer.velocityFadeIn > 0U) {
         const int fadeEnd = static_cast<int>(layer.velocityLow) + static_cast<int>(layer.velocityFadeIn);
@@ -1962,7 +2176,9 @@ void startVoice(SamplerEngine::Impl& impl,
     updateMixTarget(v, upper, true, 0.0F);
     v.mixL = v.mixTargetL;
     v.mixR = v.mixTargetR;
-    v.tuneSemis = liveTuneSemis(upper, global, key, ((impl.scaleUppers.load(std::memory_order_relaxed) >> upperIndex) & 1) != 0, ul);
+    v.tuneSemis = liveTuneSemis(upper, global, key, ((impl.scaleUppers.load(std::memory_order_relaxed) >> upperIndex) & 1) != 0, ul) + static_cast<double>(v.unisonCents) / 100.0;
+    v.ratio *= std::exp2(static_cast<double>(v.unisonCents) / 1200.0);
+    v.targetRatio = v.ratio;
     v.filterEnv.params = layer.filterEnvelope;
     v.pitchEnv.params = layer.pitchEnvelope;
     v.ampEnv = AmpEnv{};
@@ -2214,7 +2430,10 @@ void forEachSoundZone(const UpperPart& upper, const GlobalState& global, std::ui
             if (!layer.matches(pk, velocity) || layer.multisample == nullptr) continue;
             for (const auto& zone : layer.multisample->zones) {
                 if (!zone.matches(pk, velocity) || !zone.sample->valid()) continue;
-                fn(s, layer, zone);
+                // SILVETON_POLYSIX_V1: UNISON = the same recording 1..4 times, detuned and spread
+                const SoundTone st = soundToneOf(upper, s);
+                const int n = std::clamp<int>(st.x.unisonVoices, 1, 4);
+                for (int u = 0; u < n; ++u) fn(s, layer, zone, u);
             }
         }
     }
@@ -2261,10 +2480,10 @@ void playUpperNote(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
         }
         if (upperLegato && hadHeldVoice) {
             // 1) a still-held voice on the same recording just changes pitch
-            forEachSoundZone(upper, global, key, velocity, [&](int s, const ProgramLayer& layer, const SampleZone& zone) noexcept {
+            forEachSoundZone(upper, global, key, velocity, [&](int s, const ProgramLayer& layer, const SampleZone& zone, int un) noexcept {
                 for (auto& existing : impl.voices) {
                     if (existing.active && !existing.fading && existing.upperIndex == ui && existing.keyHeld &&
-                        existing.delayFramesRemaining == 0U && !existing.legatoKeep && existing.soundIndex == s &&
+                        existing.delayFramesRemaining == 0U && !existing.legatoKeep && existing.soundIndex == s && existing.unisonIndex == un &&
                         existing.layer == &layer && existing.zone == &zone) {
                         legatoTo(impl, existing, upper, layer, zone, key, global, 0.0F);
                         existing.legatoKeep = true;
@@ -2290,15 +2509,15 @@ void playUpperNote(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
         }
     }
     const bool kronos = upper.portaMode == PortamentoMode::Kronos;
-    forEachSoundZone(upper, global, key, velocity, [&](int s, const ProgramLayer& layer, const SampleZone& zone) noexcept {
+    forEachSoundZone(upper, global, key, velocity, [&](int s, const ProgramLayer& layer, const SampleZone& zone, int un) noexcept {
         if (upperLegato && hadHeldVoice) {
             for (const auto& existing : impl.voices) {
-                if (existing.active && existing.legatoKeep && existing.upperIndex == ui && existing.soundIndex == s &&
+                if (existing.active && existing.legatoKeep && existing.upperIndex == ui && existing.soundIndex == s && existing.unisonIndex == un &&
                     existing.layer == &layer && existing.zone == &zone) return;
             }
         }
         auto* v = chooseVoice(impl);
-        startVoice(impl, *v, upper, layer, zone, ui, channel, key, velocity, global, stateOwner, s, upperLegato && hadHeldVoice);
+        startVoice(impl, *v, upper, layer, zone, ui, channel, key, velocity, global, stateOwner, s, upperLegato && hadHeldVoice, un);
         v->mono = upperMono;
         v->glideKronos = kronos;
         startPortamentoGlide(impl, *v, glideFromKey, glideSec);
@@ -2334,9 +2553,9 @@ void playPortamentoNote(SamplerEngine::Impl& impl, const std::shared_ptr<const E
         double fromKey = (keyWasHeld && previousKey >= 0) ? static_cast<double>(previousKey) : -1.0;
         if (kronos && !upper.portaFingered && fromKey < 0.0) fromKey = static_cast<double>(impl.polyLastKey[static_cast<std::size_t>(ui)]);
         glideSec = glideSecFor(impl, upper, fromKey, static_cast<double>(key), ui);
-        forEachSoundZone(upper, global, key, velocity, [&](int s, const ProgramLayer& layer, const SampleZone& zone) noexcept {
+        forEachSoundZone(upper, global, key, velocity, [&](int s, const ProgramLayer& layer, const SampleZone& zone, int un) noexcept {
             auto* v = chooseVoice(impl);
-            startVoice(impl, *v, upper, layer, zone, ui, channel, key, velocity, global, stateOwner, s);
+            startVoice(impl, *v, upper, layer, zone, ui, channel, key, velocity, global, stateOwner, s, false, un);
             v->mono = true;
             v->glideKronos = kronos;
             startPortamentoGlide(impl, *v, fromKey, glideSec);
@@ -2355,11 +2574,11 @@ void playPortamentoNote(SamplerEngine::Impl& impl, const std::shared_ptr<const E
     // timbre at the arrival.
     const float xfadeSec = std::clamp(glideSec, kLegatoCrossfadeSec, 0.300F);
     for (auto& v : impl.voices) if (v.upperIndex == ui) v.legatoKeep = false;
-    forEachSoundZone(upper, global, key, velocity, [&](int s, const ProgramLayer& layer, const SampleZone& zone) noexcept {
+    forEachSoundZone(upper, global, key, velocity, [&](int s, const ProgramLayer& layer, const SampleZone& zone, int un) noexcept {
         SamplerEngine::Impl::Voice* keep = nullptr;
         for (auto& v : impl.voices) {
             if (v.active && !v.fading && v.upperIndex == ui && v.keyHeld && v.delayFramesRemaining == 0U &&
-                !v.legatoKeep && v.soundIndex == s && v.layer == &layer && v.zone == &zone) { keep = &v; break; }
+                !v.legatoKeep && v.soundIndex == s && v.unisonIndex == un && v.layer == &layer && v.zone == &zone) { keep = &v; break; }
         }
         if (keep != nullptr) {
             // the same recording keeps sounding and only moves its pitch
@@ -2370,7 +2589,7 @@ void playPortamentoNote(SamplerEngine::Impl& impl, const std::shared_ptr<const E
         }
         // another recording takes over without a new strike and glides from the pitch that sounded
         auto* v = chooseVoice(impl);
-        startVoice(impl, *v, upper, layer, zone, ui, channel, key, velocity, global, stateOwner, s, true);
+        startVoice(impl, *v, upper, layer, zone, ui, channel, key, velocity, global, stateOwner, s, true, un);
         v->mono = true;
         v->glideKronos = kronos;
         startPortamentoGlide(impl, *v, fromPitch, glideSec);
@@ -2738,7 +2957,7 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
             }
             const UpperLayer* ul = layerOf(*v.upper, v.soundIndex);
             const double tune = liveTuneSemis(*v.upper, current->global, v.key,
-                ((impl_->scaleUppers.load(std::memory_order_relaxed) >> v.upperIndex) & 1) != 0, ul);
+                ((impl_->scaleUppers.load(std::memory_order_relaxed) >> v.upperIndex) & 1) != 0, ul) + static_cast<double>(v.unisonCents) / 100.0;
             if (tune != v.tuneSemis) {
                 const double m = std::exp2((tune - v.tuneSemis) / 12.0);
                 v.ratio *= m;
@@ -2746,16 +2965,78 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
                 v.tuneSemis = tune;
             }
             const SoundTone st = soundToneOf(*v.upper, v.soundIndex);
-            const UpperToneValues tv = effectiveToneFor(st, *v.upper, v.layer->ampEnvelope);
-            v.ampEnv.setBlock(tv, impl_->sampleRate);
+            // SILVETON_SYNTH_BYPASS_V1: a unison copy still sounding after SYNTH ИЗКЛ fades out
+            if (v.unisonIndex > 0 && st.x.unisonVoices <= 1 && !v.fading) softKill(*impl_, v, 0.004F);
+            UpperToneValues tv = effectiveToneFor(st, *v.upper, v.layer->ampEnvelope);
             // FILTER ENV: 1 at the start of the note, down to 0 in FILTER ENV time (exponential).
-            float envOct = 0.0F;
-            if (st.x.filterEnvOctaves != 0.0F) {
+            {
                 const double ms = std::clamp(static_cast<double>(st.x.filterEnvMs), 1.0, 20000.0);
                 v.filterEnvValue *= static_cast<float>(std::exp(-blockSec * 1000.0 / ms * 4.6));   // -40 dB at FILTER ENV time
-                envOct = std::clamp(st.x.filterEnvOctaves, -8.0F, 8.0F) * v.filterEnvValue;
             }
-            const float extraOct = envOct + v.velCutoffOct;
+            // SILVETON_POLYSIX_V1: the modulation matrix of this sound, once per block
+            {
+                const auto& ch = impl_->channels[v.channel & 0x0FU];
+                v.modCutOct = v.modRes = v.modCut2Oct = v.modLevelDb = v.modPan = v.modPitch = v.modLfoCents = v.modPwm = v.modDrive = 0.0F;
+                v.modLfoRateMul = v.modAttackMul = v.modReleaseMul = 1.0F;
+                for (const auto& r : st.mod.route) {
+                    if (r.source == ModSource::Off || r.amount == 0.0F) continue;
+                    float x = 0.0F; bool bip = false;
+                    switch (r.source) {
+                        case ModSource::Off: break;
+                        case ModSource::Velocity: x = v.velNorm; break;
+                        case ModSource::Note: x = (static_cast<float>(v.key) - 60.0F) / 60.0F; bip = true; break;
+                        case ModSource::Aftertouch: x = ch.pressure; break;
+                        case ModSource::ModWheel: x = ch.cc[1]; break;
+                        case ModSource::Breath: x = ch.breath; break;
+                        case ModSource::Expression: x = ch.expression; break;
+                        case ModSource::Pedal: x = ch.sustain ? 1.0F : 0.0F; break;
+                        case ModSource::Bend: x = static_cast<float>(ch.pitchBend) / 8192.0F; bip = true; break;
+                        case ModSource::Lfo: x = static_cast<float>(std::sin(v.vibPhase)); bip = true; break;
+                        case ModSource::FilterEnv: x = v.filterEnvValue; break;
+                        case ModSource::AmpEnv: x = v.ampEnv.value; break;
+                        case ModSource::Random: x = v.random; bip = true; break;
+                    }
+                    if (r.bipolar && !bip) x = x * 2.0F - 1.0F;
+                    const float a = std::clamp(r.amount, -1.0F, 1.0F) * x;
+                    switch (r.target) {
+                        case ModTarget::Cutoff: v.modCutOct += a * 4.0F; break;
+                        case ModTarget::Resonance: v.modRes += a; break;
+                        case ModTarget::Cutoff2: v.modCut2Oct += a * 4.0F; break;
+                        case ModTarget::Level: v.modLevelDb += a * 24.0F; break;
+                        case ModTarget::Pan: v.modPan += a; break;
+                        case ModTarget::Pitch: v.modPitch += a * 12.0F; break;
+                        case ModTarget::LfoDepth: v.modLfoCents += a * 100.0F; break;
+                        case ModTarget::LfoRate: v.modLfoRateMul *= std::exp2(a * 2.0F); break;
+                        case ModTarget::PwmWidth: v.modPwm += a * 0.45F; break;
+                        case ModTarget::Drive: v.modDrive += a; break;
+                        case ModTarget::Attack: v.modAttackMul *= std::exp2(a * 3.0F); break;
+                        case ModTarget::Release: v.modReleaseMul *= std::exp2(a * 3.0F); break;
+                    }
+                }
+                if (v.modAttackMul != 1.0F) tv.attackMs = std::clamp(tv.attackMs * v.modAttackMul, 0.0F, kToneMaxTimeMs);
+                if (v.modReleaseMul != 1.0F) tv.releaseMs = std::clamp(tv.releaseMs * v.modReleaseMul, 0.0F, kToneMaxTimeMs);
+                tv.resonance = std::clamp(tv.resonance + v.modRes, 0.0F, 1.0F);
+            }
+            v.ampEnv.setBlock(tv, impl_->sampleRate);
+            float envOct = 0.0F;
+            if (st.x.filterEnvOctaves != 0.0F) envOct = std::clamp(st.x.filterEnvOctaves, -8.0F, 8.0F) * v.filterEnvValue;
+            const float keyTrackOct = std::clamp(st.x.filterKeyTrack, -1.0F, 1.0F) * (static_cast<float>(v.key) - 60.0F) / 12.0F;
+            const float extraOct = envOct + v.velCutoffOct + v.modCutOct + keyTrackOct + (st.x.analogFeel ? v.random * 0.08F : 0.0F);
+            // filter type of CUTOFF (clean / POLYSIX ladder / KORG35) - a change resets the new filter's state
+            if (v.filterTypeNow != st.x.filterType) { v.filterTypeNow = st.x.filterType; v.ladder.prime = true; v.korg35.prime = true; v.toneLp.prime = true; }
+            // second filter
+            if (st.x.filter2Type != 0) {
+                const float hz2 = std::clamp(st.x.filter2Hz * std::exp2(v.modCut2Oct), 20.0F, kToneCutoffOpenHz);
+                v.filter2Hz = hz2; v.filter2Res = std::clamp(st.x.filter2Res, 0.0F, 1.0F);
+            }
+            // PWM width of this block
+            if (st.x.pwmWidth > 0.0F && v.periodFrames > 0.0) {
+                v.pwmPhase += 2.0 * kPi * std::clamp(static_cast<double>(st.x.pwmRateHz), 0.02, 20.0) * blockSec;
+                if (v.pwmPhase > 2.0 * kPi) v.pwmPhase -= 2.0 * kPi;
+                v.pwmWidthNow = std::clamp(st.x.pwmWidth + v.modPwm + st.x.pwmDepth * static_cast<float>(std::sin(v.pwmPhase)), 0.02F, 0.98F);
+            } else {
+                v.pwmWidthNow = 0.0F;
+            }
             const bool wantOn = tv.cutoffHz < kToneCutoffOpenHz - 1.0F || extraOct < -0.001F;
             if (wantOn && !v.toneOn) { v.toneOn = true; v.toneLog = openLog; v.toneLp.prime = true; }
             if (v.toneOn) {
@@ -2763,23 +3044,25 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
                 v.toneLog += (target - v.toneLog) * static_cast<float>(blockAlpha);
                 const float hz = std::clamp(std::exp(v.toneLog + extraOct * 0.69314718F), 20.0F, kToneCutoffOpenHz);
                 if (!wantOn && v.toneLog >= openLog - 0.05F) v.toneOn = false;
+                else if (v.filterTypeNow == 1) v.ladder.set(hz, tv.resonance, impl_->sampleRate);
+                else if (v.filterTypeNow == 2) v.korg35.set(hz, tv.resonance, impl_->sampleRate);
                 else v.toneLp.set(hz, tv.resonance, impl_->sampleRate);
             }
             // Vibrato (TONE LFO): depth from the TONE page, scaled by the modulation wheel if chosen.
-            v.vibSemis = 0.0;
-            if (st.x.lfoDepthCents > 0.0F) {
+            v.vibSemis = static_cast<double>(v.modPitch);
+            {
                 const auto& ch = impl_->channels[v.channel & 0x0FU];
                 const float wheel = st.x.lfoModWheel ? ch.cc[1] : 1.0F;
                 v.vibAgeSec += blockSec;
-                v.vibPhase += 2.0 * kPi * std::clamp(static_cast<double>(st.x.lfoRateHz), 0.1, 20.0) * blockSec;
+                v.vibPhase += 2.0 * kPi * std::clamp(static_cast<double>(st.x.lfoRateHz * v.modLfoRateMul), 0.05, 30.0) * blockSec;
                 if (v.vibPhase > 2.0 * kPi) v.vibPhase -= 2.0 * kPi;
+                const float depthCents = std::clamp(st.x.lfoDepthCents * wheel + v.modLfoCents, 0.0F, 1200.0F);
                 const double delay = std::max(0.0, static_cast<double>(st.x.lfoDelayMs)) * 0.001;
                 double fade = 1.0;
                 if (v.vibAgeSec < delay) fade = 0.0;
                 else if (st.x.lfoFadeMs > 0.0F) fade = std::clamp((v.vibAgeSec - delay) / (static_cast<double>(st.x.lfoFadeMs) * 0.001), 0.0, 1.0);
-                if (wheel > 0.0F && fade > 0.0) {
-                    v.vibSemis = std::sin(v.vibPhase) * static_cast<double>(std::min(st.x.lfoDepthCents, 1200.0F)) * 0.01 *
-                                 static_cast<double>(wheel) * fade;
+                if (depthCents > 0.0F && fade > 0.0) {
+                    v.vibSemis += std::sin(v.vibPhase) * static_cast<double>(depthCents) * 0.01 * fade;
                 }
             }
         }
@@ -2921,7 +3204,22 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
             ? controllerAmount(*v.upper, ch, ModDestination::LevelDb) : 0.0F;
         const float levelGain = controllerLevelDb != 0.0F ? dbToGain(std::clamp(controllerLevelDb, -96.0F, 24.0F)) : 1.0F;
         const float controllerPan = routeActive(ModDestination::Pan) ? controllerAmount(*v.upper, ch, ModDestination::Pan) : 0.0F;
-        updateMixTarget(v, *v.upper, upperAudible(*v.ownerState, *v.upper), controllerPan);
+        updateMixTarget(v, *v.upper, upperAudible(*v.ownerState, *v.upper), controllerPan + v.unisonPan + v.modPan);
+        // SILVETON_POLYSIX_V1 per-chunk settings of this sound
+        const SoundTone stC = soundToneOf(*v.upper, v.soundIndex);
+        const float subLevel = std::clamp(stC.x.subLevel, 0.0F, 1.0F);
+        const double subRatioDiv = stC.x.subOctave >= 2 ? 4.0 : 2.0;
+        const bool subOn = subLevel > 0.0F;
+        const bool pwmOn = v.pwmWidthNow > 0.0F && v.periodFrames > 0.0;
+        const float pwmMix = std::clamp(stC.x.pwmMix, 0.0F, 1.0F);
+        const double pwmDelta = pwmOn ? static_cast<double>(v.pwmWidthNow) * v.periodFrames : 0.0;
+        const float driveAmt = std::clamp(stC.x.drive + v.modDrive, 0.0F, 1.0F);
+        const float driveK = 1.0F + 9.0F * driveAmt * driveAmt;
+        const float driveNorm = 1.0F / std::sqrt(driveK);
+        const int f2type = stC.x.filter2Type;
+        const bool f2parallel = stC.x.filter2Parallel;
+        const float modLevelGain = v.modLevelDb != 0.0F ? dbToGain(std::clamp(v.modLevelDb, -60.0F, 24.0F)) : 1.0F;
+        const float dcCoef = 1.0F - static_cast<float>(2.0 * kPi * 20.0 / impl_->sampleRate);
         const float mixTargetL = v.mixTargetL;
         const float mixTargetR = v.mixTargetR;
         const bool mixMoving = mixTargetL != v.mixL || mixTargetR != v.mixR;
@@ -3022,6 +3320,29 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
             double readPos = v.position;
             if (v.loopWrapped && looping && loopLen > 0.0 && readPos < loopStart + 64.0) readPos += loopLen;
             readWithLoopCrossfade(interpolator_, sample, readPos, ratio, looping, sL, sR);
+            if (subOn) {
+                // SUB: the same recording an octave (or two) lower, from its own position
+                float subL = 0.0F, subR = 0.0F;
+                double subPos = v.subPosition;
+                if (v.loopWrapped && looping && loopLen > 0.0 && subPos < loopStart + 64.0) subPos += loopLen;
+                readWithLoopCrossfade(interpolator_, sample, subPos, ratio / subRatioDiv, looping, subL, subR);
+                sL += subL * subLevel; sR += subR * subLevel;
+                v.subPosition += ratio / subRatioDiv;
+                if (looping && v.subPosition >= loopEnd && loopLen > 0.0) v.subPosition = loopStart + std::fmod(v.subPosition - loopStart, loopLen);
+                else if (!looping && v.subPosition >= sampleEnd) v.subPosition = sampleEnd - 1.0;
+            }
+            if (pwmOn) {
+                // PWM: the recording minus itself shifted by WIDTH x its own period (saw -> pulse; any
+                // harmonic recording -> the same comb that PWM gives). A 20 Hz DC blocker follows.
+                double p2 = readPos - pwmDelta;
+                if (looping && loopLen > 0.0 && p2 < loopStart) { if (v.loopWrapped) p2 += loopLen; else p2 = std::max(0.0, p2); }
+                else if (p2 < 0.0) p2 = 0.0;
+                float dL = 0.0F, dR = 0.0F;
+                readWithLoopCrossfade(interpolator_, sample, p2, ratio, looping, dL, dR);
+                sL -= dL * pwmMix; sR -= dR * pwmMix;
+                const float yL = sL - v.dcXL + dcCoef * v.dcYL; v.dcXL = sL; v.dcYL = yL; sL = yL;
+                const float yR = sR - v.dcXR + dcCoef * v.dcYR; v.dcXR = sR; v.dcYR = yR; sR = yR;
+            }
 
             if (filterActive) {
                 float cutoff = staticFilterCutoff;
@@ -3037,7 +3358,19 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
                 v.filter.process(sL, sR, v.layer->filter.mode, cutoff, filterResonance, impl_->sampleRate);
             }
 
-            if (v.toneOn) v.toneLp.process(sL, sR);
+            if (driveAmt > 0.0F) { sL = std::tanh(sL * driveK) * driveNorm; sR = std::tanh(sR * driveK) * driveNorm; }
+            if (v.toneOn) {
+                if (v.filterTypeNow == 1) v.ladder.process(sL, sR);
+                else if (v.filterTypeNow == 2) v.korg35.process(sL, sR);
+                else v.toneLp.process(sL, sR);
+            }
+            if (f2type != 0) {
+                float bL = sL, bR = sR;
+                const FilterMode fm = f2type == 1 ? FilterMode::LowPass : (f2type == 2 ? FilterMode::HighPass : FilterMode::BandPass);
+                v.filter2.process(bL, bR, fm, v.filter2Hz, v.filter2Res, impl_->sampleRate);
+                if (f2type == 4) { bL = sL - bL; bR = sR - bR; }   // band reject = input minus band-pass
+                if (f2parallel) { sL = 0.5F * (sL + bL); sR = 0.5F * (sR + bR); } else { sL = bL; sR = bR; }
+            }
 
             float modGain = ampEnv;
             if (ampLfo) modGain *= std::max(0.0F, 1.0F + lfo1 * lfo1Params.ampDepth + lfo2 * lfo2Params.ampDepth);
@@ -3046,7 +3379,7 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
                 if (v.upper->breathEnabled) modGain *= ch.breath;
                 if (v.upper->aftertouchEnabled) modGain *= (0.5F + 0.5F * ch.pressure);
             }
-            float g = v.baseGain * modGain;
+            float g = v.baseGain * modGain * v.unisonGain * modLevelGain;
             if (controllerLevelDb != 0.0F) g *= levelGain;
             if (v.fadeStep != 0.0F) {
                 v.fadeGain += v.fadeStep;

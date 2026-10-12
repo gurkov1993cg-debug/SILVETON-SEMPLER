@@ -539,6 +539,8 @@ class SamplerAppController(
         portaPrefs.edit().putString("sound_recent", list.joinToString(",")).apply()
     }
     fun analyzerFrame(upper: Int, afterEq: Boolean): FloatArray = engine.nativeAnalyzerFrame(upper, afterEq)
+    fun setSoundSynthParam(upper: Int, sound: Int, id: Int, value: Float): Boolean = nativeResult(engine.nativeSetSoundSynthParam(upper, sound, id, value))
+    fun soundSynthParams(upper: Int, sound: Int): FloatArray = engine.nativeSoundSynthParams(upper, sound)
 
     fun listFavourites(): Set<Int> = portaPrefs.getString("list_favs", "")!!.split(',').mapNotNull { it.toIntOrNull() }.toSet()
     fun saveListFavourites(favs: Set<Int>) { portaPrefs.edit().putString("list_favs", favs.sorted().joinToString(",")).apply() }

@@ -1,0 +1,38 @@
+СИЛВЕТОН СЕМПЛЕР - POLYSIX ФУНКЦИИ ВЪРХУ ЗАПИСИТЕ (SILVETON_POLYSIX_V1)
+
+Включва и всичко от предишните пакети (кросфейд портаменто, портаменто по темпо).
+
+НОВО - на всеки звук (ОСНОВЕН и LAYER 1..4), таб SYNTH:
+- PWM: WIDTH (0 = OFF) / DEPTH / RATE / MIX. Записът минус същия запис, отместен с
+  WIDTH x неговия период. Върху трион = истински импулс с PWM; върху всеки
+  хармоничен запис (акордеон, стрингове) = същото "дишане" като при PWM.
+- SUB: същият запис една или две октави надолу, смесен (LEVEL, ОКТАВА -1/-2).
+- UNISON: 1..4 копия на записа, DETUNE (cents), SPREAD (стерео). Нивото се пази.
+- DRIVE: меко насищане преди филтъра.
+- ФИЛТЪР НА CUTOFF: ЧИСТ (както досега) / POLYSIX (4-полюсен ladder, самоосцилира при
+  висок резонанс) / KORG35 (филтърът на MS-20, по публикувания модел на W. Pirkle).
+- KEY TRACK: cutoff следва клавиша (-100..+100 %).
+- ФИЛТЪР 2: OFF / LP / HP / BP / BR, CUTOFF, RESO, след филтър 1 или успоредно.
+- ANALOG FEEL: малки случайни разлики на височина и cutoff на всяка нота.
+
+НОВО - таб MATRIX (на всеки звук): 8 връзки "източник -> цел", сила -100..+100 %, ±.
+  Източници: VELOCITY, NOTE, AFTERTOUCH, MOD WHEEL, BREATH, EXPRESSION, PEDAL, BEND,
+  LFO, FILTER ENV, AMP ENV, RANDOM. Цели: CUTOFF, RESONANCE, CUTOFF 2, LEVEL, PAN,
+  PITCH, LFO DEPTH, LFO RATE, PWM WIDTH, DRIVE, ATTACK, RELEASE.
+
+НОВО - вградени вълни: в избора на звук, най-отдолу (~ SAW, ~ SQUARE, ~ PULSE 25,
+  ~ TRIANGLE, ~ SINE, ~ SAW WARM) - чисти вълни за всяка октава, без алиасинг; свирят
+  се като всеки запис, с всички горни функции (PWM върху ~ SAW = Polysix).
+
+НОВО - ефект ENSEMBLE (стринг машина / Polysix): SPEED, DEPTH.
+
+Поправено: леярите вече се пазят и зареждат правилно в LIST / сетове (преди запазен
+сет можеше да носи записите на леярите в себе си).
+
+Всичко ново е изключено по подразбиране - старите бленди звучат непроменено.
+Сетове: версия 13 (старите се зареждат). Нула латенция. Тестове: testBuiltinWaves,
+testPwmSubUnisonDrive, testCharacterFilters, testModMatrix, testEnsembleFx,
+testSetV13RoundTrip + всички досегашни.
+
+ИНСТАЛИРАНЕ: качи съдържанието в корена на репото (замества silveton_pro_payload,
+.github/workflows/silveton-apk.yml, codemagic.yaml).

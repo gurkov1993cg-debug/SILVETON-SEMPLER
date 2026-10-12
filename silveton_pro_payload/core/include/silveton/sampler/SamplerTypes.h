@@ -20,6 +20,9 @@ constexpr int kMaxUpperControllerRoutes = 8;
 constexpr std::uint16_t kFixedSoundSlotCount = 500U;
 constexpr std::uint16_t kFixedCombiSlotCount = 500U;
 constexpr std::uint16_t kNoSoundSlot = 0U;
+// SILVETON_POLYSIX_V1: built-in single-cycle waves live at these SOUND slots (not in the bank).
+constexpr std::uint16_t kBuiltinWaveFirstSlot = 9001U;
+constexpr int kBuiltinWaveCount = 6;
 
 struct LoopRegion {
     bool enabled{false};
@@ -221,6 +224,43 @@ struct ToneExtra {
     float eqLowDb{0.0F};          // 3-band EQ of this sound (shelf 120 Hz / peak 1.2 kHz / shelf 7 kHz)
     float eqMidDb{0.0F};
     float eqHighDb{0.0F};
+    // SILVETON_POLYSIX_V1: synthesizer functions on the recording (a Polysix whose oscillator is the sample).
+    float pwmWidth{0.0F};         // 0 = off; 0.05..0.95 = the recording minus itself shifted by WIDTH x period (PWM)
+    float pwmDepth{0.0F};         // LFO movement of the width (0..0.45)
+    float pwmRateHz{0.5F};
+    float pwmMix{1.0F};           // how much of the shifted copy is subtracted (1 = full pulse)
+    float subLevel{0.0F};         // SUB: the same recording one/two octaves down, mixed in (0..1)
+    std::int8_t subOctave{1};     // 1 or 2
+    std::int8_t unisonVoices{1};  // 1..4 copies per note
+    float unisonDetuneCents{8.0F};
+    float unisonSpread{0.5F};     // stereo spread of the copies 0..1
+    float drive{0.0F};            // soft saturation before the filter 0..1
+    std::int8_t filterType{0};    // CUTOFF filter: 0 clean SVF, 1 POLYSIX 4-pole ladder, 2 KORG35 (MS-20)
+    float filterKeyTrack{0.0F};   // -1..1: cutoff follows the key (1 = fully)
+    std::int8_t filter2Type{0};   // second filter: 0 off, 1 LP, 2 HP, 3 BP, 4 BR (12 dB)
+    float filter2Hz{1000.0F};
+    float filter2Res{0.0F};
+    bool filter2Parallel{false};  // false = after filter 1 (series), true = beside it
+    bool analogFeel{false};       // tiny random detune / cutoff per note, like a real analog
+    // SILVETON_SYNTH_BYPASS_V1: true = the whole SYNTH + MATRIX section is skipped (sound exactly
+    // as before Polysix), knob settings kept. Switches without a click while playing.
+    bool synthBypass{false};
+};
+
+// SILVETON_POLYSIX_V1: modulation matrix of one sound - "everything to everything".
+enum class ModSource : std::uint8_t { Off, Velocity, Note, Aftertouch, ModWheel, Breath, Expression, Pedal, Bend, Lfo, FilterEnv, AmpEnv, Random };
+enum class ModTarget : std::uint8_t { Cutoff, Resonance, Cutoff2, Level, Pan, Pitch, LfoDepth, LfoRate, PwmWidth, Drive, Attack, Release };
+constexpr int kModSourceCount = 13;
+constexpr int kModTargetCount = 12;
+constexpr int kModRoutes = 8;
+struct ModRoute {
+    ModSource source{ModSource::Off};
+    ModTarget target{ModTarget::Cutoff};
+    float amount{0.0F};           // -1..1 of the target's full range
+    bool bipolar{false};          // unipolar source mapped to -1..1
+};
+struct ModMatrix {
+    std::array<ModRoute, kModRoutes> route{};
 };
 
 // Full TONE of one sound. The six legacy values keep their "-1 = PROGRAM" rule.
@@ -232,6 +272,7 @@ struct SoundTone {
     float cutoffHz{-1.0F};
     float resonance{-1.0F};
     ToneExtra x{};
+    ModMatrix mod{};              // SILVETON_POLYSIX_V1
 };
 
 // SILVETON_LAYERS_V1: one of the four extra layers of an Upper. A layer is a
@@ -333,6 +374,7 @@ struct UpperPart {
     float toneCutoffHz{-1.0F};
     float toneResonance{-1.0F};
     ToneExtra toneExtra{};                               // SILVETON_TONE_V2: rest of the basic sound's TONE
+    ModMatrix toneMod{};                                 // SILVETON_POLYSIX_V1: matrix of the basic sound
     std::array<UpperLayer, kUpperLayers> layers{};       // SILVETON_LAYERS_V1
     UpperEq eq{};                                        // SILVETON_EQ5_V1 (eqLow/Mid/HighDb above = bands 1/3/5)
     // SILVETON_PORTA_MODES_V1: KRONOS portamento (used when portaMode == Kronos)
@@ -365,9 +407,10 @@ enum class EffectType : std::uint8_t {
     Hall, Room, Chamber, Spring,                  // reverbs
     TapeDelay, PingPong, MultiTap, DuckDelay,     // delays
     Flanger, Phaser, Rotary,                      // modulation
-    Compressor, Drive                             // dynamics / colour (mostly as INSERT)
+    Compressor, Drive,                            // dynamics / colour (mostly as INSERT)
+    Ensemble                                      // SILVETON_POLYSIX_V1: the Polysix / string-machine ensemble
 };
-constexpr int kEffectTypeCount = 17;
+constexpr int kEffectTypeCount = 18;
 [[nodiscard]] constexpr bool effectIsReverb(EffectType t) noexcept {
     return t == EffectType::Reverb || t == EffectType::Hall || t == EffectType::Room ||
            t == EffectType::Chamber || t == EffectType::Spring;

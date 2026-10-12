@@ -19,6 +19,9 @@ class NativeSamplerEngine {
     external fun nativeFxParams(unit: Int): FloatArray
     // SILVETON_ANALYZER_V1: the last 8192 mono samples of an Upper (before or after its EQ); empty = none
     external fun nativeAnalyzerFrame(upper: Int, afterEq: Boolean): FloatArray
+    // SILVETON_POLYSIX_V1 (ids: see SamplerAudioBridge.cpp)
+    external fun nativeSetSoundSynthParam(upper: Int, sound: Int, id: Int, value: Float): Boolean
+    external fun nativeSoundSynthParams(upper: Int, sound: Int): FloatArray
     external fun nativeAudioOpen(): Boolean
     external fun nativeAudioStart(): Boolean
     external fun nativeAudioStop()

@@ -690,20 +690,7 @@ public:
 
         for (const auto& saved : preserved.combis) {
             Combi rebound = saved.combi;
-            for (auto& upper : rebound.uppers) {
-                if (upper.soundSlotId == kNoSoundSlot) continue;
-                if (upper.soundSlotId > kFixedSoundSlotCount) {
-                    upper.program.reset();
-                    upper.enabled = false;
-                    continue;
-                }
-                upper.program = library_.program(SlotAddress{0U, 0U, upper.soundSlotId});
-                if (upper.program != nullptr) {
-                    upper.name = upper.program->name;
-                } else {
-                    upper.enabled = false;
-                }
-            }
+            for (auto& upper : rebound.uppers) rebindUpper(upper);
             if (!library_.writeCombi(saved.address, rebound)) {
                 setTextError("Failed to restore COMBI after SILVETON bank load");
                 return false;
@@ -825,7 +812,7 @@ public:
         data.multisamples.clear();
         data.programs.clear();
         for (auto& slot : data.combis) {
-            for (auto& upper : slot.combi.uppers) upper.program.reset();
+            for (auto& upper : slot.combi.uppers) { upper.program.reset(); for (auto& l : upper.layers) l.program.reset(); }
         }
         const auto saved = SetPackage::save(path, data);
         if (!saved.success) { setTextError(saved.error); return false; }
@@ -840,18 +827,8 @@ public:
         for (const auto& saved : loaded.data.combis) {
             Combi rebound = saved.combi;
             for (auto& upper : rebound.uppers) {
-                if (upper.soundSlotId == kNoSoundSlot) {
-                    upper.program.reset();
-                    continue;
-                }
-                if (upper.soundSlotId > kFixedSoundSlotCount) {
-                    upper.program.reset();
-                    upper.enabled = false;
-                    continue;
-                }
-                upper.program = library_.program(SlotAddress{0U, 0U, upper.soundSlotId});
-                if (upper.program != nullptr) upper.name = upper.program->name;
-                else upper.enabled = false;
+                if (upper.soundSlotId == kNoSoundSlot) upper.program.reset();
+                rebindUpper(upper);
             }
             if (!library_.writeCombi(saved.address, rebound)) {
                 setTextError("Could not restore saved BLEND/COMBI");
@@ -1378,8 +1355,8 @@ public:
         if (upperIndex < 0 || upperIndex >= kUpperCount || layer < 0 || layer >= kUpperLayers) { setTextError("Invalid layer"); return false; }
         auto next = std::make_shared<EngineState>(state_ != nullptr ? *state_ : EngineState{});
         auto& l = next->combi.uppers[static_cast<std::size_t>(upperIndex)].layers[static_cast<std::size_t>(layer)];
-        if (slot <= 0 || slot > static_cast<int>(kFixedSoundSlotCount)) { l.program.reset(); l.soundSlotId = kNoSoundSlot; l.enabled = false; l.name.clear(); return installState(std::move(next)); }
-        auto program = library_.program(SlotAddress{0U, 0U, static_cast<std::uint16_t>(slot)});
+        if (slot <= 0 || slot > 65535 || !((slot <= static_cast<int>(kFixedSoundSlotCount)) || isBuiltinSlot(static_cast<std::uint16_t>(slot)))) { l.program.reset(); l.soundSlotId = kNoSoundSlot; l.enabled = false; l.name.clear(); return installState(std::move(next)); }
+        auto program = programForSlot(static_cast<std::uint16_t>(slot));
         if (program == nullptr) { setTextError("SOUND slot is empty"); return false; }
         l.program = program; l.soundSlotId = static_cast<std::uint16_t>(slot); l.name = program->name; l.enabled = true;
         return installState(std::move(next));
@@ -1457,6 +1434,72 @@ public:
         return out;
     }
 
+
+    // ---------------------------------------------------------------- SILVETON_POLYSIX_V1
+    // Synth functions of one sound (sound 0 = basic, 1..4 = layer). Ids:
+    //   0 pwmWidth 1 pwmDepth 2 pwmRateHz 3 pwmMix 4 subLevel 5 subOctave 6 unisonVoices 7 unisonDetuneCents
+    //   8 unisonSpread 9 drive 10 filterType 11 filterKeyTrack 12 filter2Type 13 filter2Hz 14 filter2Res
+    //   15 filter2Parallel 16 analogFeel 17 synthBypass (SILVETON_SYNTH_BYPASS_V1: 1 = SYNTH ИЗКЛ); 20 + route*4 + (0 source, 1 target, 2 amount, 3 bipolar), route 0..7
+    static constexpr int kSynthParamCount = 52;
+    static void applySynth(ToneExtra& x, ModMatrix& m, int id, float v) {
+        const auto i8 = [](float f, int lo, int hi) { return static_cast<std::int8_t>(std::clamp(static_cast<int>(std::lround(f)), lo, hi)); };
+        if (id >= 20) {
+            const int r = (id - 20) / 4, k = (id - 20) % 4;
+            if (r < 0 || r >= kModRoutes) return;
+            auto& route = m.route[static_cast<std::size_t>(r)];
+            switch (k) {
+                case 0: route.source = static_cast<ModSource>(std::clamp(static_cast<int>(std::lround(v)), 0, kModSourceCount - 1)); break;
+                case 1: route.target = static_cast<ModTarget>(std::clamp(static_cast<int>(std::lround(v)), 0, kModTargetCount - 1)); break;
+                case 2: route.amount = std::clamp(v, -1.0F, 1.0F); break;
+                default: route.bipolar = v >= 0.5F; break;
+            }
+            return;
+        }
+        switch (id) {
+            case 0: x.pwmWidth = v < 0.02F ? 0.0F : std::clamp(v, 0.02F, 0.98F); break;
+            case 1: x.pwmDepth = std::clamp(v, 0.0F, 0.45F); break;
+            case 2: x.pwmRateHz = std::clamp(v, 0.02F, 20.0F); break;
+            case 3: x.pwmMix = std::clamp(v, 0.0F, 1.0F); break;
+            case 4: x.subLevel = std::clamp(v, 0.0F, 1.0F); break;
+            case 5: x.subOctave = i8(v, 1, 2); break;
+            case 6: x.unisonVoices = i8(v, 1, 4); break;
+            case 7: x.unisonDetuneCents = std::clamp(v, 0.0F, 100.0F); break;
+            case 8: x.unisonSpread = std::clamp(v, 0.0F, 1.0F); break;
+            case 9: x.drive = std::clamp(v, 0.0F, 1.0F); break;
+            case 10: x.filterType = i8(v, 0, 2); break;
+            case 11: x.filterKeyTrack = std::clamp(v, -1.0F, 1.0F); break;
+            case 12: x.filter2Type = i8(v, 0, 4); break;
+            case 13: x.filter2Hz = std::clamp(v, 20.0F, 20000.0F); break;
+            case 14: x.filter2Res = std::clamp(v, 0.0F, 1.0F); break;
+            case 15: x.filter2Parallel = v >= 0.5F; break;
+            case 16: x.analogFeel = v >= 0.5F; break;
+            case 17: x.synthBypass = v >= 0.5F; break;
+            default: break;
+        }
+    }
+    static void readSynth(const ToneExtra& x, const ModMatrix& m, std::vector<float>& out) {
+        out.insert(out.end(), {x.pwmWidth, x.pwmDepth, x.pwmRateHz, x.pwmMix, x.subLevel, static_cast<float>(x.subOctave), static_cast<float>(x.unisonVoices), x.unisonDetuneCents,
+                               x.unisonSpread, x.drive, static_cast<float>(x.filterType), x.filterKeyTrack, static_cast<float>(x.filter2Type), x.filter2Hz, x.filter2Res,
+                               x.filter2Parallel ? 1.0F : 0.0F, x.analogFeel ? 1.0F : 0.0F, x.synthBypass ? 1.0F : 0.0F, 0.0F, 0.0F});
+        for (const auto& r : m.route) out.insert(out.end(), {static_cast<float>(r.source), static_cast<float>(r.target), r.amount, r.bipolar ? 1.0F : 0.0F});
+    }
+    bool setSoundSynthParam(int upperIndex, int sound, int id, float v) {
+        if (upperIndex < 0 || upperIndex >= kUpperCount || sound < 0 || sound > kUpperLayers || id < 0 || id >= kSynthParamCount || !std::isfinite(v)) { setTextError("Invalid synth parameter"); return false; }
+        auto next = std::make_shared<EngineState>(state_ != nullptr ? *state_ : EngineState{});
+        auto& u = next->combi.uppers[static_cast<std::size_t>(upperIndex)];
+        if (sound == 0) applySynth(u.toneExtra, u.toneMod, id, v);
+        else { auto& l = u.layers[static_cast<std::size_t>(sound - 1)]; applySynth(l.tone.x, l.tone.mod, id, v); }
+        return installState(std::move(next));
+    }
+    std::vector<float> soundSynthParams(int upperIndex, int sound) const {
+        std::vector<float> out;
+        if (upperIndex < 0 || upperIndex >= kUpperCount || sound < 0 || sound > kUpperLayers || state_ == nullptr) return out;
+        const auto& u = state_->combi.uppers[static_cast<std::size_t>(upperIndex)];
+        if (sound == 0) readSynth(u.toneExtra, u.toneMod, out);
+        else { const auto& l = u.layers[static_cast<std::size_t>(sound - 1)]; readSynth(l.tone.x, l.tone.mod, out); }
+        return out;
+    }
+
     std::vector<float> upperState(int upperIndex) const {
         std::vector<float> out;
         if (upperIndex < 0 || upperIndex >= kUpperCount || state_ == nullptr) return out;
@@ -1517,6 +1560,29 @@ public:
         return out;
     }
 
+    // SILVETON_POLYSIX_V1: a SOUND slot is a bank SOUND (1..500) or a built-in wave (9001..).
+    static bool isBuiltinSlot(std::uint16_t slot) noexcept {
+        return slot >= kBuiltinWaveFirstSlot && slot < kBuiltinWaveFirstSlot + static_cast<std::uint16_t>(kBuiltinWaveCount);
+    }
+    ProgramPtr programForSlot(std::uint16_t slot) const {
+        if (slot >= 1U && slot <= kFixedSoundSlotCount) return library_.program(SlotAddress{0U, 0U, slot});
+        if (isBuiltinSlot(slot)) return builtinWaveProgram(static_cast<int>(slot - kBuiltinWaveFirstSlot));
+        return nullptr;
+    }
+    // Binds every sound of an Upper (basic + layers) to the SOUND of its slot. Missing = off.
+    void rebindUpper(UpperPart& upper) const {
+        if (upper.soundSlotId != kNoSoundSlot) {
+            upper.program = programForSlot(upper.soundSlotId);
+            if (upper.program != nullptr) upper.name = upper.program->name; else if (!upper.hasAnySound()) upper.enabled = false;
+        }
+        for (auto& l : upper.layers) {
+            if (l.soundSlotId == kNoSoundSlot) { l.program.reset(); l.enabled = false; continue; }
+            l.program = programForSlot(l.soundSlotId);
+            if (l.program != nullptr) l.name = l.program->name; else l.enabled = false;
+        }
+        if (upper.program == nullptr && !upper.hasAnySound()) upper.enabled = false;
+    }
+
     std::vector<int> soundCatalogAddresses() const {
         std::vector<int> out;
         for (const auto& item : library_.programCatalog()) {
@@ -1524,12 +1590,14 @@ public:
             out.push_back(static_cast<int>(item.address.page));
             out.push_back(static_cast<int>(item.address.slot));
         }
+        for (int i = 0; i < kBuiltinWaveCount; ++i) { out.push_back(0); out.push_back(0); out.push_back(static_cast<int>(kBuiltinWaveFirstSlot) + i); }
         return out;
     }
 
     std::vector<std::string> soundCatalogNames() const {
         std::vector<std::string> out;
         for (const auto& item : library_.programCatalog()) out.push_back(item.name);
+        for (int i = 0; i < kBuiltinWaveCount; ++i) out.push_back(std::string("~ ") + builtinWaveName(i));   // built-in waves
         return out;
     }
 
@@ -1807,12 +1875,13 @@ public:
 
     bool activateProgram(const SlotAddress& address, int upperIndex) {
         if (upperIndex < 0 || upperIndex >= kUpperCount) { setTextError("Invalid Upper index"); return false; }
-        const auto program = library_.program(address);
+        const bool builtin = address.bank == 0U && address.page == 0U && isBuiltinSlot(address.slot);
+        const auto program = builtin ? programForSlot(address.slot) : library_.program(address);
         if (program == nullptr) { setTextError("PROGRAM slot is empty"); return false; }
         auto next = std::make_shared<EngineState>(state_ != nullptr ? *state_ : EngineState{});
         auto& upper = next->combi.uppers[static_cast<std::size_t>(upperIndex)];
         upper.program = program;
-        upper.soundSlotId = (address.bank == 0U && address.page == 0U && address.slot >= 1U && address.slot <= kFixedSoundSlotCount) ? address.slot : kNoSoundSlot;
+        upper.soundSlotId = (address.bank == 0U && address.page == 0U && ((address.slot >= 1U && address.slot <= kFixedSoundSlotCount) || builtin)) ? address.slot : kNoSoundSlot;
         upper.name = program->name; // visible name arrives 1:1 from SILVETON_BANK.sv
         upper.enabled = true;
         return installState(std::move(next));
@@ -1839,17 +1908,11 @@ public:
         // SILVETON_FX_TAIL_V1: a new BLEND -> the old effect rings out, no cut.
         next->combiGeneration = (state_ != nullptr ? state_->combiGeneration : 0U) + 1U;
         for (auto& upper : next->combi.uppers) {
-            if (upper.soundSlotId == kNoSoundSlot) continue;
-            if (upper.soundSlotId > kFixedSoundSlotCount) {
-                setTextError("COMBI references SOUND slot outside 1..500");
-                return false;
-            }
-            upper.program = library_.program(SlotAddress{0U, 0U, upper.soundSlotId});
-            if (upper.program == nullptr) {
+            rebindUpper(upper);   // SILVETON_LAYERS_V1 / SILVETON_POLYSIX_V1: basic sound, layers, built-in waves
+            if (upper.soundSlotId != kNoSoundSlot && upper.program == nullptr) {
                 setTextError("COMBI references an empty SOUND slot");
                 return false;
             }
-            upper.name = upper.program->name;
         }
         return installState(std::move(next));
     }
@@ -3289,6 +3352,8 @@ extern "C" JNIEXPORT jfloatArray JNICALL Java_com_silveton_sampler_NativeSampler
 extern "C" JNIEXPORT jstring JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeLayerName(JNIEnv* env,jobject,jint upper,jint layer){return env->NewStringUTF(sampler().layerName(upper,layer).c_str());}
 extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeSetFxParam(JNIEnv*,jobject,jint unit,jint id,jfloat value){return sampler().setFxParam(unit,id,value)?JNI_TRUE:JNI_FALSE;}
 extern "C" JNIEXPORT jfloatArray JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeFxParams(JNIEnv* env,jobject,jint unit){return floatVectorArray(env,sampler().fxParams(unit));}
+extern "C" JNIEXPORT jboolean JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeSetSoundSynthParam(JNIEnv*,jobject,jint upper,jint sound,jint id,jfloat value){return sampler().setSoundSynthParam(upper,sound,id,value)?JNI_TRUE:JNI_FALSE;}
+extern "C" JNIEXPORT jfloatArray JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeSoundSynthParams(JNIEnv* env,jobject,jint upper,jint sound){return floatVectorArray(env,sampler().soundSynthParams(upper,sound));}
 extern "C" JNIEXPORT jfloatArray JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeAnalyzerFrame(JNIEnv* env,jobject,jint upper,jboolean after){return floatVectorArray(env,sampler().analyzerFrame(upper,after==JNI_TRUE));}
 extern "C" JNIEXPORT jfloatArray JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeCombiFxState(JNIEnv* env,jobject){return floatVectorArray(env,sampler().combiFxState());}
 extern "C" JNIEXPORT void JNICALL Java_com_silveton_sampler_NativeSamplerEngine_nativeStartScan(JNIEnv*,jobject,jint mode){sampler().startScan(static_cast<int>(mode));}

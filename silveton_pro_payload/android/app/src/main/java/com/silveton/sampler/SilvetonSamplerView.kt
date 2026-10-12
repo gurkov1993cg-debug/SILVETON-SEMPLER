@@ -51,7 +51,7 @@ class SilvetonSamplerView(
     // SILVETON_LOOK_V2: relief keys everywhere (shadow, gradient face, light edge), glowing EQ curve.
     private enum class Page { LIST, COMBI, EFFECTS, SETTINGS }
     // SILVETON_GUI_V4: the Upper editor edits one sound (basic / L1..L4) or the common Upper settings.
-    private enum class UpperTab { TUNE, RANGE, CONTROL, TONE, FX, PORTA, EQ }
+    private enum class UpperTab { TUNE, RANGE, CONTROL, TONE, SYNTH, MATRIX, FX, PORTA, EQ }
     private enum class WriteTarget { LIST, BLEND }
     private enum class WriteMode { WRITE, COPY, MOVE }
 
@@ -71,6 +71,7 @@ class SilvetonSamplerView(
     private val layerNameCache = Array(7) { arrayOfNulls<String>(4) }
     private var fxUnitFocus = 0                  // EFFECTS page: 0..3 send slot, 4..10 INSERT of Upper 1..7
     private val fxParamsCache = arrayOfNulls<FloatArray>(11)
+    private val synthCache = Array(7) { arrayOfNulls<FloatArray>(5) }   // SILVETON_POLYSIX_V1
     private var eqBand = 2                       // EQ page: 0 HP, 1..5 band, 6 LP
     private var analyzerOn = true
     private var analyzerAfter = true
@@ -92,7 +93,12 @@ class SilvetonSamplerView(
     private fun lParams(u: Int, l: Int): FloatArray = layerParamsCache[u][l] ?: sampler.layerParams(u, l).also { layerParamsCache[u][l] = it }
     private fun lName(u: Int, l: Int): String = layerNameCache[u][l] ?: sampler.layerName(u, l).also { layerNameCache[u][l] = it }
     private fun fxP(unit: Int): FloatArray = fxParamsCache[unit] ?: sampler.fxParams(unit).also { fxParamsCache[unit] = it }
-    private fun dropParamCaches(u: Int) { upperParamsCache[u] = null; for (l in 0 until 4) { layerParamsCache[u][l] = null; layerNameCache[u][l] = null } }
+    private fun dropParamCaches(u: Int) { upperParamsCache[u] = null; for (l in 0 until 4) { layerParamsCache[u][l] = null; layerNameCache[u][l] = null }; for (k in 0 until 5) synthCache[u][k] = null }
+    private fun sParams(u: Int, sound: Int): FloatArray = synthCache[u][sound] ?: sampler.soundSynthParams(u, sound).also { synthCache[u][sound] = it }
+    private fun setSParam(u: Int, sound: Int, id: Int, v: Float) {
+        val a = sParams(u, sound).copyOf(); if (id < a.size) a[id] = v; synthCache[u][sound] = a
+        if (!sampler.setSoundSynthParam(u, sound, id, v)) synthCache[u][sound] = null
+    }
     private fun setUParam(u: Int, id: Int, v: Float) {
         val a = uParams(u).copyOf(); if (id < a.size) a[id] = v; upperParamsCache[u] = a
         if (!sampler.setUpperParam(u, id, v)) upperParamsCache[u] = null
@@ -115,7 +121,7 @@ class SilvetonSamplerView(
     private fun soundLabel(sound: Int) = when (sound) { 0 -> "ОСНОВЕН"; 5 -> "ОБЩО UPPER"; else -> "LAYER $sound" }
     private fun tabsFor(sound: Int): List<UpperTab> =
         if (sound == 5) listOf(UpperTab.PORTA, UpperTab.EQ, UpperTab.CONTROL, UpperTab.FX)
-        else listOf(UpperTab.TUNE, UpperTab.RANGE, UpperTab.TONE)
+        else listOf(UpperTab.TUNE, UpperTab.RANGE, UpperTab.TONE, UpperTab.SYNTH, UpperTab.MATRIX)
 
     // SILVETON_GUI_V3: a "-" / "+" pair; both pressed together = reset.
     private class PairHit(val a: RectF, val b: RectF, val reset: () -> Unit)
@@ -1016,6 +1022,8 @@ class SilvetonSamplerView(
             UpperTab.RANGE -> if (editSound == 0) drawRange(c, sec, s) else drawLayerRange(c, sec, u, editSound - 1)
             UpperTab.CONTROL -> drawControl(c, sec, s)
             UpperTab.TONE -> drawToneV2(c, sec, u, editSound)
+            UpperTab.SYNTH -> drawSynth(c, sec, u, editSound)
+            UpperTab.MATRIX -> drawMatrix(c, sec, u, editSound)
             UpperTab.FX -> drawUpperFx(c, sec, s)
             UpperTab.PORTA -> drawPorta(c, sec, s)
             UpperTab.EQ -> {}   // drawn full screen by drawCombi
@@ -1513,6 +1521,120 @@ class SilvetonSamplerView(
         hintLine(c, sec)
     }
 
+
+
+    // ---------------------------------------------------------------- SILVETON_POLYSIX_V1 pages
+    private val kModSources = listOf("OFF", "VELOCITY", "NOTE", "AFTERTOUCH", "MOD WHEEL", "BREATH", "EXPRESSION", "PEDAL", "BEND", "LFO", "FILTER ENV", "AMP ENV", "RANDOM")
+    private val kModTargets = listOf("CUTOFF", "RESONANCE", "CUTOFF 2", "LEVEL", "PAN", "PITCH", "LFO DEPTH", "LFO RATE", "PWM WIDTH", "DRIVE", "ATTACK", "RELEASE")
+
+    private fun drawSynth(c: Canvas, sec: RectF, u: Int, sound: Int) {
+        val p = sParams(u, sound)
+        if (p.size < 52) { text(c, "SYNTH – няма данни", sec.centerX(), sec.centerY(), 16f, C_KNOB_LABEL, center = true); return }
+        val unit = sec.width() / 12f
+        fun cx(k: Int) = sec.left + unit * (k + 0.5f)
+        val r1 = 572f; val r2 = 684f; val rad = 20f; val hw = unit - 4f
+        text(c, "SYNTH · ${soundLabel(sound)} · Polysix функции върху записа", sec.left + 6f, sec.top + 12f, 11f, C_SECTION_TITLE, spacing = 0.25f)
+        // SILVETON_SYNTH_BYPASS_V1: one key = SYNTH ВКЛ / ИЗКЛ (all of this page + MATRIX skipped, knobs kept)
+        run {
+            val byp = p[17] >= 0.5f
+            val br = RectF(sec.right - 150f, sec.top + 4f, sec.right - 6f, sec.top + 36f)
+            stripToggle(c, br, if (byp) "SYNTH ИЗКЛ" else "SYNTH ВКЛ", !byp, if (byp) C_AMBER else C_LCD_OK, size = 12f)
+            hit(br, { _, _ -> setSParam(u, sound, 17, if (byp) 0f else 1f) })
+            if (byp) text(c, "изключено – звучи като преди, настройките са запазени", sec.right - 158f, sec.top + 26f, 9f, C_AMBER, right = true)
+        }
+        fun pct(v: Float) = "${round(v * 100f).toInt()} %"
+        // row 1: PWM WIDTH DEPTH RATE MIX | SUB LEVEL | SUB OCT | UNISON | DETUNE | SPREAD | DRIVE | ANALOG
+        val w = p[0]
+        knobControl(c, cx(0), r1, rad, w, 0f, 0.98f, 0.01f, 260f, false, if (w < 0.02f) "OFF" else pct(w), "PWM WIDTH", hitW = hw,
+            onChange = { nv -> setSParam(u, sound, 0, if (nv < 0.02f) 0f else nv) }, exact = { showNumber("PWM WIDTH % (0 = OFF)", w * 100f, 0f, 98f, 0) { setSParam(u, sound, 0, it / 100f) } }, reset = { setSParam(u, sound, 0, 0f) })
+        knobControl(c, cx(1), r1, rad, p[1], 0f, 0.45f, 0.01f, 260f, false, pct(p[1] / 0.45f), "PWM DEPTH", hitW = hw,
+            onChange = { nv -> setSParam(u, sound, 1, nv) }, exact = { showNumber("PWM DEPTH %", p[1] / 0.45f * 100f, 0f, 100f, 0) { setSParam(u, sound, 1, it / 100f * 0.45f) } }, reset = { setSParam(u, sound, 1, 0f) })
+        knobControl(c, cx(2), r1, rad, p[2], 0.02f, 20f, 0.01f, 300f, false, "%.2f Hz".format(p[2]), "PWM RATE", hitW = hw,
+            onChange = { nv -> setSParam(u, sound, 2, nv) }, exact = { showNumber("PWM RATE Hz", p[2], 0.02f, 20f, 2) { setSParam(u, sound, 2, it) } }, reset = { setSParam(u, sound, 2, 0.5f) })
+        knobControl(c, cx(3), r1, rad, p[3], 0f, 1f, 0.01f, 250f, false, pct(p[3]), "PWM MIX", hitW = hw,
+            onChange = { nv -> setSParam(u, sound, 3, nv) }, exact = { showNumber("PWM MIX %", p[3] * 100f, 0f, 100f, 0) { setSParam(u, sound, 3, it / 100f) } }, reset = { setSParam(u, sound, 3, 1f) })
+        knobControl(c, cx(4), r1, rad, p[4], 0f, 1f, 0.01f, 250f, false, if (p[4] <= 0f) "OFF" else pct(p[4]), "SUB LEVEL", hitW = hw,
+            onChange = { nv -> setSParam(u, sound, 4, nv) }, exact = { showNumber("SUB LEVEL %", p[4] * 100f, 0f, 100f, 0) { setSParam(u, sound, 4, it / 100f) } }, reset = { setSParam(u, sound, 4, 0f) })
+        run {
+            val o1 = RectF(cx(5) - hw / 2f + 2f, r1 - 22f, cx(5) - 2f, r1 + 22f); val o2 = RectF(cx(5) + 2f, r1 - 22f, cx(5) + hw / 2f - 2f, r1 + 22f)
+            stripToggle(c, o1, "-1", p[5].toInt() == 1, C_AMBER, size = 12f); stripToggle(c, o2, "-2", p[5].toInt() == 2, C_AMBER, size = 12f)
+            hit(o1, { _, _ -> setSParam(u, sound, 5, 1f) }); hit(o2, { _, _ -> setSParam(u, sound, 5, 2f) })
+            text(c, "SUB ОКТАВА", cx(5), r1 + 56f, 9f, C_KNOB_LABEL, center = true, spacing = 0.15f)
+            val uw = (hw - 6f) / 4f
+            for (k in 1..4) { val ur = RectF(cx(6) - hw / 2f + 2f + (k - 1) * uw, r1 - 22f, cx(6) - hw / 2f + 2f + k * uw - 2f, r1 + 22f); stripToggle(c, ur, "$k", p[6].toInt() == k, C_AMBER, size = 12f); hit(ur, { _, _ -> setSParam(u, sound, 6, k.toFloat()) }) }
+            text(c, "UNISON ГЛАСОВЕ", cx(6), r1 + 56f, 9f, C_KNOB_LABEL, center = true, spacing = 0.15f)
+        }
+        knobControl(c, cx(7), r1, rad, p[7], 0f, 100f, 0.5f, 260f, false, "${round(p[7]).toInt()} c", "DETUNE", hitW = hw,
+            onChange = { nv -> setSParam(u, sound, 7, nv) }, exact = { showNumber("UNISON DETUNE (cents)", p[7], 0f, 100f, 0) { setSParam(u, sound, 7, it) } }, reset = { setSParam(u, sound, 7, 8f) })
+        knobControl(c, cx(8), r1, rad, p[8], 0f, 1f, 0.01f, 250f, false, pct(p[8]), "SPREAD", hitW = hw,
+            onChange = { nv -> setSParam(u, sound, 8, nv) }, exact = { showNumber("UNISON SPREAD %", p[8] * 100f, 0f, 100f, 0) { setSParam(u, sound, 8, it / 100f) } }, reset = { setSParam(u, sound, 8, 0.5f) })
+        knobControl(c, cx(9), r1, rad, p[9], 0f, 1f, 0.01f, 250f, false, if (p[9] <= 0f) "OFF" else pct(p[9]), "DRIVE", hitW = hw,
+            onChange = { nv -> setSParam(u, sound, 9, nv) }, exact = { showNumber("DRIVE %", p[9] * 100f, 0f, 100f, 0) { setSParam(u, sound, 9, it / 100f) } }, reset = { setSParam(u, sound, 9, 0f) })
+        run {
+            val ar = RectF(cx(10) - hw / 2f + 2f, r1 - 22f, cx(11) + hw / 2f - 2f, r1 + 22f)
+            stripToggle(c, ar, "ANALOG FEEL", p[16] >= 0.5f, C_AMBER, size = 11f); hit(ar, { _, _ -> setSParam(u, sound, 16, if (p[16] >= 0.5f) 0f else 1f) })
+            text(c, "малки случайни разлики на всяка нота", (cx(10) + cx(11)) / 2f, r1 + 56f, 9f, C_KNOB_LABEL, center = true)
+        }
+        // row 2: FILTER TYPE (3 keys over 3 cols) | KEY TRACK | F2 TYPE (5 keys over 3 cols) | F2 CUTOFF | F2 RESO | F2 ROUTE
+        run {
+            val names = listOf("ЧИСТ", "POLYSIX", "KORG35"); val fw = (3f * unit - 8f) / 3f
+            for (k in 0..2) { val fr = RectF(sec.left + 4f + k * fw, r2 - 22f, sec.left + 4f + (k + 1) * fw - 4f, r2 + 22f); stripToggle(c, fr, names[k], p[10].toInt() == k, C_AMBER, size = 12f); hit(fr, { _, _ -> setSParam(u, sound, 10, k.toFloat()) }) }
+            text(c, "ФИЛТЪР НА CUTOFF (характер)", cx(1), r2 + 56f, 9f, C_KNOB_LABEL, center = true, spacing = 0.15f)
+        }
+        knobControl(c, cx(3), r2, rad, p[11], -1f, 1f, 0.01f, 250f, true, pct(p[11]), "KEY TRACK", hitW = hw,
+            onChange = { nv -> setSParam(u, sound, 11, nv) }, exact = { showNumber("KEY TRACK % (cutoff следва клавиша)", p[11] * 100f, -100f, 100f, 0) { setSParam(u, sound, 11, it / 100f) } }, reset = { setSParam(u, sound, 11, 0f) })
+        run {
+            val names = listOf("OFF", "LP", "HP", "BP", "BR"); val fw = (3f * unit - 8f) / 5f
+            for (k in 0..4) { val fr = RectF(cx(4) - unit / 2f + 4f + k * fw, r2 - 22f, cx(4) - unit / 2f + 4f + (k + 1) * fw - 4f, r2 + 22f); stripToggle(c, fr, names[k], p[12].toInt() == k, C_AMBER, size = 12f); hit(fr, { _, _ -> setSParam(u, sound, 12, k.toFloat()) }) }
+            text(c, "ФИЛТЪР 2", cx(5), r2 + 56f, 9f, C_KNOB_LABEL, center = true, spacing = 0.15f)
+        }
+        val f2 = p[13]; val f2n = (kotlin.math.ln(f2.coerceIn(20f, 20000f) / 20f) / kotlin.math.ln(1000f))
+        knobControl(c, cx(7), r2, rad, f2n, 0f, 1f, 0.002f, 260f, false, if (f2 < 1000f) "${round(f2).toInt()} Hz" else "%.1f kHz".format(f2 / 1000f), "F2 CUTOFF", hitW = hw,
+            onChange = { nv -> setSParam(u, sound, 13, round(20f * Math.pow(1000.0, nv.toDouble()).toFloat())) }, exact = { showNumber("FILTER 2 CUTOFF Hz", f2, 20f, 20000f, 0) { setSParam(u, sound, 13, it) } }, reset = { setSParam(u, sound, 13, 1000f) })
+        knobControl(c, cx(8), r2, rad, p[14], 0f, 1f, 0.01f, 250f, false, pct(p[14]), "F2 RESO", hitW = hw,
+            onChange = { nv -> setSParam(u, sound, 14, nv) }, exact = { showNumber("FILTER 2 RESONANCE %", p[14] * 100f, 0f, 100f, 0) { setSParam(u, sound, 14, it / 100f) } }, reset = { setSParam(u, sound, 14, 0f) })
+        run {
+            val a = RectF(cx(9) - hw / 2f + 2f, r2 - 22f, cx(10) - 2f, r2 + 22f); val b = RectF(cx(10) + 2f, r2 - 22f, cx(11) + hw / 2f - 2f, r2 + 22f)
+            stripToggle(c, a, "СЛЕД Ф1", p[15] < 0.5f, C_AMBER, size = 11f); stripToggle(c, b, "УСПОРЕДНО", p[15] >= 0.5f, C_AMBER, size = 11f)
+            hit(a, { _, _ -> setSParam(u, sound, 15, 0f) }); hit(b, { _, _ -> setSParam(u, sound, 15, 1f) })
+            text(c, "ФИЛТЪР 2 – КЪДЕ", (cx(9) + cx(11)) / 2f, r2 + 56f, 9f, C_KNOB_LABEL, center = true, spacing = 0.15f)
+        }
+    }
+
+    private fun drawMatrix(c: Canvas, sec: RectF, u: Int, sound: Int) {
+        val p = sParams(u, sound)
+        if (p.size < 52) return
+        text(c, "МАТРИЦА · ${soundLabel(sound)} · всичко към всичко (8 връзки)", sec.left + 6f, sec.top + 12f, 11f, C_SECTION_TITLE, spacing = 0.25f)
+        if (p[17] >= 0.5f) text(c, "SYNTH ИЗКЛ – матрицата не действа", sec.right - 6f, sec.top + 12f, 10f, C_AMBER, right = true)   // SILVETON_SYNTH_BYPASS_V1
+        val colW = (sec.width() - 12f) / 2f
+        val rowH = 52f
+        for (r in 0 until 8) {
+            val col = r / 4; val row = r % 4
+            val x0 = sec.left + col * (colW + 12f); val y0 = sec.top + 24f + row * (rowH + 4f)
+            val base = 20 + r * 4
+            val src = p[base].toInt().coerceIn(0, kModSources.size - 1); val dst = p[base + 1].toInt().coerceIn(0, kModTargets.size - 1); val amt = p[base + 2]; val bip = p[base + 3] >= 0.5f
+            val on = src != 0 && amt != 0f
+            val sr = RectF(x0, y0, x0 + 150f, y0 + rowH - 6f)
+            stripToggle(c, sr, kModSources[src], on, C_AMBER, size = 11f)
+            hit(sr, { _, _ -> setSParam(u, sound, base, ((src + 1) % kModSources.size).toFloat()) }, { setSParam(u, sound, base, 0f) })
+            text(c, "→", x0 + 160f, y0 + 32f, 16f, C_KNOB_LABEL)
+            val tr = RectF(x0 + 178f, y0, x0 + 328f, y0 + rowH - 6f)
+            stripToggle(c, tr, kModTargets[dst], on, C_LCD_OK, size = 11f)
+            hit(tr, { _, _ -> setSParam(u, sound, base + 1, ((dst + 1) % kModTargets.size).toFloat()) }, { setSParam(u, sound, base + 1, 0f) })
+            // amount slider -100..+100
+            val tx0 = x0 + 340f; val tx1 = x0 + colW - 60f
+            fill(c, RectF(tx0, y0 + 20f, tx1, y0 + 28f), 4f, Color.rgb(16, 18, 16))
+            val mid = (tx0 + tx1) / 2f; val px = mid + (tx1 - tx0) / 2f * amt.coerceIn(-1f, 1f)
+            fill(c, RectF(min(mid, px), y0 + 20f, max(mid, px), y0 + 28f), 4f, if (amt >= 0f) C_AMBER else C_LCD_OK)
+            paint.color = Color.rgb(236, 238, 241); c.drawCircle(px, y0 + 24f, 12f, paint)
+            text(c, "${if (amt >= 0f) "+" else ""}${round(amt * 100f).toInt()} %", tx1 + 6f, y0 + 29f, 11f, C_AMBER, face = faceMono)
+            val onDrag = { x: Float -> setSParam(u, sound, base + 2, round(((x - mid) / ((tx1 - tx0) / 2f)).coerceIn(-1f, 1f) * 100f) / 100f) }
+            hit(RectF(tx0 - 8f, y0, tx1 + 8f, y0 + rowH - 6f), { x, _ -> onDrag(x) }, { setSParam(u, sound, base + 2, 0f) }, { x, _, _ -> onDrag(x) })
+            val br = RectF(x0 + colW - 48f, y0 + 6f, x0 + colW - 4f, y0 + rowH - 10f)
+            stripToggle(c, br, "±", bip, C_AMBER, size = 13f); hit(br, { _, _ -> setSParam(u, sound, base + 3, if (bip) 0f else 1f) })
+        }
+        text(c, "допир на източник/цел = следващ · двоен допир = OFF · ± = двупосочно (−1..+1 вместо 0..1)", sec.left + 6f, sec.bottom - 6f, 10f, C_HINT, maxWidth = sec.width() - 12f)
+    }
 
     // ---------------------------------------------------------------- SILVETON_EQ5_V1 page (finger design)
     private fun eqFreqX(hz: Float, x0: Float, x1: Float) = x0 + (x1 - x0) * (kotlin.math.log10(hz.coerceIn(20f, 20000f) / 20f) / 3f)
@@ -2435,6 +2557,7 @@ class SilvetonSamplerView(
             11 -> delay + listOf(FxKnob(5, "DUCKING", 0f, 1f, 0.01f, 0.6f, pct))
             2 -> listOf(wet, FxKnob(4, "RATE", 0.02f, 8f, 0.01f, 0.8f, hz, 2), FxKnob(5, "DEPTH", 0f, 1f, 0.01f, 0.35f, pct), FxKnob(6, "TONE", 0f, 1f, 0.01f, 0.5f, pct), FxKnob(14, "VOICES", 2f, 4f, 1f, 3f, { "${it.toInt()}" }))
             12 -> listOf(wet, FxKnob(4, "RATE", 0.02f, 8f, 0.01f, 0.3f, hz, 2), FxKnob(5, "DEPTH", 0f, 1f, 0.01f, 0.5f, pct), FxKnob(3, "FEEDBACK", -0.95f, 0.95f, 0.01f, 0.4f, pct))
+            17 -> listOf(wet, FxKnob(4, "SPEED", 0.1f, 2f, 0.01f, 0.6f, hz, 2), FxKnob(5, "DEPTH", 0f, 1f, 0.01f, 0.7f, pct))
             13 -> listOf(wet, FxKnob(4, "RATE", 0.02f, 8f, 0.01f, 0.4f, hz, 2), FxKnob(5, "DEPTH", 0f, 1f, 0.01f, 0.6f, pct), FxKnob(3, "FEEDBACK", 0f, 0.9f, 0.01f, 0.3f, pct), FxKnob(14, "STAGES", 4f, 8f, 2f, 6f, { "${it.toInt()}" }))
             14 -> listOf(wet, FxKnob(4, "SLOW Hz", 0.1f, 2f, 0.01f, 0.8f, hz, 2), FxKnob(14, "FAST Hz", 2f, 10f, 0.1f, 6.5f, hz, 1), FxKnob(5, "DEPTH", 0f, 1f, 0.01f, 0.6f, pct), FxKnob(15, "SPEED", 0f, 1f, 1f, 0f, { if (it >= 0.5f) "FAST" else "SLOW" }))
             15 -> listOf(FxKnob(14, "THRESHOLD", -60f, 0f, 0.5f, -20f, { "%.1f dB".format(it) }, 1), FxKnob(15, "RATIO", 1f, 20f, 0.1f, 4f, { "%.1f : 1".format(it) }, 1), FxKnob(2, "ATTACK", 0.1f, 300f, 0.1f, 10f, ms, 1), FxKnob(16, "RELEASE", 10f, 3000f, 1f, 120f, ms), FxKnob(6, "MAKE-UP", 0f, 24f, 0.1f, 0f, { "%.1f dB".format(it) }, 1))
@@ -2451,8 +2574,8 @@ class SilvetonSamplerView(
         val title = if (unit < 4) "FX${unit + 1}" else "INSERT U${unit - 3}"
         text(c, title, r.left + 22f, r.top + 42f, 24f, C_AMBER, face = faceMonoBold)
         // type keys: two rows of 9 (17 types)
-        val typeNames = listOf("OFF", "DIGITAL DLY", "CHORUS", "PLATE", "HALL", "ROOM", "CHAMBER", "SPRING", "TAPE DLY", "PING-PONG", "MULTI-TAP", "DUCK DLY", "FLANGER", "PHASER", "ROTARY", "COMP", "DRIVE")
-        val order = listOf(0, 4, 3, 5, 6, 7, 1, 8, 9, 10, 11, 2, 12, 13, 14, 15, 16)
+        val typeNames = listOf("OFF", "DIGITAL DLY", "CHORUS", "PLATE", "HALL", "ROOM", "CHAMBER", "SPRING", "TAPE DLY", "PING-PONG", "MULTI-TAP", "DUCK DLY", "FLANGER", "PHASER", "ROTARY", "COMP", "DRIVE", "ENSEMBLE")
+        val order = listOf(0, 4, 3, 5, 6, 7, 1, 8, 9, 10, 11, 2, 17, 12, 13, 14, 15, 16)
         val tx0 = r.left + 200f
         val tw = (r.right - 20f - tx0 - 8f * 6f) / 9f
         order.forEachIndexed { k, t ->
@@ -3638,7 +3761,7 @@ class SilvetonSamplerView(
     private fun effectName(t: Int) = when (t) {
         1 -> "DIGITAL DELAY"; 2 -> "CHORUS"; 3 -> "PLATE REVERB"; 4 -> "HALL"; 5 -> "ROOM"; 6 -> "CHAMBER"; 7 -> "SPRING"
         8 -> "TAPE DELAY"; 9 -> "PING-PONG"; 10 -> "MULTI-TAP"; 11 -> "DUCKING DELAY"; 12 -> "FLANGER"; 13 -> "PHASER"; 14 -> "ROTARY"
-        15 -> "COMPRESSOR"; 16 -> "DRIVE"; else -> "OFF"
+        15 -> "COMPRESSOR"; 16 -> "DRIVE"; 17 -> "ENSEMBLE"; else -> "OFF"
     }
     private fun panText(p: Float) = when { p < -0.02f -> "L${(-p * 100).toInt()}"; p > 0.02f -> "R${(p * 100).toInt()}"; else -> "C" }
     private fun noteName(key: Int): String {

@@ -1503,7 +1503,6 @@ struct Instrument {
     double outGain{0.14};           // a full stroke peaks about like a recording at full velocity
 };
 
-constexpr int kInstrumentCount = 4;   // 1 violin, 2 viola, 3 cello, 4 double bass (0 = none)
 inline Instrument instrumentFor(int index) noexcept {
     Instrument i;
     switch (index) {

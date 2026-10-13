@@ -1500,15 +1500,15 @@ struct Instrument {
     double bodyDry{-14.0};          // direct bridge force in the output, dB
     double frictionV0{0.085};       // width of the friction curve (how softly the hair lets go)
     double muStick{0.85}, muSlip{0.25};
-    double outGain{0.14};           // a full stroke peaks about like a recording at full velocity
+    double outGain{0.09};           // a full stroke peaks about like a recording at full velocity
 };
 
 inline Instrument instrumentFor(int index) noexcept {
     Instrument i;
     switch (index) {
-        case 2: i.name = "viola"; i.lowestHz = 125.0; i.bodyScale = 0.72; i.bridgeCutoffHz = 10000.0; break;
-        case 3: i.name = "cello"; i.lowestHz = 60.0; i.bodyScale = 0.38; i.bridgeCutoffHz = 8000.0; i.stringLoss = 0.998; i.fingerLoss = 0.996; break;
-        case 4: i.name = "double bass"; i.lowestHz = 38.0; i.bodyScale = 0.25; i.bridgeCutoffHz = 6500.0; i.stringLoss = 0.9985; i.fingerLoss = 0.997; i.bodyDry = -12.0; break;
+        case 2: i.name = "viola"; i.lowestHz = 125.0; i.bodyScale = 0.72; i.bridgeCutoffHz = 10000.0; i.outGain = 0.085; break;
+        case 3: i.name = "cello"; i.lowestHz = 60.0; i.bodyScale = 0.38; i.bridgeCutoffHz = 8000.0; i.stringLoss = 0.998; i.fingerLoss = 0.996; i.outGain = 0.05; break;
+        case 4: i.name = "double bass"; i.lowestHz = 38.0; i.bodyScale = 0.25; i.bridgeCutoffHz = 6500.0; i.stringLoss = 0.9985; i.fingerLoss = 0.997; i.bodyDry = -12.0; i.outGain = 0.045; break;
         default: break;
     }
     return i;
@@ -1660,8 +1660,8 @@ public:
         const double vBow = speed_ * (1.0 + 0.012 * noise_);
         const double f = friction(vBow - hairLp_, force_ * (1.0 + 0.02 * noise_));
         // ---- scattering at the bow (velocity waves, 2Z = 1)
-        nut_.write(static_cast<float>(clampd(vb + f, -8.0, 8.0)));
-        bridge_.write(static_cast<float>(clampd(vn + f, -8.0, 8.0)));
+        nut_.write(static_cast<float>(clampd(vb + f, -64.0, 64.0)));   // safety only: the real waves stay far below
+        bridge_.write(static_cast<float>(clampd(vn + f, -64.0, 64.0)));
         // ---- bridge force -> body
         const double bridgeForce = bridge_.read(std::max(2.0, (1.0 - b) * S - lpDelay_ * 0.5));
         lastForce_ = bridgeForce;
@@ -1671,7 +1671,9 @@ public:
         outLp_ += (out - outLp_) * outLpCoef_;
         const double y = outLp_ - dcX_ + 0.995 * dcY_; dcX_ = outLp_; dcY_ = y;
         level_ += (std::abs(y) - level_) * levelCoef_;
-        return static_cast<float>(y * inst_.outGain);
+        // the bridge force grows as the bow nears the bridge (slip velocity ~ 1/position): keep the
+        // instrument's loudness the same from tasto to ponticello, only the colour changes
+        return static_cast<float>(y * inst_.outGain * (b / 0.12));
     }
 
 private:

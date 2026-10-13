@@ -1515,8 +1515,8 @@ inline Instrument instrumentFor(int index) noexcept {
     Instrument i;
     switch (index) {
         case 2: i.name = "viola"; i.lowestHz = 125.0; i.bodyScale = 0.72; i.bridgeCutoffHz = 10000.0; i.outGain = 0.085; break;
-        case 3: i.name = "cello"; i.lowestHz = 60.0; i.bodyScale = 0.38; i.bridgeCutoffHz = 8000.0; i.stringLoss = 0.998; i.fingerLoss = 0.996; i.outGain = 0.05; break;
-        case 4: i.name = "double bass"; i.lowestHz = 38.0; i.bodyScale = 0.25; i.bridgeCutoffHz = 6500.0; i.stringLoss = 0.9985; i.fingerLoss = 0.997; i.bodyDry = -12.0; i.outGain = 0.045; break;
+        case 3: i.name = "cello"; i.lowestHz = 60.0; i.bodyScale = 0.38; i.bridgeCutoffHz = 8000.0; i.stringLoss = 0.998; i.fingerLoss = 0.996; i.outGain = 0.08; break;
+        case 4: i.name = "double bass"; i.lowestHz = 38.0; i.bodyScale = 0.25; i.bridgeCutoffHz = 6500.0; i.stringLoss = 0.9985; i.fingerLoss = 0.997; i.bodyDry = -12.0; i.outGain = 0.07; break;
         default: break;
     }
     return i;
@@ -1615,7 +1615,10 @@ public:
         // The bow sharpens the Helmholtz corner: more pressure and a faster bow = brighter,
         // a light slow bow = darker (flautando). Modelled as the loss filter at the bridge.
         const double bright = std::exp2((clampd(ctl_.brightness, 0.0, 1.0) - 0.5) * 2.0);   // 0.5..2
-        const double fc = inst_.bridgeCutoffHz * bright / ((0.55 + 1.3 * (1.0 - p)) * (0.7 + 0.6 * (1.0 - e)));
+        // the same character in every octave: the string's brightness follows the note (a low note is
+        // not allowed to carry many more harmonics than a high one)
+        const double noteBright = std::pow(clampd(noteHz_, 60.0, 2000.0) / 440.0, 1.0);
+        const double fc = inst_.bridgeCutoffHz * bright * noteBright / ((0.55 + 1.3 * (1.0 - p)) * (0.7 + 0.6 * (1.0 - e)));
         a_ = clampd(std::exp(-2.0 * kBowPi * fc / sr_), 0.02, 0.9);
         lpDelay_ = a_ / (1.0 - a_);
         gFinger_ = inst_.fingerLoss; gString_ = inst_.stringLoss;
@@ -1635,12 +1638,17 @@ public:
         hzStep_ = (hzEnd - hzStart) / std::max(1, frames);
         hairCoef_ = 1.0 - std::exp(-2.0 * kBowPi * kHairRel * hzEnd / sr_);
         levelCoef_ = 1.0 - std::exp(-dt / 0.05);
+        // below the instrument's lowest real note the body follows the note down
+        {
+            const double wantExtra = std::pow(clampd(hzEnd / inst_.lowestHz, 0.25, 1.0), 0.9);
+            if (std::abs(wantExtra - bodyExtra_) > 0.01 * bodyExtra_) setBodyScale(wantExtra);
+        }
         // A player evens the notes out by ear: where the body is loud the bow eases, where it is
         // weak it leans in. Most of the resonance unevenness goes, the colour of each note stays.
         // The string itself also gets a little quieter and rounder towards the top (less force up there
-        // keeps the motion clean): +0.3 dB per semitone above A4, at most +7 dB.
+        // keeps the motion clean): +0.15 dB per semitone above A4, at most +3 dB.
         const double semisUp = std::max(0.0, 12.0 * std::log2(hzEnd / 440.0));
-        const double tilt = std::pow(10.0, std::min(7.0, 0.3 * semisUp) / 20.0);
+        const double tilt = std::pow(10.0, std::min(3.0, 0.15 * semisUp) / 20.0);
         const double want = clampd(std::pow(loudRef_ / std::max(1e-9, noteLoudness(hzEnd)), 1.0) * tilt, 0.3, 3.5);
         compGain_ += (want - compGain_) * (1.0 - std::exp(-blockSec / 0.02));
     }
@@ -1694,7 +1702,7 @@ public:
 
 private:
     // calibrated on the regime maps: force band inside the Helmholtz region, bow-hair smoothing
-    static constexpr double kMin = 0.03, kMax = 0.22, kNoteAlpha = 0.8, kHairRel = 14.0;
+    static constexpr double kMin = 0.03, kMax = 0.22, kNoteAlpha = 0.4, kHairRel = 14.0;
 
     // Friction force (velocity units, 2Z = 1) for the relative velocity d = vBow - vh that the string
     // would have, and the bow force Fb. Exact Friedlander solution with the hyperbolic friction curve
@@ -1730,18 +1738,26 @@ private:
         return bodyMagnitude(hz) + 0.5 * bodyMagnitude(2.0 * hz) + 0.33 * bodyMagnitude(3.0 * hz) + 0.25 * bodyMagnitude(4.0 * hz);
     }
     void buildBody() noexcept {
+        setBodyScale(1.0);
+        // reference loudness = the average over the playing range, so the compensation only evens out
+        double acc = 0.0; int n = 0;
+        for (double hz = inst_.lowestHz * 1.2; hz < inst_.lowestHz * 12.0; hz *= 1.0595) { acc += std::log(std::max(1e-9, noteLoudness(hz))); ++n; }
+        loudRef_ = std::exp(acc / std::max(1, n));
+    }
+    // The body, scaled: 1 = the instrument as built. Below its lowest real note the body grows with
+    // the note (a bigger instrument), so a low octave played on the keyboard keeps the same full
+    // character as the upper ones instead of a thin buzz. No allocation; a few sin/cos per mode.
+    void setBodyScale(double extra) noexcept {
         // violin body: air mode A0, corpus modes B1-/B1+, the 1 kHz region, the bridge hill ~2.5 kHz
         static constexpr Mode kViolin[kModes] = {
             {275.0, 11.0, 0.0}, {405.0, 14.0, -6.0}, {462.0, 18.0, 2.0}, {545.0, 16.0, 3.0}, {660.0, 10.0, -3.0},
             {820.0, 9.0, -2.0}, {1010.0, 8.0, -2.0}, {1240.0, 9.0, -1.0}, {1520.0, 9.0, -3.0}, {1900.0, 9.0, -2.0},
             {2350.0, 6.0, 2.0}, {2900.0, 6.0, 1.0}, {3500.0, 8.0, -3.0}, {4400.0, 8.0, -7.0}};
-        for (int i = 0; i < kModes; ++i) { Mode s = kViolin[i]; s.freqHz *= inst_.bodyScale; body_[static_cast<std::size_t>(i)].set(sr_, s); }
+        const double sc = inst_.bodyScale * extra;
+        for (int i = 0; i < kModes; ++i) { Mode s = kViolin[i]; s.freqHz *= sc; body_[static_cast<std::size_t>(i)].set(sr_, s); }
         dry_ = std::pow(10.0, inst_.bodyDry / 20.0);
         outLpCoef_ = 1.0 - std::exp(-2.0 * kBowPi * std::min(sr_ * 0.4, 7000.0 * inst_.bodyScale * 1.4) / sr_);
-        // reference loudness = the average over the playing range, so the compensation only evens out
-        double acc = 0.0; int n = 0;
-        for (double hz = inst_.lowestHz * 1.2; hz < inst_.lowestHz * 12.0; hz *= 1.0595) { acc += std::log(std::max(1e-9, noteLoudness(hz))); ++n; }
-        loudRef_ = std::exp(acc / std::max(1, n));
+        bodyExtra_ = extra;
     }
 
     static constexpr int kModes = 14;
@@ -1751,7 +1767,7 @@ private:
     Controls ctl_{};
     DelayLine nut_, bridge_;
     std::array<Resonator, kModes> body_{};
-    double dry_{0.2}, outLpCoef_{0.5}, loudRef_{1.0}, compGain_{1.0};
+    double dry_{0.2}, outLpCoef_{0.5}, loudRef_{1.0}, compGain_{1.0}, bodyExtra_{1.0};
     // per-block values
     double speedTarget_{0.0}, speedCoef_{0.0}, forceCoef_{0.0}, biteDecay_{1.0}, biteAmount_{0.0}, dampStep_{0.0};
     double fMinPerSpeed_{0.0}, forceMul_{1.0}, a_{0.2}, lpDelay_{0.25}, gFinger_{0.99}, gString_{0.99};

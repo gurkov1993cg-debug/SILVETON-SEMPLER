@@ -23,6 +23,10 @@ constexpr std::uint16_t kNoSoundSlot = 0U;
 // SILVETON_POLYSIX_V1: built-in single-cycle waves live at these SOUND slots (not in the bank).
 constexpr std::uint16_t kBuiltinWaveFirstSlot = 9001U;
 constexpr int kBuiltinWaveCount = 6;
+// SILVETON_BOW_V1: the bowed instruments (physical model, no recording) live in slots 9101..9104:
+// 9101 violin, 9102 viola, 9103 cello, 9104 double bass.
+constexpr std::uint16_t kBowFirstSlot = 9101U;
+constexpr int kBowInstrumentCount = 4;
 
 struct LoopRegion {
     bool enabled{false};
@@ -165,6 +169,9 @@ struct Program {
     bool mono{false};
     bool legato{false};
     float portamentoSec{0.0F};
+    // SILVETON_BOW_V1: 0 = a recording (layers above); 1..4 = a bowed string model (violin, viola,
+    // cello, double bass) - such a Program has no layers, the sound is computed while playing.
+    std::uint8_t bowInstrument{0U};
 };
 
 using ProgramPtr = std::shared_ptr<const Program>;
@@ -245,6 +252,15 @@ struct ToneExtra {
     // SILVETON_SYNTH_BYPASS_V1: true = the whole SYNTH + MATRIX section is skipped (sound exactly
     // as before Polysix), knob settings kept. Switches without a click while playing.
     bool synthBypass{false};
+    // SILVETON_BOW_V1: the ЛЪК page of a bowed sound (ignored for recordings).
+    float bowPressure{0.5F};        // 0..1 bow pressure: 0 = flautando, 1 = edgy
+    float bowPosition{0.12F};       // 0.05..0.18 bow distance from the bridge (ponticello .. tasto)
+    float bowBrightness{0.5F};      // 0..1 string brightness, 0.5 = as built
+    float bowVibratoCents{20.0F};   // 0..100 vibrato depth (the modulation wheel adds on top)
+    float bowVibratoHz{5.5F};       // 3..9
+    float bowVibratoDelayMs{250.0F};// 0..2000 the vibrato starts this long after the note
+    float bowAttackMs{20.0F};       // 5..200 how fast the bow starts a stroke (short = bite)
+    float bowReleaseMs{60.0F};      // 10..500 how fast the bow lifts
 };
 
 // SILVETON_POLYSIX_V1: modulation matrix of one sound - "everything to everything".

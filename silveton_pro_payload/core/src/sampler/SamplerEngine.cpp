@@ -1422,6 +1422,319 @@ void RealtimeEventQueue::clear() noexcept {
     read_.store(write_.load(std::memory_order_acquire), std::memory_order_release);
 }
 
+// ---------------------------------------------------------------- SILVETON_BOW_V1 - the bowed string model
+// Behaviour model of a bowed string instrument (violin / viola / cello / double bass).
+// Original work, written from the public physics of the bowed string:
+//   * the string is a bidirectional digital waveguide (two delay lines, nut side and bridge side)
+//   * the bow is a stick/slip friction junction solved exactly every sample
+//     (Friedlander construction with the hyperbolic friction curve and the hysteresis rule)
+//   * the body is a bank of resonances (modal synthesis) fed by the bridge force
+// Calibrated on regime maps at 96 kHz: Helmholtz motion over the whole range of each instrument,
+// pitch within a few cents, a "bite" attack like a real stroke, Schelleng's playable force band.
+// prepare() allocates (control thread); everything else is realtime-safe.
+namespace bow {
+
+
+constexpr double kBowPi = 3.14159265358979323846;
+inline double clampd(double v, double lo, double hi) noexcept { return v < lo ? lo : (v > hi ? hi : v); }
+inline double midiToHz(double n) noexcept { return 440.0 * std::exp2((n - 69.0) / 12.0); }
+
+// ---------------------------------------------------------------- fractional delay line (4-point Lagrange)
+class DelayLine {
+public:
+    void prepare(int maxSamples) { buf_.assign(static_cast<std::size_t>(maxSamples + 8), 0.0F); size_ = static_cast<int>(buf_.size()); write_ = 0; }
+    void clear() noexcept { std::fill(buf_.begin(), buf_.end(), 0.0F); }
+    void write(float x) noexcept { buf_[static_cast<std::size_t>(write_)] = x; if (++write_ >= size_) write_ = 0; }
+    // the sample written `delay` samples ago (delay >= 2)
+    float read(double delay) const noexcept {
+        delay = clampd(delay, 2.0, static_cast<double>(size_ - 4));
+        double pos = static_cast<double>(write_) - delay;
+        if (pos < 0.0) pos += size_;
+        const int i = static_cast<int>(pos);
+        const double t = pos - i;
+        const float xm1 = at(i - 1), x0 = at(i), x1 = at(i + 1), x2 = at(i + 2);
+        const double wm1 = -t * (t - 1.0) * (t - 2.0) / 6.0;
+        const double w0 = (t + 1.0) * (t - 1.0) * (t - 2.0) / 2.0;
+        const double w1 = -(t + 1.0) * t * (t - 2.0) / 2.0;
+        const double w2 = (t + 1.0) * t * (t - 1.0) / 6.0;
+        return static_cast<float>(wm1 * xm1 + w0 * x0 + w1 * x1 + w2 * x2);
+    }
+    int capacity() const noexcept { return size_ - 8; }
+private:
+    float at(int i) const noexcept { if (i < 0) i += size_; else if (i >= size_) i -= size_; return buf_[static_cast<std::size_t>(i)]; }
+    std::vector<float> buf_;
+    int size_{0}, write_{0};
+};
+
+// ---------------------------------------------------------------- one resonance of the body
+struct Mode { double freqHz{440.0}, q{10.0}, gainDb{0.0}; };
+
+class Resonator {
+public:
+    void set(double sr, const Mode& m) noexcept {
+        const double w0 = 2.0 * kBowPi * clampd(m.freqHz, 20.0, sr * 0.45) / sr;
+        const double alpha = std::sin(w0) / (2.0 * m.q);
+        const double a0 = 1.0 + alpha;
+        b0_ = alpha / a0; a1_ = -2.0 * std::cos(w0) / a0; a2_ = (1.0 - alpha) / a0;
+        gain_ = std::pow(10.0, m.gainDb / 20.0);
+    }
+    double tick(double x) noexcept {
+        const double y = b0_ * (x - x2_) - a1_ * y1_ - a2_ * y2_;
+        x2_ = x1_; x1_ = x; y2_ = y1_; y1_ = y;
+        return gain_ * y;
+    }
+    void clear() noexcept { x1_ = x2_ = y1_ = y2_ = 0.0; }
+private:
+    double b0_{0}, a1_{0}, a2_{0}, gain_{1};
+    double x1_{0}, x2_{0}, y1_{0}, y2_{0};
+};
+
+// ---------------------------------------------------------------- instrument description
+struct Instrument {
+    const char* name{"violin"};
+    double lowestHz{190.0};         // for the delay line size
+    double bodyScale{1.0};          // violin = 1, viola ~0.72, cello ~0.38, bass ~0.25
+    double stringLoss{0.9965};      // gain per round trip at the bridge (string damping)
+    double fingerLoss{0.994};       // gain per round trip at the finger / nut
+    double bridgeCutoffHz{12000.0}; // loss filter of the bridge reflection (lower = darker string)
+    double bodyDry{-14.0};          // direct bridge force in the output, dB
+    double frictionV0{0.085};       // width of the friction curve (how softly the hair lets go)
+    double muStick{0.85}, muSlip{0.25};
+    double outGain{0.14};           // a full stroke peaks about like a recording at full velocity
+};
+
+constexpr int kInstrumentCount = 4;   // 1 violin, 2 viola, 3 cello, 4 double bass (0 = none)
+inline Instrument instrumentFor(int index) noexcept {
+    Instrument i;
+    switch (index) {
+        case 2: i.name = "viola"; i.lowestHz = 125.0; i.bodyScale = 0.72; i.bridgeCutoffHz = 10000.0; break;
+        case 3: i.name = "cello"; i.lowestHz = 60.0; i.bodyScale = 0.38; i.bridgeCutoffHz = 8000.0; i.stringLoss = 0.998; i.fingerLoss = 0.996; break;
+        case 4: i.name = "double bass"; i.lowestHz = 38.0; i.bodyScale = 0.25; i.bridgeCutoffHz = 6500.0; i.stringLoss = 0.9985; i.fingerLoss = 0.997; i.bodyDry = -12.0; break;
+        default: break;
+    }
+    return i;
+}
+constexpr double kLowestHzOfAll = 38.0;
+
+// ---------------------------------------------------------------- player controls (what the musician does)
+struct Controls {
+    double expression{0.6};     // 0..1  dynamics: bow speed (and a part of the pressure) - the main "breath"
+    double pressure{0.5};       // 0..1  bow pressure inside the playable band: 0 = flautando, 1 = edgy
+    double bowPosition{0.12};   // 0.05..0.18 distance bow-bridge as a fraction of the string (ponticello .. tasto)
+    double brightness{0.5};     // 0..1  string / bridge brightness (0.5 = the instrument as built)
+    double vibratoCents{20.0};  // depth (peak), 0 = none
+    double vibratoHz{5.5};
+    double vibratoDelaySec{0.25};
+    double vibratoFadeSec{0.35};
+    double glideSec{0.03};      // time of the pitch change on a legato note
+    double attackSec{0.02};     // how fast the bow reaches its speed on a new stroke (short = with a "bite")
+    double releaseSec{0.06};    // how fast the bow lifts
+    double bendSemis{0.0};      // live pitch offset (pitch bend)
+    double extraVibratoCents{0.0}; // added by the modulation wheel
+};
+
+// ---------------------------------------------------------------- the instrument
+class BowedString {
+public:
+    // Control thread: allocates the delay lines for the lowest note of any instrument.
+    void prepare(double sr) {
+        sr_ = sr;
+        const int maxLen = static_cast<int>(sr / kLowestHzOfAll) + 64;
+        nut_.prepare(maxLen); bridge_.prepare(maxLen);
+        setInstrument(1);
+        reset();
+    }
+    // Realtime-safe: no allocation.
+    void setInstrument(int index) noexcept {
+        instrumentIndex_ = index;
+        inst_ = instrumentFor(index);
+        buildBody();
+    }
+    int instrument() const noexcept { return instrumentIndex_; }
+    void reset() noexcept {
+        nut_.clear(); bridge_.clear(); lp_ = 0.0; slipping_ = true; speed_ = 0.0; force_ = 0.0;
+        noteHz_ = 440.0; baseHz_ = 440.0; hzStep_ = 0.0; glideFrom_ = glideTo_ = 69.0; glidePos_ = 1.0; vibPhase_ = 0.0; vibAmt_ = 0.0;
+        heldTime_ = 0.0; playing_ = false; noise_ = 0.0; damp_ = 0.0; bite_ = 0.0; hairLp_ = 0.0;
+        dcX_ = dcY_ = 0.0; outLp_ = 0.0; lastForce_ = 0.0; level_ = 0.0;
+        for (auto& r : body_) r.clear();
+    }
+    void setControls(const Controls& c) noexcept { ctl_ = c; ctl_.bowPosition = clampd(c.bowPosition, 0.05, 0.18); }
+    Controls& controls() noexcept { return ctl_; }
+    const Controls& controls() const noexcept { return ctl_; }
+
+    // legato = true: the bow keeps moving, the pitch glides to the new note (no new attack).
+    // fromNote >= 0 on a new stroke: start there and glide to `midi` (portamento on a re-struck note).
+    void noteOn(double midi, bool legato, double fromNote = -1.0) noexcept {
+        if (legato && playing_) {
+            glideFrom_ = currentNote(); glideTo_ = midi; glidePos_ = (ctl_.glideSec <= 0.0) ? 1.0 : 0.0;
+        } else {
+            if (fromNote >= 0.0 && ctl_.glideSec > 0.0) { glideFrom_ = fromNote; glideTo_ = midi; glidePos_ = 0.0; }
+            else { glideFrom_ = glideTo_ = midi; glidePos_ = 1.0; }
+            heldTime_ = 0.0; vibAmt_ = 0.0; vibPhase_ = 0.0;
+            if (!playing_) { slipping_ = true; speed_ = 0.0; }
+            bite_ = 1.0;
+        }
+        playing_ = true; damp_ = 0.0;
+    }
+    void noteOff() noexcept { playing_ = false; }
+    bool playing() const noexcept { return playing_; }
+    double currentNote() const noexcept { return glideFrom_ + (glideTo_ - glideFrom_) * glidePos_; }
+    double currentHz() const noexcept { return noteHz_; }
+    bool slipping() const noexcept { return slipping_; }
+    double lastBridgeForce() const noexcept { return lastForce_; }   // raw string signal before the body (tests)
+    // Output level follower (0..1-ish), to know when a lifted string has died away.
+    double level() const noexcept { return level_; }
+
+    // Control rate: once per block of `frames` samples. Everything the per-sample loop needs
+    // that does not have to change inside a block is computed here (no exp/pow per sample).
+    void block(int frames) noexcept {
+        const double dt = 1.0 / sr_;
+        const double blockSec = frames * dt;
+        const double e = clampd(ctl_.expression, 0.0, 1.0);
+        const double p = clampd(ctl_.pressure, 0.0, 1.0);
+        speedTarget_ = playing_ ? (0.10 + 0.90 * std::pow(e, 1.4)) : 0.0;
+        const double tau = playing_ ? std::max(0.002, ctl_.attackSec) : std::max(0.002, ctl_.releaseSec);
+        speedCoef_ = 1.0 - std::exp(-dt / tau);
+        forceCoef_ = 1.0 - std::exp(-dt / (tau * 0.7));
+        biteDecay_ = std::exp(-dt / 0.06);
+        biteAmount_ = 4.0 * clampd(1.0 - (ctl_.attackSec - 0.015) / 0.12, 0.0, 1.0);
+        dampStep_ = playing_ ? 0.0 : dt / 0.08;
+        // Schelleng: the playable force band scales with bow speed and position (min ~ v/b^2, max ~ v/b);
+        // long strings want more force. Evaluated with the speed at the start of the block.
+        const double b = ctl_.bowPosition;
+        const double noteScale = std::pow(440.0 / std::max(20.0, noteHz_), kNoteAlpha);
+        fMinPerSpeed_ = kMin * noteScale / (b * b);
+        forceMul_ = std::pow(std::max(1.0, (kMax * noteScale / b) / fMinPerSpeed_), p) * (0.75 + 0.5 * e);
+        // The bow sharpens the Helmholtz corner: more pressure and a faster bow = brighter,
+        // a light slow bow = darker (flautando). Modelled as the loss filter at the bridge.
+        const double bright = std::exp2((clampd(ctl_.brightness, 0.0, 1.0) - 0.5) * 2.0);   // 0.5..2
+        const double fc = inst_.bridgeCutoffHz * bright / ((0.55 + 1.3 * (1.0 - p)) * (0.7 + 0.6 * (1.0 - e)));
+        a_ = clampd(std::exp(-2.0 * kBowPi * fc / sr_), 0.02, 0.9);
+        lpDelay_ = a_ / (1.0 - a_);
+        gFinger_ = inst_.fingerLoss; gString_ = inst_.stringLoss;
+        // vibrato amount of this block (delay, fade)
+        if (ctl_.vibratoCents + ctl_.extraVibratoCents > 0.0 && playing_) {
+            const double want = clampd((heldTime_ - ctl_.vibratoDelaySec) / std::max(0.01, ctl_.vibratoFadeSec), 0.0, 1.0);
+            vibAmt_ += (want - vibAmt_) * (1.0 - std::exp(-blockSec / 0.04));
+        } else vibAmt_ *= std::exp(-blockSec / 0.04);
+        vibInc_ = ctl_.vibratoHz * dt;
+        vibDepth_ = (clampd(ctl_.vibratoCents, 0.0, 200.0) + clampd(ctl_.extraVibratoCents, 0.0, 200.0)) * vibAmt_;
+        // pitch: the glide moves per block, the frequency is interpolated sample by sample inside it
+        heldTime_ += blockSec;
+        const double hzStart = midiToHz(currentNote() + ctl_.bendSemis);
+        if (glidePos_ < 1.0) glidePos_ = std::min(1.0, glidePos_ + blockSec / std::max(blockSec, ctl_.glideSec));
+        const double hzEnd = midiToHz(currentNote() + ctl_.bendSemis);
+        baseHz_ = hzStart;
+        hzStep_ = (hzEnd - hzStart) / std::max(1, frames);
+        hairCoef_ = 1.0 - std::exp(-2.0 * kBowPi * kHairRel * hzEnd / sr_);
+        levelCoef_ = 1.0 - std::exp(-dt / 0.05);
+    }
+
+    float render() noexcept {
+        // ---- the bow this sample (speed, force)
+        speed_ += (speedTarget_ - speed_) * speedCoef_;
+        const double fMin = fMinPerSpeed_ * speed_;
+        const double forceTarget = playing_ ? fMin * forceMul_ * (1.0 + biteAmount_ * bite_) : 0.0;
+        force_ += (forceTarget - force_) * forceCoef_;
+        bite_ *= biteDecay_;
+        if (dampStep_ > 0.0) damp_ = std::min(1.0, damp_ + dampStep_);
+        // ---- pitch: vibrato on top of the (per-block) glide
+        vibPhase_ += vibInc_; if (vibPhase_ >= 1.0) vibPhase_ -= 1.0;
+        const double vib = vibDepth_ * std::sin(2.0 * kBowPi * vibPhase_);
+        baseHz_ += hzStep_;
+        noteHz_ = baseHz_ * std::exp2(vib / 1200.0);
+        // ---- string geometry in samples: one-way length S, round trips on both sides of the bow
+        const double S = sr_ / (2.0 * noteHz_);
+        const double b = ctl_.bowPosition;
+        double dn = 2.0 * b * S;
+        double db = 2.0 * (1.0 - b) * S - lpDelay_;
+        if (dn < 2.5) { db -= (2.5 - dn); dn = 2.5; }
+        // ---- waves arriving at the bow from both sides
+        const double vn = -gFinger_ * (1.0 - 0.12 * damp_) * nut_.read(dn);
+        const double raw = -gString_ * (1.0 - 0.03 * damp_) * bridge_.read(db);
+        lp_ += (raw - lp_) * (1.0 - a_);
+        const double vb = lp_;
+        const double vh = vn + vb;                                  // string velocity at the bow if no bow force
+        // ---- the bow: hair roughness as a little noise on the speed; the hair is wide and springy
+        noise_ += (white() - noise_) * 0.15;
+        hairLp_ += (vh - hairLp_) * hairCoef_;
+        const double vBow = speed_ * (1.0 + 0.012 * noise_);
+        const double f = friction(vBow - hairLp_, force_ * (1.0 + 0.02 * noise_));
+        // ---- scattering at the bow (velocity waves, 2Z = 1)
+        nut_.write(static_cast<float>(clampd(vb + f, -8.0, 8.0)));
+        bridge_.write(static_cast<float>(clampd(vn + f, -8.0, 8.0)));
+        // ---- bridge force -> body
+        const double bridgeForce = bridge_.read(std::max(2.0, (1.0 - b) * S - lpDelay_ * 0.5));
+        lastForce_ = bridgeForce;
+        double out = bridgeForce * dry_;
+        for (auto& r : body_) out += r.tick(bridgeForce);
+        // gentle roll-off above the bridge hill, DC block
+        outLp_ += (out - outLp_) * outLpCoef_;
+        const double y = outLp_ - dcX_ + 0.995 * dcY_; dcX_ = outLp_; dcY_ = y;
+        level_ += (std::abs(y) - level_) * levelCoef_;
+        return static_cast<float>(y * inst_.outGain);
+    }
+
+private:
+    // calibrated on the regime maps: force band inside the Helmholtz region, bow-hair smoothing
+    static constexpr double kMin = 0.03, kMax = 0.22, kNoteAlpha = 0.8, kHairRel = 14.0;
+
+    // Friction force (velocity units, 2Z = 1) for the relative velocity d = vBow - vh that the string
+    // would have, and the bow force Fb. Exact Friedlander solution with the hyperbolic friction curve
+    //   mu(v) = muD + (muS - muD) * v0 / (v0 + |v|)
+    // and the hysteresis rule: once slipping, stay on the slipping branch until it disappears.
+    double friction(double d, double Fb) noexcept {
+        const double muS = inst_.muStick, muD = inst_.muSlip, v0 = inst_.frictionV0;
+        if (Fb <= 1e-9) { slipping_ = true; return 0.0; }
+        const double ad = std::abs(d), s = d < 0.0 ? -1.0 : 1.0;
+        const double stickMax = Fb * muS;
+        if (!slipping_ && ad <= stickMax) return d;                 // sticking: the string follows the bow
+        // slipping: x = |relative velocity| solves  x^2 + (v0 + Fb*muD - ad) x + v0 (Fb*muS - ad) = 0
+        const double bq = v0 + Fb * muD - ad;
+        const double cq = v0 * (stickMax - ad);
+        const double disc = bq * bq - 4.0 * cq;
+        if (disc >= 0.0) {
+            const double x = (-bq + std::sqrt(disc)) * 0.5;         // the outer (stable) slipping solution
+            if (x > 0.0) { slipping_ = true; return s * (ad - x); }
+        }
+        slipping_ = false;                                          // no slipping solution: the string sticks
+        return s * std::min(ad, stickMax);
+    }
+    double white() noexcept { seed_ ^= seed_ << 13; seed_ ^= seed_ >> 17; seed_ ^= seed_ << 5; return static_cast<double>(seed_) * (2.0 / 4294967295.0) - 1.0; }
+    void buildBody() noexcept {
+        // violin body: air mode A0, corpus modes B1-/B1+, the 1 kHz region, the bridge hill ~2.5 kHz
+        static constexpr Mode kViolin[kModes] = {
+            {275.0, 11.0, 0.0}, {405.0, 14.0, -6.0}, {462.0, 18.0, 2.0}, {545.0, 16.0, 3.0}, {660.0, 10.0, -3.0},
+            {820.0, 9.0, -2.0}, {1010.0, 8.0, -2.0}, {1240.0, 9.0, -1.0}, {1520.0, 9.0, -3.0}, {1900.0, 9.0, -2.0},
+            {2350.0, 6.0, 2.0}, {2900.0, 6.0, 1.0}, {3500.0, 8.0, -3.0}, {4400.0, 8.0, -7.0}};
+        for (int i = 0; i < kModes; ++i) { Mode s = kViolin[i]; s.freqHz *= inst_.bodyScale; body_[static_cast<std::size_t>(i)].set(sr_, s); }
+        dry_ = std::pow(10.0, inst_.bodyDry / 20.0);
+        outLpCoef_ = 1.0 - std::exp(-2.0 * kBowPi * std::min(sr_ * 0.4, 7000.0 * inst_.bodyScale * 1.4) / sr_);
+    }
+
+    static constexpr int kModes = 14;
+    double sr_{48000.0};
+    int instrumentIndex_{1};
+    Instrument inst_{};
+    Controls ctl_{};
+    DelayLine nut_, bridge_;
+    std::array<Resonator, kModes> body_{};
+    double dry_{0.2}, outLpCoef_{0.5};
+    // per-block values
+    double speedTarget_{0.0}, speedCoef_{0.0}, forceCoef_{0.0}, biteDecay_{1.0}, biteAmount_{0.0}, dampStep_{0.0};
+    double fMinPerSpeed_{0.0}, forceMul_{1.0}, a_{0.2}, lpDelay_{0.25}, gFinger_{0.99}, gString_{0.99};
+    double vibInc_{0.0}, vibDepth_{0.0}, baseHz_{440.0}, hairCoef_{1.0}, levelCoef_{0.0};
+    // state
+    double lp_{0.0}, speed_{0.0}, force_{0.0}, noise_{0.0}, damp_{0.0}, bite_{0.0}, hairLp_{0.0};
+    double noteHz_{440.0}, hzStep_{0.0}, glideFrom_{69.0}, glideTo_{69.0}, glidePos_{1.0};
+    double vibPhase_{0.0}, vibAmt_{0.0}, heldTime_{0.0};
+    double dcX_{0.0}, dcY_{0.0}, outLp_{0.0}, lastForce_{0.0}, level_{0.0};
+    bool slipping_{true}, playing_{false};
+    std::uint32_t seed_{0x2545F491u};
+};
+
+} // namespace bow
+
 struct SamplerEngine::Impl {
     struct ChannelState {
         float expression{1.0F};
@@ -1532,6 +1845,24 @@ struct SamplerEngine::Impl {
         StateVariableFilter filter{};
     };
 
+    // SILVETON_BOW_V1: one bowed string per sound slot (basic sound or layer) of every Upper.
+    // Monophonic with legato like the real instrument: held keys form a stack, a new key glides
+    // (no new attack), letting the top key go glides back to the key still held.
+    struct BowVoice {
+        bow::BowedString string;
+        std::array<std::uint8_t, 16U> keys{};
+        std::array<std::uint8_t, 16U> vels{};
+        std::uint8_t count{0U};
+        bool active{false};
+        bool sustained{false};       // all keys up, damper pedal holds the bow on the string
+        std::uint8_t channel{0U};
+        double lastNote{-1.0};       // the note last played on this string (portamento from it)
+        float velNorm{0.8F};
+        float mixL{0.0F}, mixR{0.0F};
+        std::uint32_t quietFrames{0U};
+    };
+    std::array<std::array<BowVoice, kSoundsPerUpper>, kUpperCount> bows{};
+
     double sampleRate{48000.0};
     std::uint32_t maxBlock{512U};
     // 128 playable voices + spare tail slots for 4 ms takeover fades.
@@ -1634,6 +1965,7 @@ struct SamplerEngine::Impl {
         for (auto& m : mono) m = MonoKeys{};
         monoWas.fill(false);
         for (auto& v : voices) v = Voice{};
+        for (auto& row : bows) for (auto& b : row) { b.string.reset(); b.count = 0U; b.active = false; b.sustained = false; b.lastNote = -1.0; b.mixL = b.mixR = 0.0F; b.quietFrames = 0U; }
         lowEq.reset(); midEq.reset(); highEq.reset();
         for (auto& e : upperEq) e.reset();
         for (auto& row : soundBus) for (auto& b : row) b.reset();
@@ -1648,6 +1980,7 @@ struct SamplerEngine::Impl {
     void prepareFx(double sr) {
         for (auto& pair : sendFx) for (auto& u : pair) u.prepare(sr, 2.6);
         for (auto& u : insertFx) u.prepare(sr, 1.1);
+        for (auto& row : bows) for (auto& b : row) b.string.prepare(sr);   // SILVETON_BOW_V1
     }
 };
 
@@ -1741,6 +2074,36 @@ ProgramPtr builtinWaveProgram(int index) {
     layer.multisample = ms;
     layer.ampEnvelope = EnvelopeParams{0.003F, 0.05F, 1.0F, 0.08F};
     prog->layers.push_back(layer);
+    slot = prog;
+    return slot;
+}
+
+// ---------------------------------------------------------------- SILVETON_BOW_V1
+// The bowed instruments: a Program without recordings, the sound is the string model.
+namespace {
+constexpr std::array<const char*, kBowInstrumentCount> kBowNames{{"ЛЪК ЦИГУЛКА", "ЛЪК ВИОЛА", "ЛЪК ЧЕЛО", "ЛЪК КОНТРАБАС"}};
+}
+
+const char* bowInstrumentName(int index) noexcept {
+    return (index >= 0 && index < kBowInstrumentCount) ? kBowNames[static_cast<std::size_t>(index)] : "";
+}
+
+bool bowSoundSlot(std::uint16_t slot) noexcept {
+    return slot >= kBowFirstSlot && slot < kBowFirstSlot + static_cast<std::uint16_t>(kBowInstrumentCount);
+}
+
+ProgramPtr bowInstrumentProgram(int index) {
+    if (index < 0 || index >= kBowInstrumentCount) return nullptr;
+    static std::array<ProgramPtr, kBowInstrumentCount> cache{};
+    static std::mutex cacheMutex;
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    auto& slot = cache[static_cast<std::size_t>(index)];
+    if (slot != nullptr) return slot;
+    auto prog = std::make_shared<Program>();
+    prog->name = kBowNames[static_cast<std::size_t>(index)];
+    prog->bowInstrument = static_cast<std::uint8_t>(index + 1);
+    prog->mono = true;
+    prog->legato = true;
     slot = prog;
     return slot;
 }
@@ -2698,6 +3061,122 @@ void playPortamentoNote(SamplerEngine::Impl& impl, const std::shared_ptr<const E
     for (auto& v : impl.voices) if (v.upperIndex == ui) v.legatoKeep = false;
 }
 
+// ---------------------------------------------------------------- SILVETON_BOW_V1 note handling
+constexpr double kBowSlurSec = 0.03;        // legato without portamento: a quick finger shift
+
+int bowInstrumentOf(const UpperPart& u, int soundIndex) noexcept {
+    const Program* p = soundProgramOf(u, soundIndex);
+    return p != nullptr ? static_cast<int>(p->bowInstrument) : 0;
+}
+
+bow::Controls bowControlsFor(const ToneExtra& x) noexcept {
+    bow::Controls c;
+    c.pressure = std::clamp(static_cast<double>(x.bowPressure), 0.0, 1.0);
+    c.bowPosition = std::clamp(static_cast<double>(x.bowPosition), 0.05, 0.18);
+    c.brightness = std::clamp(static_cast<double>(x.bowBrightness), 0.0, 1.0);
+    c.vibratoCents = std::clamp(static_cast<double>(x.bowVibratoCents), 0.0, 100.0);
+    c.vibratoHz = std::clamp(static_cast<double>(x.bowVibratoHz), 3.0, 9.0);
+    c.vibratoDelaySec = std::clamp(static_cast<double>(x.bowVibratoDelayMs), 0.0, 2000.0) * 0.001;
+    c.attackSec = std::clamp(static_cast<double>(x.bowAttackMs), 5.0, 200.0) * 0.001;
+    c.releaseSec = std::clamp(static_cast<double>(x.bowReleaseMs), 10.0, 500.0) * 0.001;
+    return c;
+}
+
+// The note (fractional MIDI) this key plays on the bowed sound: OCTAVE / TRANSPOSE / FINE / MASTER TUNE / SCALE.
+double bowNoteFor(const SamplerEngine::Impl& impl, const UpperPart& upper, const GlobalState& global, int ui, std::uint8_t key, const UpperLayer* ul) noexcept {
+    const bool scaleOn = ((impl.scaleUppers.load(std::memory_order_relaxed) >> ui) & 1) != 0;
+    return static_cast<double>(playKeyFor(upper, global, key, ul)) + liveTuneSemis(upper, global, key, scaleOn, ul);
+}
+
+// PORTA page of the Upper decides the glide of a legato note; without portamento a quick slur.
+double bowGlideSec(const SamplerEngine::Impl& impl, const UpperPart& upper, double fromNote, double toNote, int ui) noexcept {
+    if (portamentoSecFor(upper) <= 0.0F) return kBowSlurSec;
+    return std::max(static_cast<double>(glideSecFor(impl, upper, fromNote, toNote, ui)), 0.005);
+}
+
+void bowNoteOn(SamplerEngine::Impl& impl, const EngineState& state, int ui, const UpperPart& upper,
+               std::uint8_t channel, std::uint8_t key, std::uint8_t vel) noexcept {
+    for (int s = 0; s < kSoundsPerUpper; ++s) {
+        const int inst = bowInstrumentOf(upper, s);
+        if (inst == 0) continue;
+        const UpperLayer* ul = layerOf(upper, s);
+        if (ul != nullptr && !ul->matches(key, vel)) continue;
+        auto& b = impl.bows[static_cast<std::size_t>(ui)][static_cast<std::size_t>(s)];
+        if (!b.active) { b.string.reset(); b.count = 0U; b.sustained = false; }
+        if (b.string.instrument() != inst) b.string.setInstrument(inst);
+        const double note = bowNoteFor(impl, upper, state.global, ui, key, ul);
+        const bool legato = b.active && b.string.playing() && (b.count > 0U || b.sustained);
+        // held-key stack (no duplicates, newest on top)
+        for (std::size_t i = 0; i < b.count; ++i) if (b.keys[i] == key) { for (std::size_t j = i + 1U; j < b.count; ++j) { b.keys[j - 1U] = b.keys[j]; b.vels[j - 1U] = b.vels[j]; } --b.count; break; }
+        if (b.count >= b.keys.size()) { for (std::size_t j = 1U; j < b.count; ++j) { b.keys[j - 1U] = b.keys[j]; b.vels[j - 1U] = b.vels[j]; } --b.count; }
+        b.keys[b.count] = key; b.vels[b.count] = vel; ++b.count;
+        b.channel = channel;
+        b.velNorm = static_cast<float>(vel) * kInv127;
+        bow::Controls c = bowControlsFor(ul != nullptr ? ul->tone.x : upper.toneExtra);
+        double fromNote = -1.0;
+        if (legato) {
+            c.glideSec = bowGlideSec(impl, upper, b.string.currentNote(), note, ui);
+        } else if (portamentoSecFor(upper) > 0.0F && b.lastNote >= 0.0 &&
+                   (upper.portaMode == PortamentoMode::Silveton || !upper.portaFingered)) {
+            // a new stroke with portamento ON glides from the key played before (as the processor does)
+            fromNote = b.lastNote;
+            c.glideSec = bowGlideSec(impl, upper, fromNote, note, ui);
+        } else {
+            c.glideSec = 0.0;
+        }
+        b.string.setControls(c);
+        b.string.noteOn(note, legato, fromNote);
+        b.lastNote = note;
+        b.active = true;
+        b.sustained = false;
+        b.quietFrames = 0U;
+    }
+}
+
+void bowNoteOff(SamplerEngine::Impl& impl, const EngineState& state, int ui, const UpperPart& upper,
+                std::uint8_t channel, std::uint8_t key, bool sustainDown) noexcept {
+    for (int s = 0; s < kSoundsPerUpper; ++s) {
+        auto& b = impl.bows[static_cast<std::size_t>(ui)][static_cast<std::size_t>(s)];
+        if (!b.active || b.channel != channel) continue;
+        std::size_t index = b.count;
+        for (std::size_t i = 0; i < b.count; ++i) if (b.keys[i] == key) { index = i; break; }
+        if (index >= b.count) continue;
+        const bool wasTop = index + 1U == b.count;
+        for (std::size_t j = index + 1U; j < b.count; ++j) { b.keys[j - 1U] = b.keys[j]; b.vels[j - 1U] = b.vels[j]; }
+        --b.count;
+        if (!wasTop) continue;   // a lower held key was let go: the sound goes on
+        if (b.count > 0U) {
+            // back to the key that is still held, without a new stroke
+            const UpperLayer* ul = layerOf(upper, s);
+            const double note = bowNoteFor(impl, upper, state.global, ui, b.keys[b.count - 1U], ul);
+            bow::Controls c = b.string.controls();
+            c.glideSec = bowGlideSec(impl, upper, b.string.currentNote(), note, ui);
+            b.string.setControls(c);
+            b.string.noteOn(note, true);
+            b.lastNote = note;
+        } else if (sustainDown && upper.damperEnabled) {
+            b.sustained = true;      // the pedal keeps the bow on the string
+        } else {
+            b.string.noteOff();
+        }
+    }
+}
+
+// The damper pedal went up: bows held only by the pedal lift.
+void bowReleaseSustained(SamplerEngine::Impl& impl, std::uint8_t channel) noexcept {
+    for (auto& row : impl.bows) for (auto& b : row) {
+        if (b.active && b.sustained && b.channel == channel && b.count == 0U) { b.sustained = false; b.string.noteOff(); }
+    }
+}
+
+// All notes off / panic: the strings stop at once.
+void bowAllOff(SamplerEngine::Impl& impl, int channel) noexcept {
+    for (auto& row : impl.bows) for (auto& b : row) {
+        if (!b.active || (channel >= 0 && b.channel != static_cast<std::uint8_t>(channel))) continue;
+        b.string.reset(); b.count = 0U; b.active = false; b.sustained = false; b.mixL = b.mixR = 0.0F;
+    }
+}
+
 void handleNoteOff(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineState>& stateOwner,
                    std::uint8_t channel, std::uint8_t key) noexcept {
     std::uint16_t handled = 0U;
@@ -2717,7 +3196,11 @@ void handleNoteOff(SamplerEngine::Impl& impl, const std::shared_ptr<const Engine
     }
     for (int ui = 0; ui < kUpperCount; ++ui) {
         const auto& upper = stateOwner->combi.uppers[static_cast<std::size_t>(ui)];
-        if (upper.midiChannel != (channel & 0x0FU) || voiceModeNow(impl, ui, upper) == UpperVoiceMode::Poly) continue;
+        if (upper.midiChannel != (channel & 0x0FU)) continue;
+        // SILVETON_BOW_V1: the bowed sounds of this Upper (a T Upper lets its third go when it ends)
+        if (((tmask >> ui) & 1) == 0) bowNoteOff(impl, *stateOwner, ui, upper, channel, key, impl.channels[channel & 0x0FU].sustain);
+        else if (harmony >= 0 && harmonyEnds) bowNoteOff(impl, *stateOwner, ui, upper, channel, static_cast<std::uint8_t>(harmony), impl.channels[channel & 0x0FU].sustain);
+        if (voiceModeNow(impl, ui, upper) == UpperVoiceMode::Poly) continue;
         std::uint8_t keyHere = key;
         if (((tmask >> ui) & 1) != 0) {
             if (harmony < 0 || !harmonyEnds) continue;
@@ -2814,6 +3297,7 @@ void processEvent(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineS
                     if (harmonyKey < 0) continue;
                     key = static_cast<std::uint8_t>(harmonyKey);
                 }
+                bowNoteOn(impl, state, ui, upper, e.channel, key, e.data2);   // SILVETON_BOW_V1
                 if (voiceModeNow(impl, ui, upper) != UpperVoiceMode::Poly) {
                     auto& mk = impl.mono[static_cast<std::size_t>(ui)];
                     const bool keyWasHeld = mk.count > 0U;
@@ -2856,6 +3340,7 @@ void processEvent(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineS
             // Safety CCs remain active even when ordinary CCs are filtered.
             if (e.data1 == 120U || e.data1 == 123U) {
                 for (auto& v : impl.voices) if (v.active && v.channel == e.channel) { v.ampEnv.forceOff(); v.active = false; }
+                bowAllOff(impl, static_cast<int>(e.channel));   // SILVETON_BOW_V1
                 for (int ui = 0; ui < kUpperCount; ++ui) {
                     if (state.combi.uppers[static_cast<std::size_t>(ui)].midiChannel == (e.channel & 0x0FU)) {
                         impl.mono[static_cast<std::size_t>(ui)] = SamplerEngine::Impl::MonoKeys{};
@@ -2875,7 +3360,7 @@ void processEvent(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineS
                 const bool old = ch.sustain;
                 const bool pressed = e.data2 >= 64U;
                 ch.sustain = state.global.damperPolarityReversed ? !pressed : pressed;
-                if (old && !ch.sustain) releaseSustained(impl, e.channel);
+                if (old && !ch.sustain) { releaseSustained(impl, e.channel); bowReleaseSustained(impl, channel); }   // SILVETON_BOW_V1
             }
             break;
         case EventType::PitchBend:
@@ -2886,7 +3371,7 @@ void processEvent(SamplerEngine::Impl& impl, const std::shared_ptr<const EngineS
                               ? static_cast<float>(e.data1) * kInv127
                               : 0.0F;
             break;
-        case EventType::Panic: panic(impl); break;
+        case EventType::Panic: panic(impl); bowAllOff(impl, -1); break;   // SILVETON_BOW_V1
     }
 }
 
@@ -3501,6 +3986,56 @@ void SamplerEngine::render(float* out, std::uint32_t frames) noexcept {
       for (const auto& v : impl_->voices) {
           if (v.active && v.upperIndex >= 0 && v.upperIndex < kUpperCount)
               busLive[static_cast<std::size_t>(v.upperIndex)][static_cast<std::size_t>(std::clamp(v.soundIndex, 0, kSoundsPerUpper - 1))] = true;
+      }
+
+      // SILVETON_BOW_V1: the bowed strings render into the bus of their sound (basic sound or layer),
+      // so level, pan, ON/MUTE/SOLO, the sound's EQ, the Upper EQ, INSERT and sends apply as to a recording.
+      for (std::size_t ui = 0; ui < static_cast<std::size_t>(kUpperCount); ++ui) {
+        for (std::size_t si = 0; si < static_cast<std::size_t>(kSoundsPerUpper); ++si) {
+          auto& b = impl_->bows[ui][si];
+          if (!b.active) continue;
+          const auto& u = current->combi.uppers[ui];
+          const UpperLayer* ul = layerOf(u, static_cast<int>(si));
+          const auto& ch = impl_->channels[b.channel & 0x0FU];
+          // the slot plays a recording now (or nothing): the bow lifts, the string rings out
+          if (bowInstrumentOf(u, static_cast<int>(si)) == 0 && b.string.playing()) { b.string.noteOff(); b.count = 0U; b.sustained = false; }
+          bow::Controls c = bowControlsFor(ul != nullptr ? ul->tone.x : u.toneExtra);
+          c.glideSec = b.string.controls().glideSec;   // set at the note, not by the page
+          // dynamics: the stroke's velocity sets the base, the expression pedal (and breath) shape it live
+          float dyn = 0.35F + 0.65F * b.velNorm;
+          if (u.expressionEnabled) dyn *= ch.expression;
+          if (u.breathEnabled) dyn *= ch.breath;
+          c.expression = std::clamp(static_cast<double>(dyn), 0.0, 1.0);
+          if (u.aftertouchEnabled) c.pressure = std::min(1.0, c.pressure + 0.4 * static_cast<double>(ch.pressure));
+          c.bendSemis = static_cast<double>(ch.pitchBend) / 8192.0 * static_cast<double>(u.pitchBendRange);
+          c.extraVibratoCents = static_cast<double>(ch.cc[1]) * 50.0;   // the modulation wheel adds vibrato
+          b.string.setControls(c);
+          b.string.block(static_cast<int>(n));
+          // mix gains: Upper level x equal-power pan x ON/MUTE/SOLO (+ the layer's own level and pan)
+          const std::uint16_t routeMask = impl_->upperRouteMask[ui];
+          const auto routed = [routeMask](ModDestination d) noexcept { return (routeMask & static_cast<std::uint16_t>(1U << static_cast<unsigned>(d))) != 0U; };
+          float targetL = 0.0F, targetR = 0.0F;
+          if (upperAudible(*current, u)) {
+              const float panIn = std::clamp(u.pan + (ul != nullptr ? ul->pan : 0.0F) + (routed(ModDestination::Pan) ? controllerAmount(u, ch, ModDestination::Pan) : 0.0F), -1.0F, 1.0F);
+              const float levelDb = u.levelDb + (ul != nullptr ? ul->levelDb : 0.0F) + (routed(ModDestination::LevelDb) ? std::clamp(controllerAmount(u, ch, ModDestination::LevelDb), -96.0F, 24.0F) : 0.0F);
+              const float angle = (panIn + 1.0F) * static_cast<float>(kPi * 0.25);
+              const float level = dbToGain(levelDb);
+              targetL = level * std::cos(angle); targetR = level * std::sin(angle);
+          }
+          auto& outL = impl_->chunkL[ui][si];
+          auto& outR = impl_->chunkR[ui][si];
+          for (std::uint32_t i = 0U; i < n; ++i) {
+              b.mixL += (targetL - b.mixL) * mixSmooth;
+              b.mixR += (targetR - b.mixR) * mixSmooth;
+              const float y = b.string.render();
+              outL[i] += y * b.mixL;
+              outR[i] += y * b.mixR;
+          }
+          busLive[ui][si] = true;
+          // a lifted string that has died away frees the voice
+          if (!b.string.playing() && b.string.level() < 1.0e-4) { b.quietFrames += n; if (b.quietFrames > static_cast<std::uint32_t>(0.25 * impl_->sampleRate)) { b.active = false; b.count = 0U; b.sustained = false; b.string.reset(); } }
+          else b.quietFrames = 0U;
+        }
       }
       // Send amounts of every Upper (once per chunk).
       std::array<std::array<float, kFxSendSlots>, kUpperCount> sendAmt{};

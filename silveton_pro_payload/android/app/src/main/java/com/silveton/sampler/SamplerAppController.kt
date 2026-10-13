@@ -303,7 +303,14 @@ class SamplerAppController(
     }
 
     /** SOUNDs of SILVETON_BANK.sv only (the built-in waves are not a bank). SILVETON_BANK_LOAD_FIX_V1 */
-    private fun bankSoundCount(): Int = engine.nativeSoundCatalogNames().count { !it.startsWith("~ ") }
+    private fun bankSoundCount(): Int {
+        // SILVETON_BOW_V1: the bowed instruments (slots 9101..) are always in the catalog, so only slots 1..500 count
+        val a = engine.nativeSoundCatalogAddresses()
+        var n = 0
+        var i = 2
+        while (i < a.size) { if (a[i] in 1..500) n++; i += 3 }
+        return n
+    }
 
     private fun loadDefaultBankOnce() {
         if (defaultBankAttempted) return

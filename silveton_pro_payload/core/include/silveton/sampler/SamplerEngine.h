@@ -78,6 +78,10 @@ struct UpperToneValues {
 // index 0..kBuiltinWaveCount-1; nullptr for others. Built once, shared.
 [[nodiscard]] ProgramPtr builtinWaveProgram(int index);
 [[nodiscard]] const char* builtinWaveName(int index) noexcept;
+// SILVETON_BOW_V1: the bowed instruments, index 0..kBowInstrumentCount-1 (slot kBowFirstSlot + index).
+[[nodiscard]] ProgramPtr bowInstrumentProgram(int index);
+[[nodiscard]] const char* bowInstrumentName(int index) noexcept;
+[[nodiscard]] bool bowSoundSlot(std::uint16_t slot) noexcept;
 
 class SamplerEngine {
 public:

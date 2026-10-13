@@ -1311,6 +1311,7 @@ public:
         out.insert(out.end(), {u.eq.hpOn ? 1.0F : 0.0F, u.eq.hpHz, static_cast<float>(u.eq.hpSlopeDb), u.eq.lpOn ? 1.0F : 0.0F, u.eq.lpHz, static_cast<float>(u.eq.lpSlopeDb)});
         out.insert(out.end(), {u.portaMode == PortamentoMode::Kronos ? 1.0F : 0.0F, u.portaFingered ? 1.0F : 0.0F, u.portaRateMode ? 1.0F : 0.0F, static_cast<float>(u.portaTime)});
         out.insert(out.end(), {u.fxSend3, u.fxSend4, static_cast<float>(u.pitchBendRange)});
+        out.push_back(static_cast<float>(u.soundSlotId));   // SILVETON_BOW_V1: 49 = slot of the basic sound (read only)
         return out;
     }
 
@@ -1355,7 +1356,7 @@ public:
         if (upperIndex < 0 || upperIndex >= kUpperCount || layer < 0 || layer >= kUpperLayers) { setTextError("Invalid layer"); return false; }
         auto next = std::make_shared<EngineState>(state_ != nullptr ? *state_ : EngineState{});
         auto& l = next->combi.uppers[static_cast<std::size_t>(upperIndex)].layers[static_cast<std::size_t>(layer)];
-        if (slot <= 0 || slot > 65535 || !((slot <= static_cast<int>(kFixedSoundSlotCount)) || isBuiltinSlot(static_cast<std::uint16_t>(slot)))) { l.program.reset(); l.soundSlotId = kNoSoundSlot; l.enabled = false; l.name.clear(); return installState(std::move(next)); }
+        if (slot <= 0 || slot > 65535 || !((slot <= static_cast<int>(kFixedSoundSlotCount)) || specialSlot(static_cast<std::uint16_t>(slot)))) { l.program.reset(); l.soundSlotId = kNoSoundSlot; l.enabled = false; l.name.clear(); return installState(std::move(next)); }
         auto program = programForSlot(static_cast<std::uint16_t>(slot));
         if (program == nullptr) { setTextError("SOUND slot is empty"); return false; }
         l.program = program; l.soundSlotId = static_cast<std::uint16_t>(slot); l.name = program->name; l.enabled = true;
@@ -1440,9 +1441,25 @@ public:
     //   0 pwmWidth 1 pwmDepth 2 pwmRateHz 3 pwmMix 4 subLevel 5 subOctave 6 unisonVoices 7 unisonDetuneCents
     //   8 unisonSpread 9 drive 10 filterType 11 filterKeyTrack 12 filter2Type 13 filter2Hz 14 filter2Res
     //   15 filter2Parallel 16 analogFeel 17 synthBypass (SILVETON_SYNTH_BYPASS_V1: 1 = SYNTH ИЗКЛ); 20 + route*4 + (0 source, 1 target, 2 amount, 3 bipolar), route 0..7
-    static constexpr int kSynthParamCount = 52;
+    //   SILVETON_BOW_V1 - the ЛЪК page of a bowed sound: 52 pressure 53 position 54 brightness 55 vibrato cents
+    //   56 vibrato Hz 57 vibrato delay ms 58 attack ms 59 release ms
+    static constexpr int kSynthParamCount = 60;
     static void applySynth(ToneExtra& x, ModMatrix& m, int id, float v) {
         const auto i8 = [](float f, int lo, int hi) { return static_cast<std::int8_t>(std::clamp(static_cast<int>(std::lround(f)), lo, hi)); };
+        if (id >= 52) {   // SILVETON_BOW_V1
+            switch (id) {
+                case 52: x.bowPressure = std::clamp(v, 0.0F, 1.0F); break;
+                case 53: x.bowPosition = std::clamp(v, 0.05F, 0.18F); break;
+                case 54: x.bowBrightness = std::clamp(v, 0.0F, 1.0F); break;
+                case 55: x.bowVibratoCents = std::clamp(v, 0.0F, 100.0F); break;
+                case 56: x.bowVibratoHz = std::clamp(v, 3.0F, 9.0F); break;
+                case 57: x.bowVibratoDelayMs = std::clamp(v, 0.0F, 2000.0F); break;
+                case 58: x.bowAttackMs = std::clamp(v, 5.0F, 200.0F); break;
+                case 59: x.bowReleaseMs = std::clamp(v, 10.0F, 500.0F); break;
+                default: break;
+            }
+            return;
+        }
         if (id >= 20) {
             const int r = (id - 20) / 4, k = (id - 20) % 4;
             if (r < 0 || r >= kModRoutes) return;
@@ -1482,6 +1499,7 @@ public:
                                x.unisonSpread, x.drive, static_cast<float>(x.filterType), x.filterKeyTrack, static_cast<float>(x.filter2Type), x.filter2Hz, x.filter2Res,
                                x.filter2Parallel ? 1.0F : 0.0F, x.analogFeel ? 1.0F : 0.0F, x.synthBypass ? 1.0F : 0.0F, 0.0F, 0.0F});
         for (const auto& r : m.route) out.insert(out.end(), {static_cast<float>(r.source), static_cast<float>(r.target), r.amount, r.bipolar ? 1.0F : 0.0F});
+        out.insert(out.end(), {x.bowPressure, x.bowPosition, x.bowBrightness, x.bowVibratoCents, x.bowVibratoHz, x.bowVibratoDelayMs, x.bowAttackMs, x.bowReleaseMs});   // SILVETON_BOW_V1
     }
     bool setSoundSynthParam(int upperIndex, int sound, int id, float v) {
         if (upperIndex < 0 || upperIndex >= kUpperCount || sound < 0 || sound > kUpperLayers || id < 0 || id >= kSynthParamCount || !std::isfinite(v)) { setTextError("Invalid synth parameter"); return false; }
@@ -1567,8 +1585,11 @@ public:
     ProgramPtr programForSlot(std::uint16_t slot) const {
         if (slot >= 1U && slot <= kFixedSoundSlotCount) return library_.program(SlotAddress{0U, 0U, slot});
         if (isBuiltinSlot(slot)) return builtinWaveProgram(static_cast<int>(slot - kBuiltinWaveFirstSlot));
+        if (bowSoundSlot(slot)) return bowInstrumentProgram(static_cast<int>(slot - kBowFirstSlot));   // SILVETON_BOW_V1
         return nullptr;
     }
+    // SILVETON_BOW_V1: a slot that is not a bank SOUND but is still a sound (built-in wave or bowed instrument)
+    static bool specialSlot(std::uint16_t slot) noexcept { return isBuiltinSlot(slot) || bowSoundSlot(slot); }
     // Binds every sound of an Upper (basic + layers) to the SOUND of its slot. Missing = off.
     void rebindUpper(UpperPart& upper) const {
         if (upper.soundSlotId != kNoSoundSlot) {
@@ -1592,12 +1613,15 @@ public:
         }
         // SILVETON_BANK_LOAD_FIX_V1: the built-in waves are not offered as SOUNDs - the Polysix
         // functions work on the bank recordings only (what was asked for).
+        // SILVETON_BOW_V1: the bowed instruments come after the bank SOUNDs (slots 9101..9104).
+        for (int i = 0; i < kBowInstrumentCount; ++i) { out.push_back(0); out.push_back(0); out.push_back(static_cast<int>(kBowFirstSlot) + i); }
         return out;
     }
 
     std::vector<std::string> soundCatalogNames() const {
         std::vector<std::string> out;
         for (const auto& item : library_.programCatalog()) out.push_back(item.name);
+        for (int i = 0; i < kBowInstrumentCount; ++i) out.emplace_back(bowInstrumentName(i));   // SILVETON_BOW_V1
         return out;
     }
 
@@ -1875,7 +1899,7 @@ public:
 
     bool activateProgram(const SlotAddress& address, int upperIndex) {
         if (upperIndex < 0 || upperIndex >= kUpperCount) { setTextError("Invalid Upper index"); return false; }
-        const bool builtin = address.bank == 0U && address.page == 0U && isBuiltinSlot(address.slot);
+        const bool builtin = address.bank == 0U && address.page == 0U && specialSlot(address.slot);   // SILVETON_BOW_V1: + bowed instruments
         const auto program = builtin ? programForSlot(address.slot) : library_.program(address);
         if (program == nullptr) { setTextError("PROGRAM slot is empty"); return false; }
         auto next = std::make_shared<EngineState>(state_ != nullptr ? *state_ : EngineState{});
@@ -3091,10 +3115,23 @@ private:
         return installState(std::move(state));
     }
 
+    // SILVETON_SYNTH_MENU_OFF_V1: the SYNTH and MATRIX pages are gone from the screen, so every
+    // sound plays as the plain recording - exactly the SYNTH ИЗКЛ sound (no PWM, SUB, UNISON,
+    // DRIVE, character filters, filter 2 or matrix; one voice per sound, lighter on the CPU).
+    // The knob values stay stored in the SET untouched.
+    static void forceSynthOff(EngineState& s) noexcept {
+        for (auto& u : s.combi.uppers) {
+            u.toneExtra.synthBypass = true;
+            for (auto& l : u.layers) l.tone.x.synthBypass = true;
+        }
+    }
+
     bool installState(std::shared_ptr<const EngineState> state) {
         if (state == nullptr) return false;
+        auto plain = std::make_shared<EngineState>(*state);   // SILVETON_SYNTH_MENU_OFF_V1
+        forceSynthOff(*plain);
         std::lock_guard<std::mutex> lock(controlMutex_);
-        state_ = std::move(state);
+        state_ = std::move(plain);
         // Real bank SOUND is authoritative. The old diagnostic TEST EP is retired.
         testInstrument_.setEnabled(false);
         engine_.setState(state_);

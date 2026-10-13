@@ -2635,19 +2635,86 @@ void testEnsembleFx() {
     double diff=0.0; for(std::size_t i=0;i<x.size();++i) diff+=std::abs(x[i]-y[i]);
     assert(diff>1.0); assert(peakOf(y,0U,y.size())<2.0);
 }
+// ---------------------------------------------------------------- SILVETON_BOW_V1
+std::shared_ptr<EngineState> bowState(int instrument, int layerToo=-1) {
+    auto st=std::make_shared<EngineState>(); auto& u=st->combi.uppers[0]; u.program=bowInstrumentProgram(instrument-1); u.soundSlotId=static_cast<std::uint16_t>(kBowFirstSlot+instrument-1); u.enabled=true; st->global.masterGainDb=0.0F; st->global.limiterEnabled=false;
+    if(layerToo>0){ auto& l=u.layers[0]; l.enabled=true; l.program=bowInstrumentProgram(layerToo-1); l.soundSlotId=static_cast<std::uint16_t>(kBowFirstSlot+layerToo-1); }
+    return st;
+}
+// Fundamental by autocorrelation (a bowed string through its body crosses zero more than once per period).
+double f0Of(const std::vector<float>& x, std::size_t from, std::size_t to, double sr) {
+    to=std::min(to,x.size()); if(to<=from+16U) return 0.0;
+    std::vector<double> seg(x.begin()+static_cast<std::ptrdiff_t>(from), x.begin()+static_cast<std::ptrdiff_t>(to)); const std::size_t n=seg.size();
+    double mean=0.0; for(double v:seg) mean+=v; mean/=static_cast<double>(n); for(double& v:seg) v-=mean;
+    const auto lo=static_cast<std::size_t>(sr/2000.0), hi=static_cast<std::size_t>(sr/40.0); std::vector<double> ac(hi+2U,0.0); double best=0.0;
+    for(std::size_t l=lo;l<=hi;++l){ double a=0.0; for(std::size_t i=0;i+l<n;++i) a+=seg[i]*seg[i+l]; ac[l]=a; best=std::max(best,a); }
+    for(std::size_t l=lo+1U;l<hi;++l) if(ac[l]>=0.9*best && ac[l]>=ac[l-1U] && ac[l]>=ac[l+1U]) return sr/static_cast<double>(l);
+    return 0.0;
+}
+double rmsOf(const std::vector<float>& x, std::size_t from, std::size_t to) { double a=0.0; std::size_t n=0; for(std::size_t i=from;i<to&&i<x.size();++i){a+=static_cast<double>(x[i])*x[i];++n;} return n?std::sqrt(a/static_cast<double>(n)):0.0; }
+void testBowInstrument() {
+    for(int i=0;i<kBowInstrumentCount;++i){
+        auto p=bowInstrumentProgram(i); assert(p && p->layers.empty() && p->bowInstrument==i+1 && !p->name.empty());
+        assert(bowSoundSlot(static_cast<std::uint16_t>(kBowFirstSlot+i)));
+    }
+    assert(!bowSoundSlot(kBowFirstSlot-1U) && !bowSoundSlot(static_cast<std::uint16_t>(kBowFirstSlot+kBowInstrumentCount)));
+    // violin A4: the string plays the right pitch, periodic, finite
+    SamplerEngine e; e.prepare(96000.0,96U); e.setState(bowState(1)); e.postNoteOn(0U,69U,100U);
+    auto x=renderLeft(e,1000); for(float v:x) { assert(std::isfinite(v)); }
+    assert(peakOf(x,48000U,96000U)>0.01);
+    const double hz=f0Of(x,48000U,96000U,96000.0); assert(std::abs(hz-440.0)<440.0*0.02);
+    // legato: a second key while the first is held glides, no new attack (no dip in level)
+    e.postNoteOn(0U,76U,100U); auto y=renderLeft(e,400);
+    double minRms=1e9; for(std::size_t f=0;f+2400U<=y.size();f+=2400U) minRms=std::min(minRms,rmsOf(y,f,f+2400U));
+    assert(minRms>0.2*rmsOf(x,48000U,96000U));
+    const double hz2=f0Of(y,24000U,38400U,96000.0); assert(std::abs(hz2-659.26)<659.26*0.02);
+    // letting the top key go glides back to the held key
+    e.postNoteOff(0U,76U); auto z=renderLeft(e,400);
+    const double hz3=f0Of(z,24000U,38400U,96000.0); assert(std::abs(hz3-440.0)<440.0*0.02);
+    // all keys up: the bow lifts, the string dies away
+    e.postNoteOff(0U,69U); auto r=renderLeft(e,1200);
+    assert(peakOf(r,96000U,115200U)<0.002); assert(e.activeVoiceCount()==0U);
+    // the expression pedal shapes the dynamics live: 30 % is much quieter than 100 %
+    SamplerEngine f; f.prepare(96000.0,96U); auto st=bowState(1); st->global.expressionCc=11U; f.setState(st);
+    f.postControlChange(0U,11U,127U); f.postNoteOn(0U,62U,100U); auto loud=renderLeft(f,800);
+    f.postControlChange(0U,11U,38U); auto soft=renderLeft(f,800);
+    assert(rmsOf(soft,48000U,76800U)<0.5*rmsOf(loud,48000U,76800U));
+    for(float v:soft) { assert(std::isfinite(v)); }
+    // cello low C, a bow in a layer too, both sound and are in tune
+    SamplerEngine g; g.prepare(96000.0,96U); g.setState(bowState(3,3)); g.postNoteOn(0U,48U,100U);
+    auto c=renderLeft(g,1200); for(float v:c) { assert(std::isfinite(v)); }
+    assert(peakOf(c,96000U,115200U)>0.01);
+    const double hzc=f0Of(c,96000U,115200U,96000.0); assert(std::abs(hzc-130.81)<130.81*0.03);
+    // a recording loaded into the slot while the bow plays: the bow lifts on its own
+    SamplerEngine h; h.prepare(96000.0,96U); h.setState(bowState(2)); h.postNoteOn(0U,69U,100U); renderLeft(h,300);
+    const auto sample=AudioFileLoader::load(makeWav()).sample; h.setState(makeState(sample)); auto t=renderLeft(h,600);
+    for(float v:t) assert(std::isfinite(v));
+    assert(peakOf(t,48000U,57600U)<0.01);
+    // PANIC / all notes off stop a bow at once
+    SamplerEngine k; k.prepare(96000.0,96U); k.setState(bowState(1)); k.postNoteOn(0U,69U,100U); renderLeft(k,300); k.postControlChange(0U,123U,0U); auto q=renderLeft(k,100); assert(peakOf(q,4800U,9600U)<0.001);
+    // the PORTA page drives the glide: TIME 100 ms, C4 -> C5 is half way after ~50 ms
+    SamplerEngine m; m.prepare(96000.0,96U); auto ps=bowState(1); ps->combi.uppers[0].portamentoSec=0.1F; m.setState(ps);
+    m.postNoteOn(0U,60U,100U); renderLeft(m,600); m.postNoteOn(0U,72U,100U); auto gl=renderLeft(m,200);
+    const double hzm=f0Of(gl,2400U,4800U,96000.0); assert(hzm>285.0 && hzm<480.0);
+    const double hzEnd=f0Of(gl,14400U,19200U,96000.0); assert(std::abs(hzEnd-523.25)<523.25*0.02);
+}
 void testSetV13RoundTrip() {
     const auto sample=AudioFileLoader::load(makeWav()).sample; auto state=makeState(sample);
     SetData data; data.name="V13"; data.global=state->global; data.programs.push_back({{1U,1U,1U},state->combi.uppers[0].program});
     CombiSlot cs; cs.address={1U,1U,2U}; cs.combi=state->combi; auto& u=cs.combi.uppers[0];
     u.toneExtra.pwmWidth=0.4F; u.toneExtra.pwmDepth=0.2F; u.toneExtra.pwmRateHz=1.5F; u.toneExtra.pwmMix=0.7F; u.toneExtra.subLevel=0.6F; u.toneExtra.subOctave=2; u.toneExtra.unisonVoices=3; u.toneExtra.unisonDetuneCents=12.0F; u.toneExtra.unisonSpread=0.8F; u.toneExtra.drive=0.3F; u.toneExtra.filterType=2; u.toneExtra.filterKeyTrack=0.5F; u.toneExtra.filter2Type=3; u.toneExtra.filter2Hz=2500.0F; u.toneExtra.filter2Res=0.4F; u.toneExtra.filter2Parallel=true; u.toneExtra.analogFeel=true;
     u.toneMod.route[2].source=ModSource::Breath; u.toneMod.route[2].target=ModTarget::Drive; u.toneMod.route[2].amount=0.75F; u.toneMod.route[2].bipolar=true;
-    u.toneExtra.synthBypass=true; u.layers[0].enabled=true; u.layers[0].program=state->combi.uppers[0].program; u.layers[0].tone.x.unisonVoices=2; u.layers[0].tone.mod.route[0].source=ModSource::Aftertouch; u.layers[0].tone.mod.route[0].target=ModTarget::LfoDepth; u.layers[0].tone.mod.route[0].amount=0.5F;
+    u.toneExtra.synthBypass=true; u.toneExtra.bowPressure=0.8F; u.toneExtra.bowPosition=0.07F; u.toneExtra.bowBrightness=0.3F; u.toneExtra.bowVibratoCents=45.0F; u.toneExtra.bowVibratoHz=6.5F; u.toneExtra.bowVibratoDelayMs=400.0F; u.toneExtra.bowAttackMs=80.0F; u.toneExtra.bowReleaseMs=150.0F;   // SILVETON_SET_V15
+    cs.combi.uppers[1].program=bowInstrumentProgram(2); cs.combi.uppers[1].soundSlotId=kBowFirstSlot+2U; cs.combi.uppers[1].enabled=true; data.programs.push_back({{1U,1U,3U},cs.combi.uppers[1].program});
+    u.layers[0].enabled=true; u.layers[0].program=state->combi.uppers[0].program; u.layers[0].tone.x.unisonVoices=2; u.layers[0].tone.mod.route[0].source=ModSource::Aftertouch; u.layers[0].tone.mod.route[0].target=ModTarget::LfoDepth; u.layers[0].tone.mod.route[0].amount=0.5F;
     data.combis.push_back(cs);
     const std::string dir="/tmp/SILVETON_TEST_V13.SVSET"; assert(SetPackage::save(dir,data).success); const auto loaded=SetPackage::load(dir); assert(loaded.ok());
     const auto& v=loaded.data.combis.front().combi.uppers[0];
     assert(v.toneExtra.pwmWidth==0.4F && v.toneExtra.pwmDepth==0.2F && v.toneExtra.pwmRateHz==1.5F && v.toneExtra.pwmMix==0.7F && v.toneExtra.subLevel==0.6F && v.toneExtra.subOctave==2 && v.toneExtra.unisonVoices==3 && v.toneExtra.unisonDetuneCents==12.0F && v.toneExtra.unisonSpread==0.8F);
     assert(v.toneExtra.drive==0.3F && v.toneExtra.filterType==2 && v.toneExtra.filterKeyTrack==0.5F && v.toneExtra.filter2Type==3 && v.toneExtra.filter2Hz==2500.0F && v.toneExtra.filter2Res==0.4F && v.toneExtra.filter2Parallel && v.toneExtra.analogFeel);
     assert(v.toneExtra.synthBypass);
+    assert(v.toneExtra.bowPressure==0.8F && v.toneExtra.bowPosition==0.07F && v.toneExtra.bowBrightness==0.3F && v.toneExtra.bowVibratoCents==45.0F && v.toneExtra.bowVibratoHz==6.5F && v.toneExtra.bowVibratoDelayMs==400.0F && v.toneExtra.bowAttackMs==80.0F && v.toneExtra.bowReleaseMs==150.0F);   // SILVETON_SET_V15
+    assert(loaded.data.combis.front().combi.uppers[1].program!=nullptr && loaded.data.combis.front().combi.uppers[1].program->bowInstrument==3U && loaded.data.combis.front().combi.uppers[1].soundSlotId==kBowFirstSlot+2U);
     assert(v.toneMod.route[2].source==ModSource::Breath && v.toneMod.route[2].target==ModTarget::Drive && v.toneMod.route[2].amount==0.75F && v.toneMod.route[2].bipolar);
     assert(v.layers[0].tone.x.unisonVoices==2 && v.layers[0].tone.mod.route[0].source==ModSource::Aftertouch && v.layers[0].tone.mod.route[0].target==ModTarget::LfoDepth && v.layers[0].tone.mod.route[0].amount==0.5F);
     assert(std::filesystem::is_directory(dir));   // with audio = folder
@@ -2711,7 +2778,7 @@ int main() {
     testLiveEditsOnHeldNote();
     testFxSlotsDelayReverb();
     testCrossfadePortamento();
-    testBuiltinWaves(); testPwmSubUnisonDrive(); testCharacterFilters(); testModMatrix(); testSynthBypass(); testEnsembleFx(); testSetV13RoundTrip();
+    testBuiltinWaves(); testPwmSubUnisonDrive(); testCharacterFilters(); testModMatrix(); testSynthBypass(); testEnsembleFx(); testBowInstrument(); testSetV13RoundTrip();
     testUpperLayers(); testToneV2(); testUpperEq5(); testKronosPortamento(); testEffectsV3(); testSetV12RoundTrip(); testVoiceGuardQuietestStops(); testCpuMeter();
     std::puts("SILVETON sampler tests passed");
     return 0;

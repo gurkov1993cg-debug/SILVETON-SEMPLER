@@ -1484,6 +1484,14 @@ public:
         return gain_ * y;
     }
     void clear() noexcept { x1_ = x2_ = y1_ = y2_ = 0.0; }
+    // complex response at w (radians/sample), times the mode gain
+    void response(double w, double& re, double& im) const noexcept {
+        const double c1 = std::cos(w), s1 = std::sin(w), c2 = std::cos(2.0 * w), s2 = std::sin(2.0 * w);
+        const double nr = b0_ * (1.0 - c2), ni = b0_ * s2;                       // b0 (1 - z^-2)
+        const double dr = 1.0 + a1_ * c1 + a2_ * c2, di = -(a1_ * s1 + a2_ * s2); // 1 + a1 z^-1 + a2 z^-2
+        const double d = dr * dr + di * di;
+        re = gain_ * (nr * dr + ni * di) / d; im = gain_ * (ni * dr - nr * di) / d;
+    }
 private:
     double b0_{0}, a1_{0}, a2_{0}, gain_{1};
     double x1_{0}, x2_{0}, y1_{0}, y2_{0};
@@ -1554,7 +1562,7 @@ public:
         nut_.clear(); bridge_.clear(); lp_ = 0.0; slipping_ = true; speed_ = 0.0; force_ = 0.0;
         noteHz_ = 440.0; baseHz_ = 440.0; hzStep_ = 0.0; glideFrom_ = glideTo_ = 69.0; glidePos_ = 1.0; vibPhase_ = 0.0; vibAmt_ = 0.0;
         heldTime_ = 0.0; playing_ = false; noise_ = 0.0; damp_ = 0.0; bite_ = 0.0; hairLp_ = 0.0;
-        dcX_ = dcY_ = 0.0; outLp_ = 0.0; lastForce_ = 0.0; level_ = 0.0;
+        dcX_ = dcY_ = 0.0; outLp_ = 0.0; lastForce_ = 0.0; level_ = 0.0; compGain_ = 1.0;
         for (auto& r : body_) r.clear();
     }
     void setControls(const Controls& c) noexcept { ctl_ = c; ctl_.bowPosition = clampd(c.bowPosition, 0.05, 0.18); }
@@ -1627,6 +1635,14 @@ public:
         hzStep_ = (hzEnd - hzStart) / std::max(1, frames);
         hairCoef_ = 1.0 - std::exp(-2.0 * kBowPi * kHairRel * hzEnd / sr_);
         levelCoef_ = 1.0 - std::exp(-dt / 0.05);
+        // A player evens the notes out by ear: where the body is loud the bow eases, where it is
+        // weak it leans in. Most of the resonance unevenness goes, the colour of each note stays.
+        // The string itself also gets a little quieter and rounder towards the top (less force up there
+        // keeps the motion clean): +0.3 dB per semitone above A4, at most +7 dB.
+        const double semisUp = std::max(0.0, 12.0 * std::log2(hzEnd / 440.0));
+        const double tilt = std::pow(10.0, std::min(7.0, 0.3 * semisUp) / 20.0);
+        const double want = clampd(std::pow(loudRef_ / std::max(1e-9, noteLoudness(hzEnd)), 1.0) * tilt, 0.3, 3.5);
+        compGain_ += (want - compGain_) * (1.0 - std::exp(-blockSec / 0.02));
     }
 
     float render() noexcept {
@@ -1673,7 +1689,7 @@ public:
         level_ += (std::abs(y) - level_) * levelCoef_;
         // the bridge force grows as the bow nears the bridge (slip velocity ~ 1/position): keep the
         // instrument's loudness the same from tasto to ponticello, only the colour changes
-        return static_cast<float>(y * inst_.outGain * (b / 0.12));
+        return static_cast<float>(y * inst_.outGain * compGain_ * (b / 0.12));
     }
 
 private:
@@ -1702,6 +1718,17 @@ private:
         return s * std::min(ad, stickMax);
     }
     double white() noexcept { seed_ ^= seed_ << 13; seed_ ^= seed_ >> 17; seed_ ^= seed_ << 5; return static_cast<double>(seed_) * (2.0 / 4294967295.0) - 1.0; }
+    // |body| at hz: the dry path plus every resonance, added as complex numbers (phase matters)
+    double bodyMagnitude(double hz) const noexcept {
+        const double w = 2.0 * kBowPi * clampd(hz, 10.0, sr_ * 0.45) / sr_;
+        double re = dry_, im = 0.0;
+        for (const auto& r : body_) { double a = 0.0, b = 0.0; r.response(w, a, b); re += a; im += b; }
+        return std::sqrt(re * re + im * im);
+    }
+    // loudness of a note as the body passes it: fundamental and the next harmonics, weighted like a bowed string
+    double noteLoudness(double hz) const noexcept {
+        return bodyMagnitude(hz) + 0.5 * bodyMagnitude(2.0 * hz) + 0.33 * bodyMagnitude(3.0 * hz) + 0.25 * bodyMagnitude(4.0 * hz);
+    }
     void buildBody() noexcept {
         // violin body: air mode A0, corpus modes B1-/B1+, the 1 kHz region, the bridge hill ~2.5 kHz
         static constexpr Mode kViolin[kModes] = {
@@ -1711,6 +1738,10 @@ private:
         for (int i = 0; i < kModes; ++i) { Mode s = kViolin[i]; s.freqHz *= inst_.bodyScale; body_[static_cast<std::size_t>(i)].set(sr_, s); }
         dry_ = std::pow(10.0, inst_.bodyDry / 20.0);
         outLpCoef_ = 1.0 - std::exp(-2.0 * kBowPi * std::min(sr_ * 0.4, 7000.0 * inst_.bodyScale * 1.4) / sr_);
+        // reference loudness = the average over the playing range, so the compensation only evens out
+        double acc = 0.0; int n = 0;
+        for (double hz = inst_.lowestHz * 1.2; hz < inst_.lowestHz * 12.0; hz *= 1.0595) { acc += std::log(std::max(1e-9, noteLoudness(hz))); ++n; }
+        loudRef_ = std::exp(acc / std::max(1, n));
     }
 
     static constexpr int kModes = 14;
@@ -1720,7 +1751,7 @@ private:
     Controls ctl_{};
     DelayLine nut_, bridge_;
     std::array<Resonator, kModes> body_{};
-    double dry_{0.2}, outLpCoef_{0.5};
+    double dry_{0.2}, outLpCoef_{0.5}, loudRef_{1.0}, compGain_{1.0};
     // per-block values
     double speedTarget_{0.0}, speedCoef_{0.0}, forceCoef_{0.0}, biteDecay_{1.0}, biteAmount_{0.0}, dampStep_{0.0};
     double fMinPerSpeed_{0.0}, forceMul_{1.0}, a_{0.2}, lpDelay_{0.25}, gFinger_{0.99}, gString_{0.99};
@@ -3112,7 +3143,9 @@ void bowNoteOn(SamplerEngine::Impl& impl, const EngineState& state, int ui, cons
         if (b.count >= b.keys.size()) { for (std::size_t j = 1U; j < b.count; ++j) { b.keys[j - 1U] = b.keys[j]; b.vels[j - 1U] = b.vels[j]; } --b.count; }
         b.keys[b.count] = key; b.vels[b.count] = vel; ++b.count;
         b.channel = channel;
-        b.velNorm = static_cast<float>(vel) * kInv127;
+        // the velocity of a new stroke sets its dynamics; inside a slur the dynamics stay (the expression
+        // pedal shapes them), so fast legato runs do not jump in loudness from key to key
+        if (!legato) b.velNorm = static_cast<float>(vel) * kInv127;
         bow::Controls c = bowControlsFor(ul != nullptr ? ul->tone.x : upper.toneExtra);
         double fromNote = -1.0;
         if (legato) {

@@ -7,6 +7,7 @@ on:
     paths:
       # Rebuild when the source ZIP, any patch, the PRO payload, or this workflow changes.
       - "SILVETON-SEMPLER-source-fixed.zip"
+      - "SILVETON-SEMPLER.zip"
       - "codemagic_*.py"
       - "silveton_pro_payload/**"
       - ".github/workflows/silveton-apk.yml"
@@ -27,6 +28,8 @@ jobs:
       ANDROID_CMAKE_VERSION: "3.22.1"
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -35,6 +38,47 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # SILVETON_ZIP_UPLOAD_V1: from the phone only one ZIP is uploaded - SILVETON-SEMPLER.zip
+          # in the root of the repo. Its silveton_pro_payload/ replaces the folder, unless the
+          # folder was uploaded later than the ZIP (then the folder is the newest and wins).
+          UPLOAD_ZIP="$CM_BUILD_DIR/SILVETON-SEMPLER.zip"
+          if [ -f "$UPLOAD_ZIP" ]; then
+            ZIP_TIME="$(git -C "$CM_BUILD_DIR" log -1 --format=%ct -- SILVETON-SEMPLER.zip || true)"
+            DIR_TIME="$(git -C "$CM_BUILD_DIR" log -1 --format=%ct -- silveton_pro_payload || true)"
+            if [ "${ZIP_TIME:-0}" -ge "${DIR_TIME:-0}" ]; then
+              python3 - "$UPLOAD_ZIP" "$CM_BUILD_DIR" <<'SILVETON_ZIP_PY'
+          import os, sys, zipfile
+          src, root = sys.argv[1], sys.argv[2]
+          marker = "silveton_pro_payload/"
+          with zipfile.ZipFile(src) as z:
+              names = [n for n in z.namelist() if not n.endswith("/")]
+              prefix = None
+              for n in names:
+                  i = n.find(marker)
+                  if i == 0 or (i > 0 and n[:i].count("/") == 1):
+                      prefix = n[:i]
+                      break
+              if prefix is None:
+                  sys.exit("ERROR: SILVETON-SEMPLER.zip has no silveton_pro_payload folder")
+              count = 0
+              for n in names:
+                  if not n.startswith(prefix + marker):
+                      continue
+                  rel = n[len(prefix):]
+                  if ".." in rel.split("/"):
+                      sys.exit("ERROR: bad path in SILVETON-SEMPLER.zip: " + n)
+                  dst = os.path.join(root, rel)
+                  os.makedirs(os.path.dirname(dst), exist_ok=True)
+                  with z.open(n) as f, open(dst, "wb") as o:
+                      o.write(f.read())
+                  count += 1
+          print("SILVETON-SEMPLER.zip applied: %d files of silveton_pro_payload" % count)
+          SILVETON_ZIP_PY
+            else
+              echo "silveton_pro_payload is newer than SILVETON-SEMPLER.zip - the folder is used"
+            fi
+          fi
+          
           test -f "$CM_BUILD_DIR/$SILVETON_ZIP"
           test -f "$CM_BUILD_DIR/codemagic_runtime_fix.py"
           test -f "$CM_BUILD_DIR/codemagic_root_apk_fix.py"

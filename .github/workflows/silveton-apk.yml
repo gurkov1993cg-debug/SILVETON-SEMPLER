@@ -1,341 +1,108 @@
 name: SILVETON Sampler APK
 
+# The tablet program: a NativeActivity made only of C++ (no Kotlin, no Java). Samsung Galaxy Tab A11 (SM-X130), root.
+# The source is the folder silveton_pro_payload: inside SILVETON-SEMPLER.zip in the root of the repository (one zip, uploaded
+# from the phone), or unpacked as the folder itself.
 on:
-  workflow_dispatch:
   push:
-    branches: [main]
+    branches:
+      - main
     paths:
-      # Rebuild when the source ZIP, any patch, the PRO payload, or this workflow changes.
-      - "SILVETON-SEMPLER-source-fixed.zip"
       - "SILVETON-SEMPLER.zip"
-      - "codemagic_*.py"
       - "silveton_pro_payload/**"
       - ".github/workflows/silveton-apk.yml"
+  workflow_dispatch:
 
 permissions:
-  contents: write  # Allows GITHUB_TOKEN to publish the built APK as a GitHub Release.
+  contents: read
 
 jobs:
-  build:
+  android:
     runs-on: macos-15-intel
     timeout-minutes: 90
     env:
-      CM_BUILD_DIR: ${{ github.workspace }}
-      SILVETON_ZIP: SILVETON-SEMPLER-source-fixed.zip
       GRADLE_VERSION: "8.9"
       ANDROID_BUILD_TOOLS_VERSION: "35.0.0"
       ANDROID_NDK_VERSION: "27.2.12479018"
       ANDROID_CMAKE_VERSION: "3.22.1"
+
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-java@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
-      - name: Prepare SILVETON rooted APK source
+
+      - name: Prepare project from ZIP
         shell: bash
         run: |
           set -euo pipefail
-          # SILVETON_ZIP_UPLOAD_V1: from the phone only one ZIP is uploaded - SILVETON-SEMPLER.zip
-          # in the root of the repo. Its silveton_pro_payload/ replaces the folder, unless the
-          # folder was uploaded later than the ZIP (then the folder is the newest and wins).
-          UPLOAD_ZIP="$CM_BUILD_DIR/SILVETON-SEMPLER.zip"
-          if [ -f "$UPLOAD_ZIP" ]; then
-            ZIP_TIME="$(git -C "$CM_BUILD_DIR" log -1 --format=%ct -- SILVETON-SEMPLER.zip || true)"
-            DIR_TIME="$(git -C "$CM_BUILD_DIR" log -1 --format=%ct -- silveton_pro_payload || true)"
-            if [ "${ZIP_TIME:-0}" -ge "${DIR_TIME:-0}" ]; then
-              python3 - "$UPLOAD_ZIP" "$CM_BUILD_DIR" <<'SILVETON_ZIP_PY'
-          import os, sys, zipfile
-          src, root = sys.argv[1], sys.argv[2]
-          marker = "silveton_pro_payload/"
-          with zipfile.ZipFile(src) as z:
-              names = [n for n in z.namelist() if not n.endswith("/")]
-              prefix = None
-              for n in names:
-                  i = n.find(marker)
-                  if i == 0 or (i > 0 and n[:i].count("/") == 1):
-                      prefix = n[:i]
-                      break
-              if prefix is None:
-                  sys.exit("ERROR: SILVETON-SEMPLER.zip has no silveton_pro_payload folder")
-              count = 0
-              for n in names:
-                  if not n.startswith(prefix + marker):
-                      continue
-                  rel = n[len(prefix):]
-                  if ".." in rel.split("/"):
-                      sys.exit("ERROR: bad path in SILVETON-SEMPLER.zip: " + n)
-                  dst = os.path.join(root, rel)
-                  os.makedirs(os.path.dirname(dst), exist_ok=True)
-                  with z.open(n) as f, open(dst, "wb") as o:
-                      o.write(f.read())
-                  count += 1
-          print("SILVETON-SEMPLER.zip applied: %d files of silveton_pro_payload" % count)
-          SILVETON_ZIP_PY
-            else
-              echo "silveton_pro_payload is newer than SILVETON-SEMPLER.zip - the folder is used"
+
+          # The program is the folder silveton_pro_payload (android/, core/, host/, ui/, app/android/, resources/, CMakeLists.txt).
+          # It comes either as the folder itself in the repository or inside SILVETON-SEMPLER.zip in the root of the repository.
+          PROJECT_DIR=""
+          if [ -f "silveton_pro_payload/CMakeLists.txt" ] && [ -f "silveton_pro_payload/android/settings.gradle.kts" ]; then
+            PROJECT_DIR="$GITHUB_WORKSPACE/silveton_pro_payload"
+            echo "Using the folder silveton_pro_payload of the repository"
+          else
+            ZIP_PATH="SILVETON-SEMPLER.zip"
+            if [ ! -f "$ZIP_PATH" ]; then
+              echo "ERROR: Missing SILVETON-SEMPLER.zip (put it in the root of the repository)"
+              exit 1
+            fi
+            WORK_DIR="$RUNNER_TEMP/silveton-src"
+            rm -rf "$WORK_DIR"
+            mkdir -p "$WORK_DIR"
+            ditto -x -k "$ZIP_PATH" "$WORK_DIR"
+            # the project folder is the one that holds CMakeLists.txt next to android/settings.gradle.kts
+            SETTINGS="$(find "$WORK_DIR" -type f -path '*/android/settings.gradle.kts' -print -quit)"
+            if [ -n "${SETTINGS:-}" ]; then
+              CANDIDATE="$(dirname "$(dirname "$SETTINGS")")"
+              if [ -f "$CANDIDATE/CMakeLists.txt" ] && [ -d "$CANDIDATE/core" ]; then PROJECT_DIR="$CANDIDATE"; fi
+            fi
+            if [ -z "${PROJECT_DIR:-}" ]; then
+              echo "ERROR: SILVETON-SEMPLER.zip does not hold the C++ program (CMakeLists.txt + android/settings.gradle.kts + core/)"
+              find "$WORK_DIR" -maxdepth 3 -print
+              exit 1
             fi
           fi
-          
-          test -f "$CM_BUILD_DIR/$SILVETON_ZIP"
-          test -f "$CM_BUILD_DIR/codemagic_runtime_fix.py"
-          test -f "$CM_BUILD_DIR/codemagic_root_apk_fix.py"
-          test -f "$CM_BUILD_DIR/codemagic_resume_fix.py"
-          test -f "$CM_BUILD_DIR/codemagic_live_dsp_fix.py"
-          test -f "$CM_BUILD_DIR/codemagic_test_instrument_fix.py"
-          test -f "$CM_BUILD_DIR/codemagic_stability_fix.py"
-          test -f "$CM_BUILD_DIR/codemagic_audio_driver_hardening.py"
-          test -f "$CM_BUILD_DIR/codemagic_final_stability_fix.py"
-          test -f "$CM_BUILD_DIR/codemagic_gui_sampler3.py"
-          test -f "$CM_BUILD_DIR/codemagic_live_midi_visual_skin.py"
-          test -f "$CM_BUILD_DIR/codemagic_force_keyboard_test_patch.py"
-          test -f "$CM_BUILD_DIR/codemagic_gui_contract_fix.py"
-          test -f "$CM_BUILD_DIR/codemagic_kotlin_compile_fix.py"
-          test -f "$CM_BUILD_DIR/codemagic_48khz_fix.py"
-          test -f "$CM_BUILD_DIR/codemagic_live_performance_indicators.py"
-          test -f "$CM_BUILD_DIR/codemagic_xrun_stability_fix.py"
-          test -f "$CM_BUILD_DIR/codemagic_remove_test_piano.py"
-          test -f "$CM_BUILD_DIR/codemagic_live_note_latency_fix.py"
-          test -f "$CM_BUILD_DIR/codemagic_ultra_low_latency_output_fix.py"
-          test -f "$CM_BUILD_DIR/codemagic_crackle_fix.py"
-          test -f "$CM_BUILD_DIR/codemagic_pro_sound_fix.py"
-          test -d "$CM_BUILD_DIR/silveton_pro_payload"
-          
-          rm -rf "$CM_BUILD_DIR/_silveton_src"
-          mkdir -p "$CM_BUILD_DIR/_silveton_src"
-          unzip -q "$CM_BUILD_DIR/$SILVETON_ZIP" -d "$CM_BUILD_DIR/_silveton_src"
-          
-          SETTINGS="$(find "$CM_BUILD_DIR/_silveton_src" -type f -path '*/android/settings.gradle.kts' -print -quit)"
-          test -n "$SETTINGS"
-          PROJECT_DIR="$(dirname "$(dirname "$SETTINGS")")"
+
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          
-          python3 "$CM_BUILD_DIR/codemagic_runtime_fix.py" "$PROJECT_DIR"
-          python3 "$CM_BUILD_DIR/codemagic_root_apk_fix.py" "$PROJECT_DIR"
-          python3 "$CM_BUILD_DIR/codemagic_resume_fix.py" "$PROJECT_DIR"
-          python3 "$CM_BUILD_DIR/codemagic_live_dsp_fix.py" "$PROJECT_DIR"
-          python3 "$CM_BUILD_DIR/codemagic_test_instrument_fix.py" "$PROJECT_DIR"
-          python3 "$CM_BUILD_DIR/codemagic_stability_fix.py" "$PROJECT_DIR"
-          python3 "$CM_BUILD_DIR/codemagic_audio_driver_hardening.py" "$PROJECT_DIR"
-          python3 "$CM_BUILD_DIR/codemagic_gui_sampler3.py" "$PROJECT_DIR"
-          python3 "$CM_BUILD_DIR/codemagic_live_midi_visual_skin.py" "$PROJECT_DIR"
-          python3 "$CM_BUILD_DIR/codemagic_final_stability_fix.py" "$PROJECT_DIR"
-          python3 "$CM_BUILD_DIR/codemagic_force_keyboard_test_patch.py" "$PROJECT_DIR"
-          python3 "$CM_BUILD_DIR/codemagic_gui_contract_fix.py" "$PROJECT_DIR"
-          python3 "$CM_BUILD_DIR/codemagic_kotlin_compile_fix.py" "$PROJECT_DIR"
-          python3 "$CM_BUILD_DIR/codemagic_48khz_fix.py" "$PROJECT_DIR"
-          python3 "$CM_BUILD_DIR/codemagic_live_performance_indicators.py" "$PROJECT_DIR"
-          python3 "$CM_BUILD_DIR/codemagic_xrun_stability_fix.py" "$PROJECT_DIR"
-          # Crackle fix works on the fully generated tree; PRO SOUND follows it and must stay LAST.
-          python3 "$CM_BUILD_DIR/codemagic_crackle_fix.py" "$PROJECT_DIR"
-          # PRO SOUND (MONO/LEGATO, ADSR, CUTOFF, quick re-enter) works on the crackle-fixed tree.
-          python3 "$CM_BUILD_DIR/codemagic_pro_sound_fix.py" "$PROJECT_DIR"
-          
-          BRIDGE="$PROJECT_DIR/android/app/src/main/cpp/SamplerAudioBridge.cpp"
-          RUNTIME="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SamplerRuntime.kt"
-          ROOTMODE="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SilvetonRootRuntime.kt"
-          MIDICTRL="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SamplerMidiController.kt"
-          ACTIVITY="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/MainActivity.kt"
-          ENGINE="$PROJECT_DIR/core/src/sampler/SamplerEngine.cpp"
-          SINC="$PROJECT_DIR/core/include/silveton/sampler/SincInterpolator.h"
-          SINC_CPP="$PROJECT_DIR/core/src/sampler/SincInterpolator.cpp"
-          VIEW="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SilvetonSamplerView.kt"
-          CONTROLLER="$PROJECT_DIR/android/app/src/main/java/com/silveton/sampler/SamplerAppController.kt"
-          SAMPLER_TESTS="$PROJECT_DIR/core/tests/SamplerTests.cpp"
-          BANK_RUNTIME="$PROJECT_DIR/core/src/sampler/SvBankRuntime.cpp"
-          PREFETCH_H="$PROJECT_DIR/core/include/silveton/sampler/SampleStreamPrefetcher.h"
-          
-          test -f "$SAMPLER_TESTS"
-          grep -F 'constexpr unsigned kRate = 96000U;' "$BRIDGE"
-          grep -F 'constexpr unsigned kPeriods = 2U;' "$BRIDGE"
-          grep -F 'kPreferredMinimumPeriodFrames = 96U;' "$BRIDGE"
-          grep -F 'config.bufferFrames - config.periodFrames' "$BRIDGE"
-          grep -F 'configureRealtimeThread("SilvAudioRT", 7, 7, 80);' "$BRIDGE"
-          grep -F 'configureRealtimeThread("SilvMidiRT", 0, 5, 70);' "$BRIDGE"
-          grep -F '::poll(pollFds.data(), static_cast<nfds_t>(count), 1)' "$BRIDGE"
-          grep -F 'class BuiltinTestInstrument' "$BRIDGE"
-          grep -F 'testInstrument_.render(renderBuffer_.data(), frames, sampleRate());' "$BRIDGE"
-          grep -F 'testInstrument_.setEnabled(false);' "$BRIDGE"
-          grep -F 'testInstrument_.noteOn(data1, data2);' "$BRIDGE"
-          grep -F 'const bool midiOk = startDirectMidiLocked();' "$BRIDGE"
-          grep -F 'kControlDevice = "/dev/snd/controlC0"' "$BRIDGE"
-          grep -F 'ADDA_DL_CH1 DL1_CH1' "$BRIDGE"
-          grep -F 'ADDA_DL_CH2 DL1_CH2' "$BRIDGE"
-          grep -F 'DAC In Mux' "$BRIDGE"
-          grep -F 'HPL Mux' "$BRIDGE"
-          grep -F 'HPR Mux' "$BRIDGE"
-          grep -F 'sw.xfer_align = 1U;' "$BRIDGE"
-          grep -F 'AUDIO DRIVER: PCM open/config failed' "$BRIDGE"
-          grep -F 'SilvetonRootRuntime.enter()' "$RUNTIME"
-          grep -F 'Audio reopen failed' "$RUNTIME"
-          grep -F 'SilvetonAudioRecovery' "$RUNTIME"
-          grep -F 'refreshAudioPermissions' "$RUNTIME"
-          grep -F 'refreshAudioPermissions' "$ROOTMODE"
-          grep -F 'refreshMidiPermissions' "$ROOTMODE"
-          grep -F 'return runSu(script, 5)' "$ROOTMODE"
-          grep -F 'refreshMidiPermissions' "$MIDICTRL"
-          grep -F 'SilvetonAudioLifecycle' "$ACTIVITY"
-          grep -F 'magiskpolicy' "$ROOTMODE"
-          grep -F '0x0000-0xffff' "$ROOTMODE"
-          grep -F 'taskset -p 3f' "$ROOTMODE"
-          grep -F 'promote SilvAudioRT 80 85' "$ROOTMODE"
-          grep -F 'promote SilvMidiRT 40 75' "$ROOTMODE"
-          grep -F 'LiveCubic4 = 4' "$SINC"
-          grep -F 'std::abs(playbackRatio - 0.5) < 1.0e-12' "$SINC_CPP"
-          grep -F 'interpolator_(InterpolationQuality::Studio)' "$ENGINE"
-          grep -F 'SILVETON_STUDIO_INTERP_V1' "$SINC_CPP"
-          grep -F 'SILVETON_MASTER_6DB_V1' "$ENGINE"
-          grep -F 'SILVETON_TPDF_DITHER_V1' "$BRIDGE"
-          grep -F 'SILVETON_ALL_MIDI_PORTS_V1' "$BRIDGE"
-          grep -F 'SILVETON_SOFT_GLIDE_V1' "$ENGINE"
-          grep -F 'SILVETON_SILK_PORTA_V1' "$ENGINE"
-          grep -F 'sampler.setPortaBalance(' "$VIEW"
-          grep -F 'SILVETON_LIST_BACKUP_V1' "$CONTROLLER"
-          grep -F 'SILVETON_OCTAVE_KEY_V1' "$ENGINE"
-          grep -F 'SILVETON_TERCA_V1' "$ENGINE"
-          grep -F 'SILVETON_SCAN_V1' "$BRIDGE"
-          grep -F 'SILVETON_MIDI_FULL_V1' "$BRIDGE"
-          grep -F 'SILVETON_GUI_V3' "$VIEW"
-          grep -F 'SILVETON_TUNE_RANGES_V1' "$BRIDGE"
-          grep -F 'SILVETON_SCALE_V1' "$CONTROLLER"
-          grep -F 'SILVETON_TQ_TRANSPOSE_V1' "$ENGINE"
-          grep -F 'SILVETON_FX_TAIL_V1' "$ENGINE"
-          grep -F 'SILVETON_SET_SAVE_AS_V1' "$BRIDGE"
-          grep -F 'SILVETON_TQ_LIST_V1' "$CONTROLLER"
-          grep -F 'SILVETON_LIST_GRID_V1' "$VIEW"
-          grep -F 'SILVETON_SIMPLE_NUMBER_V1' "$VIEW"
-          grep -F 'SILVETON_SLOW_DRAG_V1' "$VIEW"
-          grep -F 'SILVETON_POLY_PORTA_V1' "$ENGINE"
-          grep -F 'SILVETON_PORTA_NEAR_V1' "$ENGINE"
-          grep -F 'SILVETON_KEY_SCAN_V1' "$BRIDGE"
-          grep -F 'SILVETON_BANK_INFO_V1' "$BRIDGE"
-          grep -F 'SILVETON_BANK_INFO_V1' "$VIEW"
-          grep -F 'SILVETON_LAYERS_V1' "$ENGINE"
-          grep -F 'SILVETON_TONE_V2' "$ENGINE"
-          grep -F 'SILVETON_EQ5_V1' "$ENGINE"
-          grep -F 'SILVETON_PORTA_MODES_V1' "$ENGINE"
-          grep -F 'SILVETON_FX_V3' "$ENGINE"
-          grep -F 'SILVETON_CPU_METER_V1' "$ENGINE"
-          grep -F 'SILVETON_VOICE_GUARD_V1' "$ENGINE"
-          grep -F 'SILVETON_PARAMS_V1' "$BRIDGE"
-          grep -F 'SILVETON_START_REFRESH_V1' "$BRIDGE"
-          grep -F 'SILVETON_SET_V12' "$PROJECT_DIR/core/src/sampler/SetPackage.cpp"
-          grep -F 'SILVETON_GUI_V4' "$VIEW"
-          grep -F 'SILVETON_LOOK_V2' "$VIEW"
-          grep -F 'SILVETON_PICKER_V1' "$VIEW"
-          grep -F 'SILVETON_ANALYZER_V1' "$ENGINE"
-          grep -F 'SILVETON_LIST_V2' "$VIEW"
-          grep -F 'SILVETON_SETS_FIX_V1' "$CONTROLLER"
-          grep -F 'Studio = 1' "$SINC"
-          grep -F 'upperRouteMask' "$ENGINE"
-          grep -F 'SILVETON LIVE MIDI native Canvas renderer' "$VIEW"
-          grep -F 'RadialGradient(' "$VIEW"
-          grep -F 'Color.rgb(252,253,255)' "$VIEW"
-          grep -F 'DESIGN_W = 1340f' "$VIEW"
-          grep -F 'val keyFlash = midiRx' "$VIEW"
-          grep -F 'val audioSignal = a.activeVoices > 0' "$VIEW"
-          grep -F '"96k 96x2"' "$VIEW"
-          grep -F 'a.bufferSizeFrames == 192' "$VIEW"
-          grep -F '48 kHz SAMPLE must play through 96 kHz engine' "$SAMPLER_TESTS"
-          grep -F 'data class MidiStatus(' "$CONTROLLER"
-          grep -F 'private val statusChanged: (String?) -> Unit = {},' "$CONTROLLER"
-          grep -F 'SILVETON_CRACKLE_FIX_V1' "$ENGINE"
-          grep -F 'softKill(impl, tail);' "$ENGINE"
-          grep -F 'softKill(impl, existing, ' "$ENGINE"
-          grep -F 'SILVETON_PRO_SOUND_V1' "$ENGINE"
-          grep -F 'SILVETON_ROUTE_FALLBACK_V1' "$BRIDGE"
-          grep -F 'SILVETON_PORTA_PAGE_V1' "$ENGINE"
-          grep -F 'void playPortamentoNote(' "$ENGINE"
-          grep -F 'testPortamentoBalance();' "$SAMPLER_TESTS"
-          grep -F 'testSilkPortamentoNearArrivalAndRestart();' "$SAMPLER_TESTS"
-          grep -F 'PORTA U${selectedUpper + 1}' "$VIEW"
-          grep -F 'lastPickedSound' "$VIEW"
-          grep -F 'SILVETON_GUI_V2' "$VIEW"
-          grep -F 'e.transform(touchMatrix)' "$VIEW"
-          grep -F 'SILVETON_KORG_WRITE_V1' "$CONTROLLER"
-          grep -F 'fun writeCombiToList(' "$CONTROLLER"
-          grep -F 'sampler.writeCombiToList(' "$VIEW"
-          grep -F 'SILVETON_LIVE_EDIT_V1' "$ENGINE"
-          grep -F 'v.tuneSemis = tune;' "$ENGINE"
-          grep -F 'testLiveEditsOnHeldNote();' "$SAMPLER_TESTS"
-          grep -F 'SILVETON_LIVE_EDIT_V1' "$VIEW"
-          grep -F 'SILVETON_FX_V2' "$ENGINE"
-          grep -F 'std::unique_ptr<ReverbFx> plate;' "$ENGINE"
-          grep -F 'testFxSlotsDelayReverb();' "$SAMPLER_TESTS"
-          grep -F 'nativeUpdateCombiFx(slot - 1,' "$CONTROLLER"
-          grep -F 'SILVETON_LIST_POSITIONS_V1' "$BRIDGE"
-          grep -F 'nativeSetActiveListEntry' "$BRIDGE"
-          grep -F 'fun copyListEntryTo(' "$CONTROLLER"
-          grep -F 'fun moveListEntryTo(' "$CONTROLLER"
-          grep -F 'openPositionPicker(WriteMode.COPY' "$VIEW"
-          grep -F 'nativeSetPortaBalance' "$BRIDGE"
-          grep -F 'SILVETON_HEADPHONE_LOCK_V1' "$BRIDGE"
-          grep -F 'SILVETON_RENDER_SPEED_V1' "$ENGINE"
-          grep -F 'nativeEnforceOutputRoute' "$RUNTIME"
-          grep -F 'KEYCODE_VOLUME_UP' "$ACTIVITY"
-          grep -F 'testPortamentoFromLastNoteMono();' "$SAMPLER_TESTS"
-          grep -F 'testPortamentoAutoMonoReleaseTail();' "$SAMPLER_TESTS"
-          grep -F 'testPortamentoPolyFromLastNote();' "$SAMPLER_TESTS"
-          grep -F 'withRootNote(' "$RUNTIME"
-          grep -F 'struct AmpEnv' "$ENGINE"
-          grep -F 'void playUpperNote(' "$ENGINE"
-          grep -F 'void handleNoteOff(' "$ENGINE"
-          grep -F 'testLegatoHeldKeyGlissando();' "$SAMPLER_TESTS"
-          grep -F 'testUpperAdsrAbsolute();' "$SAMPLER_TESTS"
-          grep -F 'nativeSetUpperToneParam' "$BRIDGE"
-          grep -F 'publishVoiceWindows(*impl_, vi);' "$ENGINE"
-          grep -F 'void readStereo(' "$SINC"
-          grep -F 'class SampleStreamPrefetcher' "$PREFETCH_H"
-          grep -F 'prefetcher_.start()' "$BRIDGE"
-          grep -F 'MADV_NORMAL' "$BANK_RUNTIME"
-          grep -F 'testLoopedSampleKeepsAttack();' "$SAMPLER_TESTS"
-          
-          if grep -Fq 'if (resolved < loopStart && frame >= 0)' "$SINC_CPP"; then
-            echo "ERROR: looped samples would lose their attack again (loop-start clamp returned)" >&2
+
+      - name: Check the tablet project
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          test -f android/settings.gradle.kts
+          test -f android/app/build.gradle.kts
+          test -f android/app/src/main/AndroidManifest.xml
+          test -f app/android/AndroidApp.cpp
+          test -f app/android/AndroidRoot.cpp
+          test -f resources/fonts/Roboto-Regular.ttf
+          test -f host/src/android/SamplerHostAndroid.cpp
+          # the whole point: no Kotlin and no Java anywhere in the tablet project
+          if find . -type f \( -name '*.kt' -o -name '*.java' -o -name '*.kts' -a ! -name 'build.gradle.kts' -a ! -name 'settings.gradle.kts' \) | grep -q .; then
+            echo "ERROR: Kotlin / Java source found - the tablet program must be C++ only" >&2
+            find . -type f \( -name '*.kt' -o -name '*.java' \) -print
             exit 1
           fi
-          if grep -Fq 'MADV_SEQUENTIAL' "$BANK_RUNTIME"; then
-            echo "ERROR: bank mapping returned to MADV_SEQUENTIAL (Android drops loop pages first)" >&2
-            exit 1
-          fi
-          if grep -Fq 'existing.active = false;' "$ENGINE"; then
-            echo "ERROR: MONO/LEGATO note change cuts the previous note in one sample again" >&2
-            exit 1
-          fi
-          if grep -Fq 'constexpr unsigned kRate = 48000U;' "$BRIDGE"; then
-            echo "ERROR: stale 48 kHz final output target remains" >&2
-            exit 1
-          fi
-          if grep -Fq 'constexpr unsigned kPeriods = 3U;' "$BRIDGE"; then
-            echo "ERROR: stale 96x3 high-latency queue remains" >&2
-            exit 1
-          fi
-          if grep -Fq '::poll(pollFds.data(), static_cast<nfds_t>(count), 20)' "$BRIDGE"; then
-            echo "ERROR: stale 20 ms MIDI poll remains" >&2
-            exit 1
-          fi
-          if grep -Fq '#include <aaudio/AAudio.h>' "$BRIDGE"; then
-            echo "ERROR: AAudio returned to Direct ALSA runtime" >&2
-            exit 1
-          fi
-          if grep -Fq 'cmd activity kill-all' "$ROOTMODE"; then
-            echo "ERROR: live mode must not kill cached apps" >&2
-            exit 1
-          fi
-          if grep -Fq 'Handler(Looper.getMainLooper())' "$RUNTIME"; then
-            echo "ERROR: audio recovery returned to UI looper" >&2
-            exit 1
-          fi
-          if grep -Fq 'testInstrument_.setEnabled(true);' "$BRIDGE" || grep -Fq 'testInstrument_.setEnabled(!hasPlayableProgram);' "$BRIDGE"; then
-            echo "ERROR: obsolete TEST EP enable path remains" >&2
-            exit 1
-          fi
-          if grep -Fq 'STAGE PIANO' "$VIEW" || grep -Fq 'BUILT-IN  •  RAW MIDI' "$VIEW" || grep -Fq 'text(c,"PIANO"' "$VIEW" || grep -Fq 'text(c, "TEST EP"' "$VIEW"; then
-            echo "ERROR: obsolete TEST EP / Stage Piano UI remains" >&2
-            exit 1
-          fi
+          grep -F 'android:hasCode="false"' android/app/src/main/AndroidManifest.xml
+          grep -F 'android.app.NativeActivity' android/app/src/main/AndroidManifest.xml
+          grep -F 'com.silveton.sampler' android/app/build.gradle.kts
+          # the root scripts of the tablet must still be the ones the engine was tuned with
+          grep -F 'magiskpolicy' app/android/RootScripts.inc
+          grep -F 'promote SilvAudioRT 80 85' app/android/RootScripts.inc
+          grep -F 'promote SilvMidiRT 40 75' app/android/RootScripts.inc
+          grep -F '0x0000-0xffff' app/android/RootScripts.inc
+          grep -F 'configureRealtimeThread("SilvAudioRT", 7, 7, 80);' host/src/android/SamplerHostAndroid.cpp
+          grep -F 'configureRealtimeThread("SilvMidiRT", 0, 5, 70);' host/src/android/SamplerHostAndroid.cpp
+          grep -F 'constexpr unsigned kRate = 96000U;' host/src/android/SamplerHostAndroid.cpp
+          grep -F 'kControlDevice = "/dev/snd/controlC0"' host/src/android/SamplerHostAndroid.cpp
+
       - name: Install Android toolchain
         shell: bash
         run: |
@@ -352,16 +119,18 @@ jobs:
             "build-tools;$ANDROID_BUILD_TOOLS_VERSION" \
             "ndk;$ANDROID_NDK_VERSION" \
             "cmake;$ANDROID_CMAKE_VERSION"
-          
+
           NDK_HOME="$ANDROID_SDK/ndk/$ANDROID_NDK_VERSION"
+          test -f "$NDK_HOME/sources/android/native_app_glue/android_native_app_glue.c"
           echo "ANDROID_HOME=$ANDROID_SDK" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$NDK_HOME" >> "$GITHUB_ENV"
+
       - name: Install Gradle 8.9
         shell: bash
         run: |
           set -euo pipefail
-          TOOLS="$CM_BUILD_DIR/.silveton-tools"
+          TOOLS="$RUNNER_TEMP/silveton-tools"
           mkdir -p "$TOOLS"
           if [ ! -x "$TOOLS/gradle-$GRADLE_VERSION/bin/gradle" ]; then
             curl -fL --retry 3 "https://services.gradle.org/distributions/gradle-$GRADLE_VERSION-bin.zip" -o "$TOOLS/gradle.zip"
@@ -370,58 +139,46 @@ jobs:
           GRADLE_BIN="$TOOLS/gradle-$GRADLE_VERSION/bin/gradle"
           test -x "$GRADLE_BIN"
           echo "GRADLE_BIN=$GRADLE_BIN" >> "$GITHUB_ENV"
-      - name: Audit sampler contracts
+
+      - name: Build tablet APK
         shell: bash
         run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
-          python3 ci/audit_direct_alsa.py
-          python3 ci/audit_direct_midi.py
-          python3 ci/audit_gui_contract.py
-      - name: Build and test native core
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
-          rm -rf build-core
-          cmake -S core -B build-core \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_STANDARD=17 \
-            -DSILVETON_LIVE_BUILD_TESTS=ON
-          cmake --build build-core --parallel "$(sysctl -n hw.ncpu)"
-          ctest --test-dir build-core --output-on-failure
-      - name: Build rooted release APK
-        shell: bash
-        run: |
-          set -euo pipefail
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/silveton-android-artifact"
+          LOG="$RUNNER_TEMP/silveton-android-artifact/gradle-build.log"
           cd "$PROJECT_DIR/android"
-          LOG="$CM_BUILD_DIR/gradle-build.log"
           set +e
           CI=true "$GRADLE_BIN" --no-daemon --console=plain clean assembleRelease 2>&1 | tee "$LOG"
           STATUS=${PIPESTATUS[0]}
           set -e
           if [ "$STATUS" -ne 0 ]; then
-            echo "===== EXACT COMPILER ERRORS ====="
-            grep -E '(^e: |^w: | error: |: error:|Compilation error|Unresolved reference|Type mismatch|No value passed|Too many arguments|Cannot infer|Overload resolution ambiguity)' "$LOG" | tail -n 160 || true
-            echo "===== END COMPILER ERRORS ====="
-            exit "$STATUS"
+            echo "===== EXACT COMPILER / LINKER ERRORS ====="
+            grep -E '(error:|fatal error:|undefined reference|undefined symbol|FAILED|What went wrong|CMake Error|ld: )' "$LOG" | tail -n 200 || true
+            echo "===== END ERRORS ====="
+            # the native build keeps its own logs: show their end
+            find "$PROJECT_DIR/android/app/.cxx" -name 'build_output.txt' -print 2>/dev/null | while read -r f; do
+              echo "----- $f (end) -----"
+              tail -n 120 "$f" || true
+            done
           fi
-      - name: Verify and publish one APK
+          exit "$STATUS"
+
+      - name: Verify and package the APK
         shell: bash
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
-          
+
           APK="$(find android/app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print -quit)"
           test -f "$APK"
-          
+
           AAPT="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION/aapt"
           APKSIGNER="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION/apksigner"
           ZIPALIGN="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION/zipalign"
           test -x "$AAPT"
           test -x "$APKSIGNER"
           test -x "$ZIPALIGN"
-          
+
           BADGING="$("$AAPT" dump badging "$APK")"
           case "$BADGING" in
             *"package: name='com.silveton.sampler'"*) ;;
@@ -431,59 +188,46 @@ jobs:
             *"targetSdkVersion:'35'"*) ;;
             *) echo "Wrong targetSdk" >&2; exit 1 ;;
           esac
-          
+          case "$BADGING" in
+            *"native-code: 'arm64-v8a'"*) ;;
+            *) echo "The program must be arm64-v8a" >&2; exit 1 ;;
+          esac
+          case "$BADGING" in
+            *"launchable-activity: name='android.app.NativeActivity'"*) ;;
+            *) echo "The launcher activity must be the NativeActivity" >&2; exit 1 ;;
+          esac
+
+          LIST="$(unzip -l "$APK")"
+          case "$LIST" in *"lib/arm64-v8a/libsilveton_sampler.so"*) ;; *) echo "libsilveton_sampler.so is missing" >&2; exit 1 ;; esac
+          case "$LIST" in *"assets/fonts/Roboto-Regular.ttf"*) ;; *) echo "Fonts are missing inside the APK" >&2; exit 1 ;; esac
+          case "$LIST" in *"classes.dex"*) echo "NOTE: the APK holds a classes.dex (expected none)";; esac
+
+          # NativeActivity finds the program by the name ANativeActivity_onCreate: it must be in the library
+          WORK="$RUNNER_TEMP/apk-check"
+          rm -rf "$WORK"; mkdir -p "$WORK"
+          unzip -q -o "$APK" 'lib/arm64-v8a/libsilveton_sampler.so' -d "$WORK"
+          LLVM_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin"
+          "$LLVM_BIN/llvm-nm" -D --defined-only "$WORK/lib/arm64-v8a/libsilveton_sampler.so" | tee "$WORK/symbols.txt" | grep -E ' T (ANativeActivity_onCreate|android_main)$' || true
+          grep -q ' T ANativeActivity_onCreate$' "$WORK/symbols.txt" || { echo "ANativeActivity_onCreate is not exported" >&2; exit 1; }
+          "$LLVM_BIN/llvm-readelf" -lW "$WORK/lib/arm64-v8a/libsilveton_sampler.so" | grep LOAD || true
+
           "$ZIPALIGN" -c -P 16 -v 4 "$APK"
           "$APKSIGNER" verify --verbose --print-certs "$APK"
-          
-          mkdir -p "$CM_BUILD_DIR/artifacts"
-          OUT="$CM_BUILD_DIR/artifacts/SILVETON-SAMPLER-SM-X130.apk"
+
+          mkdir -p "$RUNNER_TEMP/silveton-android-artifact"
+          OUT="$RUNNER_TEMP/silveton-android-artifact/SILVETON-SAMPLER-SM-X130.apk"
           cp -f "$APK" "$OUT"
           shasum -a 256 "$OUT" > "$OUT.sha256.txt"
-      # GitHub Actions artifact downloads are ZIPs. GitHub Releases serves the real .apk file directly.
-      - name: Publish direct-download APK (only after successful build)
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          OUT="$CM_BUILD_DIR/artifacts/SILVETON-SAMPLER-SM-X130.apk"
-          test -s "$OUT"
+          echo "$BADGING" | head -n 20 > "$RUNNER_TEMP/silveton-android-artifact/APK-INFO.txt"
 
-          # One immutable build tag per successful run; older builds remain downloadable.
-          TAG="apk-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          TITLE="SILVETON Sampler SM-X130 - build ${GITHUB_RUN_NUMBER}"
-          NOTES="Verified release APK for Samsung SM-X130. Source commit: ${GITHUB_SHA}. Workflow run: ${GITHUB_RUN_ID}, attempt ${GITHUB_RUN_ATTEMPT}."
-
-          gh release create "$TAG" "$OUT" \
-            --target "$GITHUB_SHA" \
-            --title "$TITLE" \
-            --notes "$NOTES" \
-            --latest
-
-          # Check that GitHub really published the APK asset before reporting success.
-          APK_URL="$(gh release view "$TAG" --json assets --jq '.assets[] | select(.name == "SILVETON-SAMPLER-SM-X130.apk") | .url')"
-          test -n "$APK_URL"
-          LATEST_URL="https://github.com/${GH_REPO}/releases/latest/download/SILVETON-SAMPLER-SM-X130.apk"
-          echo "DIRECT APK: $APK_URL"
-          echo "LATEST APK: $LATEST_URL"
-          {
-            echo '## SILVETON Sampler APK — ready to download'
-            echo ''
-            echo "[**DOWNLOAD APK DIRECTLY**]($APK_URL)"
-            echo ''
-            echo "[Always download newest successful APK]($LATEST_URL)"
-            echo ''
-            echo "Build: ${GITHUB_RUN_NUMBER} · Commit: ${GITHUB_SHA}"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # Keep logs for troubleshooting failed builds, but do not wrap a successful APK in an artifact ZIP.
-      - name: Upload failure logs
-        if: failure()
+      - name: Upload APK and logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: SILVETON-BUILD-FAILURE-LOGS
+          name: SILVETON-SAMPLER-APK-and-logs
           path: |
-            gradle-build.log
+            ${{ runner.temp }}/silveton-android-artifact/*.apk
+            ${{ runner.temp }}/silveton-android-artifact/*.txt
+            ${{ runner.temp }}/silveton-android-artifact/gradle-build.log
           if-no-files-found: warn
           retention-days: 14

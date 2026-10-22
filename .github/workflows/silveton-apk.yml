@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write   # lets the build publish the finished APK as a GitHub Release (a real .apk to download, not a ZIP)
 
 jobs:
   android:
@@ -220,13 +220,51 @@ jobs:
           shasum -a 256 "$OUT" > "$OUT.sha256.txt"
           echo "$BADGING" | head -n 20 > "$RUNNER_TEMP/silveton-android-artifact/APK-INFO.txt"
 
-      - name: Upload APK and logs
-        if: always()
+      # GitHub Actions artifact downloads are always ZIPs. GitHub Releases serves the real .apk file directly.
+      - name: Publish direct-download APK (only after a successful build)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/silveton-android-artifact/SILVETON-SAMPLER-SM-X130.apk"
+          test -s "$OUT"
+
+          # One tag per successful run; older builds stay downloadable.
+          TAG="apk-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          TITLE="SILVETON Sampler SM-X130 - build ${GITHUB_RUN_NUMBER}"
+          NOTES="Verified release APK for Samsung SM-X130. Source commit: ${GITHUB_SHA}. Workflow run: ${GITHUB_RUN_ID}, attempt ${GITHUB_RUN_ATTEMPT}."
+
+          gh release create "$TAG" "$OUT" \
+            --target "$GITHUB_SHA" \
+            --title "$TITLE" \
+            --notes "$NOTES" \
+            --latest
+
+          # Check that GitHub really published the APK before reporting success.
+          APK_URL="$(gh release view "$TAG" --json assets --jq '.assets[] | select(.name == "SILVETON-SAMPLER-SM-X130.apk") | .url')"
+          test -n "$APK_URL"
+          LATEST_URL="https://github.com/${GH_REPO}/releases/latest/download/SILVETON-SAMPLER-SM-X130.apk"
+          echo "DIRECT APK: $APK_URL"
+          echo "LATEST APK: $LATEST_URL"
+          {
+            echo '## SILVETON Sampler APK — ready to download'
+            echo ''
+            echo "[**DOWNLOAD APK DIRECTLY**]($APK_URL)"
+            echo ''
+            echo "[Always download newest successful APK]($LATEST_URL)"
+            echo ''
+            echo "Build: ${GITHUB_RUN_NUMBER} · Commit: ${GITHUB_SHA}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Logs only when the build failed; a successful APK is not wrapped in a ZIP.
+      - name: Upload failure logs
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: SILVETON-SAMPLER-APK-and-logs
+          name: SILVETON-BUILD-FAILURE-LOGS
           path: |
-            ${{ runner.temp }}/silveton-android-artifact/*.apk
             ${{ runner.temp }}/silveton-android-artifact/*.txt
             ${{ runner.temp }}/silveton-android-artifact/gradle-build.log
           if-no-files-found: warn

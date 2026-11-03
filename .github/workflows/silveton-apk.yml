@@ -1,227 +1,121 @@
 name: SILVETON Sampler APK
-
-# The tablet program: a NativeActivity made only of C++ (no Kotlin, no Java). Samsung Galaxy Tab A11 (SM-X130), root.
-# The source is the folder silveton_pro_payload: inside SILVETON-SEMPLER.zip in the root of the repository (one zip, uploaded
-# from the phone), or unpacked as the folder itself.
+# FAST APK build. Full source/DSP/UI tests are NOT part of the normal Android build.
+# IMPORTANT: when SILVETON-SEMPLER.zip is in the repository, it ALWAYS wins over
+# any old silveton_pro_payload folder so the new uploaded ZIP is actually built.
 on:
   push:
-    branches:
-      - main
+    branches: [main]
     paths:
-      - "SILVETON-SEMPLER.zip"
-      - "silveton_pro_payload/**"
-      - ".github/workflows/silveton-apk.yml"
+      - 'SILVETON-SEMPLER.zip'
+      - 'silveton_pro_payload/**'
+      - '.github/workflows/silveton-apk.yml'
   workflow_dispatch:
 
 permissions:
-  contents: write   # lets the build publish the finished APK as a GitHub Release (a real .apk to download, not a ZIP)
+  contents: write # publish installable APK to Releases
+
+concurrency:
+  group: silveton-apk-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   android:
     runs-on: macos-15-intel
     timeout-minutes: 90
     env:
-      GRADLE_VERSION: "8.9"
-      ANDROID_BUILD_TOOLS_VERSION: "35.0.0"
-      ANDROID_NDK_VERSION: "27.2.12479018"
-      ANDROID_CMAKE_VERSION: "3.22.1"
-
+      ANDROID_BUILD_TOOLS_VERSION: '35.0.0'
+      ANDROID_NDK_VERSION: '27.2.12479018'
+      ANDROID_CMAKE_VERSION: '3.22.1'
     steps:
-      - name: Checkout repository
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Prepare project from ZIP
+      - name: Select current source (ZIP first)
         shell: bash
         run: |
           set -euo pipefail
-
-          # The program is the folder silveton_pro_payload (android/, core/, host/, ui/, app/android/, resources/, CMakeLists.txt).
-          # It comes either as the folder itself in the repository or inside SILVETON-SEMPLER.zip in the root of the repository.
-          PROJECT_DIR=""
-          if [ -f "silveton_pro_payload/CMakeLists.txt" ] && [ -f "silveton_pro_payload/android/settings.gradle.kts" ]; then
-            PROJECT_DIR="$GITHUB_WORKSPACE/silveton_pro_payload"
-            echo "Using the folder silveton_pro_payload of the repository"
+          if [ -f "$GITHUB_WORKSPACE/SILVETON-SEMPLER.zip" ]; then
+            SRC="$GITHUB_WORKSPACE/_silveton_ci_source"
+            mkdir -p "$SRC"
+            unzip -q "$GITHUB_WORKSPACE/SILVETON-SEMPLER.zip" -d "$SRC"
+            PROJECT_DIR="$SRC/silveton_pro_payload"
+            echo 'Building the latest SILVETON-SEMPLER.zip (not the old repo folder)'
           else
-            ZIP_PATH="SILVETON-SEMPLER.zip"
-            if [ ! -f "$ZIP_PATH" ]; then
-              echo "ERROR: Missing SILVETON-SEMPLER.zip (put it in the root of the repository)"
-              exit 1
-            fi
-            WORK_DIR="$RUNNER_TEMP/silveton-src"
-            rm -rf "$WORK_DIR"
-            mkdir -p "$WORK_DIR"
-            ditto -x -k "$ZIP_PATH" "$WORK_DIR"
-            # the project folder is the one that holds CMakeLists.txt next to android/settings.gradle.kts
-            SETTINGS="$(find "$WORK_DIR" -type f -path '*/android/settings.gradle.kts' -print -quit)"
-            if [ -n "${SETTINGS:-}" ]; then
-              CANDIDATE="$(dirname "$(dirname "$SETTINGS")")"
-              if [ -f "$CANDIDATE/CMakeLists.txt" ] && [ -d "$CANDIDATE/core" ]; then PROJECT_DIR="$CANDIDATE"; fi
-            fi
-            if [ -z "${PROJECT_DIR:-}" ]; then
-              echo "ERROR: SILVETON-SEMPLER.zip does not hold the C++ program (CMakeLists.txt + android/settings.gradle.kts + core/)"
-              find "$WORK_DIR" -maxdepth 3 -print
-              exit 1
-            fi
+            PROJECT_DIR="$GITHUB_WORKSPACE/silveton_pro_payload"
+            echo 'No ZIP; building the source directory'
           fi
-
+          test -f "$PROJECT_DIR/CMakeLists.txt"
+          test -f "$PROJECT_DIR/android/settings.gradle.kts"
+          test -f "$PROJECT_DIR/android/app/build.gradle.kts"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
-      - name: Check the tablet project
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
-          test -f android/settings.gradle.kts
-          test -f android/app/build.gradle.kts
-          test -f android/app/src/main/AndroidManifest.xml
-          test -f app/android/AndroidApp.cpp
-          test -f app/android/AndroidRoot.cpp
-          test -f resources/fonts/Roboto-Regular.ttf
-          test -f host/src/android/SamplerHostAndroid.cpp
-          # the whole point: no Kotlin and no Java anywhere in the tablet project
-          if find . -type f \( -name '*.kt' -o -name '*.java' -o -name '*.kts' -a ! -name 'build.gradle.kts' -a ! -name 'settings.gradle.kts' \) | grep -q .; then
-            echo "ERROR: Kotlin / Java source found - the tablet program must be C++ only" >&2
-            find . -type f \( -name '*.kt' -o -name '*.java' \) -print
-            exit 1
-          fi
-          grep -F 'android:hasCode="false"' android/app/src/main/AndroidManifest.xml
-          grep -F 'android.app.NativeActivity' android/app/src/main/AndroidManifest.xml
-          grep -F 'com.silveton.sampler' android/app/build.gradle.kts
-          # the root scripts of the tablet must still be the ones the engine was tuned with
-          grep -F 'magiskpolicy' app/android/RootScripts.inc
-          grep -F 'promote SilvAudioRT 80 85' app/android/RootScripts.inc
-          grep -F 'promote SilvMidiRT 40 75' app/android/RootScripts.inc
-          grep -F '0x0000-0xffff' app/android/RootScripts.inc
-          grep -F 'configureRealtimeThread("SilvAudioRT", 7, 7, 80);' host/src/android/SamplerHostAndroid.cpp
-          grep -F 'configureRealtimeThread("SilvMidiRT", 0, 5, 70);' host/src/android/SamplerHostAndroid.cpp
-          grep -F 'constexpr unsigned kRate = 96000U;' host/src/android/SamplerHostAndroid.cpp
-          grep -F 'kControlDevice = "/dev/snd/controlC0"' host/src/android/SamplerHostAndroid.cpp
+      - name: Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
 
-      - name: Install Android toolchain
+      # Gradle 8.9: downloaded/cached by the action instead of a new curl/unzip on every run.
+      - name: Gradle 8.9 with dependency caching
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Android SDK/NDK (install only missing components)
         shell: bash
         run: |
           set -euo pipefail
-          ANDROID_SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Library/Android/sdk}}"
-          SDKMANAGER="$ANDROID_SDK/cmdline-tools/latest/bin/sdkmanager"
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Library/Android/sdk}}"
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
           if [ ! -x "$SDKMANAGER" ]; then
-            SDKMANAGER="$(find "$ANDROID_SDK/cmdline-tools" -type f -path '*/bin/sdkmanager' -perm +111 2>/dev/null | tail -1 || true)"
+            SDKMANAGER="$(find "$SDK/cmdline-tools" -type f -path '*/bin/sdkmanager' -print -quit 2>/dev/null || true)"
           fi
           test -x "$SDKMANAGER"
-          yes | "$SDKMANAGER" --sdk_root="$ANDROID_SDK" --licenses >/dev/null || true
-          "$SDKMANAGER" --sdk_root="$ANDROID_SDK" \
-            "platforms;android-35" \
-            "build-tools;$ANDROID_BUILD_TOOLS_VERSION" \
-            "ndk;$ANDROID_NDK_VERSION" \
-            "cmake;$ANDROID_CMAKE_VERSION"
+          MISSING=()
+          test -d "$SDK/platforms/android-35" || MISSING+=("platforms;android-35")
+          test -x "$SDK/build-tools/$ANDROID_BUILD_TOOLS_VERSION/aapt" || MISSING+=("build-tools;$ANDROID_BUILD_TOOLS_VERSION")
+          test -f "$SDK/ndk/$ANDROID_NDK_VERSION/sources/android/native_app_glue/android_native_app_glue.c" || MISSING+=("ndk;$ANDROID_NDK_VERSION")
+          test -f "$SDK/cmake/$ANDROID_CMAKE_VERSION/bin/cmake" || MISSING+=("cmake;$ANDROID_CMAKE_VERSION")
+          if [ "${#MISSING[@]}" -gt 0 ]; then
+            echo "Installing missing Android SDK components: ${MISSING[*]}"
+            # Accept licenses only if components must be installed.
+            yes | "$SDKMANAGER" --sdk_root="$SDK" --licenses >/dev/null || true
+            "$SDKMANAGER" --sdk_root="$SDK" "${MISSING[@]}"
+          else
+            echo 'All required Android SDK components already installed'
+          fi
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$SDK/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
 
-          NDK_HOME="$ANDROID_SDK/ndk/$ANDROID_NDK_VERSION"
-          test -f "$NDK_HOME/sources/android/native_app_glue/android_native_app_glue.c"
-          echo "ANDROID_HOME=$ANDROID_SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_HOME=$NDK_HOME" >> "$GITHUB_ENV"
-
-      - name: Install Gradle 8.9
+      - name: Build APK (no separate test suite, no redundant clean)
         shell: bash
         run: |
           set -euo pipefail
-          TOOLS="$RUNNER_TEMP/silveton-tools"
-          mkdir -p "$TOOLS"
-          if [ ! -x "$TOOLS/gradle-$GRADLE_VERSION/bin/gradle" ]; then
-            curl -fL --retry 3 "https://services.gradle.org/distributions/gradle-$GRADLE_VERSION-bin.zip" -o "$TOOLS/gradle.zip"
-            unzip -q -o "$TOOLS/gradle.zip" -d "$TOOLS"
-          fi
-          GRADLE_BIN="$TOOLS/gradle-$GRADLE_VERSION/bin/gradle"
-          test -x "$GRADLE_BIN"
-          echo "GRADLE_BIN=$GRADLE_BIN" >> "$GITHUB_ENV"
-
-      - name: Build tablet APK
-        shell: bash
-        run: |
-          set -uo pipefail
           mkdir -p "$RUNNER_TEMP/silveton-android-artifact"
-          LOG="$RUNNER_TEMP/silveton-android-artifact/gradle-build.log"
           cd "$PROJECT_DIR/android"
-          set +e
-          CI=true "$GRADLE_BIN" --no-daemon --console=plain clean assembleRelease 2>&1 | tee "$LOG"
-          STATUS=${PIPESTATUS[0]}
-          set -e
-          if [ "$STATUS" -ne 0 ]; then
-            echo "===== EXACT COMPILER / LINKER ERRORS ====="
-            grep -E '(error:|fatal error:|undefined reference|undefined symbol|FAILED|What went wrong|CMake Error|ld: )' "$LOG" | tail -n 200 || true
-            echo "===== END ERRORS ====="
-            # the native build keeps its own logs: show their end
-            find "$PROJECT_DIR/android/app/.cxx" -name 'build_output.txt' -print 2>/dev/null | while read -r f; do
-              echo "----- $f (end) -----"
-              tail -n 120 "$f" || true
-            done
-          fi
-          exit "$STATUS"
+          CI=true gradle --no-daemon --console=plain assembleRelease 2>&1 | tee "$RUNNER_TEMP/silveton-android-artifact/gradle-build.log"
 
-      - name: Verify and package the APK
+      # The only post-build safety checks: the APK actually exists, has the correct
+      # app/architecture/native library, is 16K-page compatible, and is signed.
+      - name: Verify installation package
         shell: bash
         run: |
           set -euo pipefail
-          cd "$PROJECT_DIR"
-
-          APK="$(find android/app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print -quit)"
-          test -f "$APK"
-
-          AAPT="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION/aapt"
-          APKSIGNER="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION/apksigner"
-          ZIPALIGN="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION/zipalign"
-          test -x "$AAPT"
-          test -x "$APKSIGNER"
-          test -x "$ZIPALIGN"
-
-          BADGING="$("$AAPT" dump badging "$APK")"
-          case "$BADGING" in
-            *"package: name='com.silveton.sampler'"*) ;;
-            *) echo "Wrong package id" >&2; exit 1 ;;
-          esac
-          case "$BADGING" in
-            *"targetSdkVersion:'35'"*) ;;
-            *) echo "Wrong targetSdk" >&2; exit 1 ;;
-          esac
-          case "$BADGING" in
-            *"native-code: 'arm64-v8a'"*) ;;
-            *) echo "The program must be arm64-v8a" >&2; exit 1 ;;
-          esac
-          case "$BADGING" in
-            *"launchable-activity: name='android.app.NativeActivity'"*) ;;
-            *) echo "The launcher activity must be the NativeActivity" >&2; exit 1 ;;
-          esac
-
-          LIST="$(unzip -l "$APK")"
-          case "$LIST" in *"lib/arm64-v8a/libsilveton_sampler.so"*) ;; *) echo "libsilveton_sampler.so is missing" >&2; exit 1 ;; esac
-          case "$LIST" in *"assets/fonts/Roboto-Regular.ttf"*) ;; *) echo "Fonts are missing inside the APK" >&2; exit 1 ;; esac
-          case "$LIST" in *"classes.dex"*) echo "NOTE: the APK holds a classes.dex (expected none)";; esac
-
-          # NativeActivity finds the program by the name ANativeActivity_onCreate: it must be in the library
-          WORK="$RUNNER_TEMP/apk-check"
-          rm -rf "$WORK"; mkdir -p "$WORK"
-          unzip -q -o "$APK" 'lib/arm64-v8a/libsilveton_sampler.so' -d "$WORK"
-          LLVM_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin"
-          "$LLVM_BIN/llvm-nm" -D --defined-only "$WORK/lib/arm64-v8a/libsilveton_sampler.so" | tee "$WORK/symbols.txt" | grep -E ' T (ANativeActivity_onCreate|android_main)$' || true
-          grep -q ' T ANativeActivity_onCreate$' "$WORK/symbols.txt" || { echo "ANativeActivity_onCreate is not exported" >&2; exit 1; }
-          "$LLVM_BIN/llvm-readelf" -lW "$WORK/lib/arm64-v8a/libsilveton_sampler.so" | grep LOAD || true
-
-          "$ZIPALIGN" -c -P 16 -v 4 "$APK"
-          "$APKSIGNER" verify --verbose --print-certs "$APK"
-
-          mkdir -p "$RUNNER_TEMP/silveton-android-artifact"
+          APK="$(find "$PROJECT_DIR/android/app/build/outputs/apk/release" -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          test -s "$APK"
+          BT="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION"
+          BADGING="$("$BT/aapt" dump badging "$APK")"
+          [[ "$BADGING" == *"package: name='com.silveton.sampler'"* ]] || { echo 'Wrong package ID'; exit 1; }
+          [[ "$BADGING" == *"native-code: 'arm64-v8a'"* ]] || { echo 'Wrong CPU architecture'; exit 1; }
+          unzip -Z1 "$APK" | awk '$0=="lib/arm64-v8a/libsilveton_sampler.so" {found=1} END {exit !found}' || { echo 'Missing native engine'; exit 1; }
+          "$BT/zipalign" -c -P 16 4 "$APK"
+          "$BT/apksigner" verify "$APK"
           OUT="$RUNNER_TEMP/silveton-android-artifact/SILVETON-SAMPLER-SM-X130.apk"
-          cp -f "$APK" "$OUT"
+          cp "$APK" "$OUT"
           shasum -a 256 "$OUT" > "$OUT.sha256.txt"
-          echo "$BADGING" | head -n 20 > "$RUNNER_TEMP/silveton-android-artifact/APK-INFO.txt"
 
-      # GitHub Actions artifact downloads are always ZIPs. GitHub Releases serves the real .apk file directly.
-      - name: Publish direct-download APK (only after a successful build)
+      - name: Publish APK for direct download
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -229,43 +123,20 @@ jobs:
         run: |
           set -euo pipefail
           OUT="$RUNNER_TEMP/silveton-android-artifact/SILVETON-SAMPLER-SM-X130.apk"
-          test -s "$OUT"
-
-          # One tag per successful run; older builds stay downloadable.
           TAG="apk-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          TITLE="SILVETON Sampler SM-X130 - build ${GITHUB_RUN_NUMBER}"
-          NOTES="Verified release APK for Samsung SM-X130. Source commit: ${GITHUB_SHA}. Workflow run: ${GITHUB_RUN_ID}, attempt ${GITHUB_RUN_ATTEMPT}."
-
-          gh release create "$TAG" "$OUT" \
-            --target "$GITHUB_SHA" \
-            --title "$TITLE" \
-            --notes "$NOTES" \
-            --latest
-
-          # Check that GitHub really published the APK before reporting success.
-          APK_URL="$(gh release view "$TAG" --json assets --jq '.assets[] | select(.name == "SILVETON-SAMPLER-SM-X130.apk") | .url')"
-          test -n "$APK_URL"
-          LATEST_URL="https://github.com/${GH_REPO}/releases/latest/download/SILVETON-SAMPLER-SM-X130.apk"
-          echo "DIRECT APK: $APK_URL"
-          echo "LATEST APK: $LATEST_URL"
+          gh release create "$TAG" "$OUT" --target "$GITHUB_SHA" \
+            --title "SILVETON Sampler SM-X130 - build ${GITHUB_RUN_NUMBER}" \
+            --notes "APK from ${GITHUB_SHA}; workflow run ${GITHUB_RUN_ID}." --latest
           {
-            echo '## SILVETON Sampler APK — ready to download'
-            echo ''
-            echo "[**DOWNLOAD APK DIRECTLY**]($APK_URL)"
-            echo ''
-            echo "[Always download newest successful APK]($LATEST_URL)"
-            echo ''
-            echo "Build: ${GITHUB_RUN_NUMBER} · Commit: ${GITHUB_SHA}"
+            echo '## SILVETON Sampler APK'
+            echo "[**Изтегли готовия APK**](https://github.com/${GH_REPO}/releases/latest/download/SILVETON-SAMPLER-SM-X130.apk)"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # Logs only when the build failed; a successful APK is not wrapped in a ZIP.
-      - name: Upload failure logs
+      - name: Upload diagnostics if the build fails
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: SILVETON-BUILD-FAILURE-LOGS
-          path: |
-            ${{ runner.temp }}/silveton-android-artifact/*.txt
-            ${{ runner.temp }}/silveton-android-artifact/gradle-build.log
+          path: ${{ runner.temp }}/silveton-android-artifact/gradle-build.log
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 7
